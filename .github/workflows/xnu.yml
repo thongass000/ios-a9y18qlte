@@ -15,6 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      sweet_variant:
+        description: SWEET board variant (a9y = Galaxy A9 2018, ARMv8.0 + 4K pages; empty = flame/sweet)
+        default: a9y
   push:
     branches: [main]
     paths:
@@ -31,6 +34,8 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  # read by makedefs/MakeInc.def (patch 0125); pushes build the a9y variant
+  SWEET_VARIANT: ${{ github.event_name == 'workflow_dispatch' && inputs.sweet_variant || 'a9y' }}
 
 jobs:
   build:
