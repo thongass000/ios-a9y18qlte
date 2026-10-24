@@ -10,14 +10,11 @@ on:
         description: RELEASE / DEVELOPMENT / DEBUG
         default: DEVELOPMENT
       machine_config:
-        description: xnu MACHINE_CONFIG
-        default: SWEET
+        description: xnu MACHINE_CONFIG (A9Y18QLTE = Galaxy A9 2018; SWEET = upstream's sweet/flame)
+        default: A9Y18QLTE
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
-      sweet_variant:
-        description: SWEET board variant (a9y = Galaxy A9 2018, ARMv8.0 + 4K pages; empty = flame/sweet)
-        default: a9y
   push:
     branches: [main]
     paths:
@@ -33,9 +30,7 @@ env:
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
-  # read by makedefs/MakeInc.def (patch 0125); pushes build the a9y variant
-  SWEET_VARIANT: ${{ github.event_name == 'workflow_dispatch' && inputs.sweet_variant || 'a9y' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'A9Y18QLTE' }}
 
 jobs:
   build:
@@ -56,7 +51,7 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
-          if [ "$SWEET_VARIANT" = a9y ]; then
+          if [ "$MACHINE_CONFIG" = A9Y18QLTE ]; then
             # The Kryo 260 is ARMv8.0: build libfirehose_kernel for the kernel's CPU too.
             # Xcode's default arm64 CPU has LSE, which put cas/ldadd in the log buffer code.
             sed -i '' '/-target libfirehose_kernel/s/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS='"'"'$(inherited) -mcpu=cortex-a53+crc+crypto'"'"'/' dxb/build.sh
