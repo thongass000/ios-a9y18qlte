@@ -28,21 +28,82 @@ index d405964..5d43ce3 100644
  static LCK_GRP_DECLARE(sweet_pmem_grp, "sweet_pmem");
  static LCK_MTX_DECLARE(sweet_pmem_lock, &sweet_pmem_grp);
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
-index 6a121c5..af5e8ce 100644
+index 6a121c5..1395b4a 100644
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
-@@ -59,6 +59,11 @@ sweet_spmi_init(void)
- 		return sp_ready ? 0 : -1;
- 	}
- 	sp_attempted = true;
+@@ -15,9 +15,28 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
 +#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
-+	/* SDM660's arbiter is v3 at 0x0800f000 (core) / 0x09400000 (obsrvr): not ported, no reads */
-+	printf("SWEET BATTERY: SPMI not supported on a9y18qlte yet\n");
-+	return -1;
++/*
++ * SDM660: arbiter v3 (qcom,spmi@800f000). The APID map is at core + 0x800
++ * and each APID's observer channel is 0x8000 bytes (v5: 0x900 and 0x80).
++ */
++#define SP_CORE_PA      0x0800f000u
++#define SP_OBS_PA       0x09400000u
++#define SP_CFG_PA       0x0800a000u
++#define SP_CORE_SIZE    0x1000u
++#define SP_OBS_SIZE     0x1000000u
++#define SP_APID_MAP     0x800u
++#define SP_CHAN_STRIDE  0x8000u
++#define SP_MAX_APIDS    512u
++#else
+ #define SP_CORE_PA 0x0c440000u
+ #define SP_OBS_PA  0x0e600000u
+ #define SP_CFG_PA  0x0c40a000u
++#define SP_CORE_SIZE    0x2000u
++#define SP_OBS_SIZE     0x10000u        /* EE 0, 512 * 0x80 */
++#define SP_APID_MAP     0x900u
++#define SP_CHAN_STRIDE  0x80u
 +#endif
- 	sp_lock = IOLockAlloc();
+ #define SP_NO_APID 0xffffu
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+@@ -40,7 +59,7 @@ sp_find_apid(unsigned ppid)
+ {
+ 	uint16_t found = SP_NO_APID;
+ 	for (unsigned i = 0; i < sp_count; ++i) {
+-		uint32_t map = sp_rd(sp_core, 0x900u + 4u * i);
++		uint32_t map = sp_rd(sp_core, SP_APID_MAP + 4u * i);
+ 		if (!map || ((map >> 8) & 0xfffu) != ppid) {
+ 			continue;
+ 		}
+@@ -63,17 +82,23 @@ sweet_spmi_init(void)
  	if (!sp_lock) {
  		return -1;
+ 	}
+-	sp_core = ml_io_map(SP_CORE_PA, 0x2000);
++	sp_core = ml_io_map(SP_CORE_PA, SP_CORE_SIZE);
+ 	sp_cfg = ml_io_map(SP_CFG_PA, 0x1000);
+-	sp_obs = ml_io_map(SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
++	sp_obs = ml_io_map(SP_OBS_PA, SP_OBS_SIZE);
+ 	if (!sp_core || !sp_cfg || !sp_obs) {
+ 		printf("SWEET BATTERY: SPMI mapping failed\n");
+ 		return -1;
+ 	}
+ 	uint32_t arb_version = sp_rd(sp_core, 0);
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	/* v3 has no APID count register: the map has 512 entries */
++	sp_count = SP_MAX_APIDS;
++	if (arb_version < 0x30000000u || arb_version >= 0x50000000u) {
++#else
+ 	sp_count = sp_rd(sp_core, 4) & 0x7ffu;
+ 	if (arb_version < 0x50000000u || arb_version >= 0x70000000u ||
+ 	    !sp_count || sp_count > 512) {
++#endif
+ 		printf("SWEET BATTERY: unsupported SPMI arb=%#x APIDs=%u\n",
+ 		    arb_version, sp_count);
+ 		return -1;
+@@ -100,7 +125,7 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		IOLockUnlock(sp_lock);
+ 		return -1;
+ 	}
+-	unsigned off = 0x80u * apid;
++	unsigned off = SP_CHAN_STRIDE * apid;
+ 	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index 99a9c87..14de826 100644
 --- a/bsd/dev/sweet_ufs.c
@@ -479,7 +540,7 @@ index 0000000..7c82491
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 2545cf9..fb8feb3 100644
+index 2545cf9..fe99814 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
 @@ -20,6 +20,9 @@
@@ -492,21 +553,13 @@ index 2545cf9..fb8feb3 100644
  
  class SweetCPU;
  static SweetCPU *sweet_cpus[MAX_CPUS];
-@@ -154,6 +157,18 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -154,6 +157,10 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  		if (kr != KERN_SUCCESS) {
  			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
  		}
 +#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
-+		/*
-+		 * The first boot on the phone hung right here, in IOSleep(): show
-+		 * whether timer interrupts and the self-SGI arrive, spinning instead.
-+		 */
++		/* the first IRQ wait: the GIC state if it never returns (pe_init_fiq ARE_NS) */
 +		sweet_gic_dump("start");
-+		nanoseconds_to_deadline(NSEC_PER_SEC, &deadline);
-+		while (mach_absolute_time() < deadline) {
-+			;
-+		}
-+		sweet_gic_dump("1s");
 +#endif
  		/* processor_start() is asynchronous for secondaries in this XNU. */
  		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
