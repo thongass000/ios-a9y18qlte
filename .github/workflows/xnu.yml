@@ -56,6 +56,13 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          if [ "$SWEET_VARIANT" = a9y ]; then
+            # The Kryo 260 is ARMv8.0: build libfirehose_kernel for the kernel's CPU too.
+            # Xcode's default arm64 CPU has LSE, which put cas/ldadd in the log buffer code.
+            sed -i '' '/-target libfirehose_kernel/s/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS='"'"'$(inherited) -mcpu=cortex-a53+crc+crypto'"'"'/' dxb/build.sh
+            grep 'target libfirehose_kernel' dxb/build.sh
+            grep -q 'cortex-a53' dxb/build.sh
+          fi
           ls dxb/patches
 
       - name: Deps
