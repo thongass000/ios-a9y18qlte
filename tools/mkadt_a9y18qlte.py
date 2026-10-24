@@ -8,7 +8,10 @@ the a9y18qlte DTB, /proc/iomem or the probe shim's log. Nodes for hardware
 this board does not have, or whose drivers are not ported (UFS, Wi-Fi,
 display), are dropped: the flame drivers only start from sweet-ufs, so
 without it none of them touches SDM660 registers.
-Usage:  mkadt_a9y18qlte.py OUT.adt [--dump]
+Usage:  mkadt_a9y18qlte.py OUT.adt [--dump] [--qemu]
+--qemu: the phone's RAM map with QEMU virt's GIC, CNTFRQ and one CPU (the
+kernel's console mirror sits just below the phone's end of RAM, so QEMU
+needs the same memory layout, not mkadt.py --qemu's).
 """
 import os, sys
 
@@ -64,8 +67,8 @@ def drop(n, *names):
     n.children = [c for c in n.children if prop(c, 'name') not in [cstr(x) for x in names]]
 
 
-def build():
-    root = mkadt.build(highmem=True)
+def build(qemu=False):
+    root = mkadt.build(qemu=qemu, highmem=True)
 
     set_prop(root, 'compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet')
              + cstr('samsung,a9y18qlte') + cstr('qcom,sdm660') + cstr('AppleARM'))
@@ -79,7 +82,8 @@ def build():
     cpus = child(root, 'cpus')
     template = cpus.children[0]
     cpus.children = []
-    for core, (mpidr, hz) in enumerate(CPUS):
+    timebase = mkadt.QEMU_TIMEBASE if qemu else TIMEBASE
+    for core, (mpidr, hz) in enumerate(CPUS[:1] if qemu else CPUS):
         n = adt.Node()
         n.props = list(template.props)
         n.children = []
@@ -92,16 +96,17 @@ def build():
         set_prop(n, 'cluster-core-id', u32(core))
         set_prop(n, 'l2-cache-id', u32(mpidr >> 8))
         set_prop(n, 'state', cstr('running' if core == 0 else 'stopped'))
-        set_prop(n, 'timebase-frequency', u32(TIMEBASE))
+        set_prop(n, 'timebase-frequency', u32(timebase))
         set_prop(n, 'clock-frequency', u32(hz))
-        set_prop(n, 'peripheral-frequency', u32(TIMEBASE))
-        set_prop(n, 'fixed-frequency', u32(TIMEBASE))
+        set_prop(n, 'peripheral-frequency', u32(timebase))
+        set_prop(n, 'fixed-frequency', u32(timebase))
         cpus.children.append(n)
 
     arm_io = child(root, 'arm-io')
-    gic = child(arm_io, 'gic')
-    set_prop(gic, 'reg', u64(GICD - SOC_BASE, GICD_SIZE, GICR - SOC_BASE, GICR_SIZE))
-    set_prop(gic, 'virtual-timer-intid', u32(VTIMER_INTID))
+    if not qemu:	# mkadt.build(qemu=True) already has QEMU virt's GIC and timer PPI
+        gic = child(arm_io, 'gic')
+        set_prop(gic, 'reg', u64(GICD - SOC_BASE, GICD_SIZE, GICR - SOC_BASE, GICR_SIZE))
+        set_prop(gic, 'virtual-timer-intid', u32(VTIMER_INTID))
     drop(arm_io, 'wlan', 'disp0')
 
     fbcon = child(root, 'sweet-fbcon')
@@ -110,13 +115,15 @@ def build():
     set_prop(fbcon, 'height', u32(FB_H))
     set_prop(fbcon, 'stride', u32(FB_STRIDE))
 
-    set_prop(child(root, 'pram'), 'reg', u64(PANIC_LOG_PA, mkadt.PANIC_LOG_SIZE))
-    drop(root, 'sweet-ufs')
+    # iBoot's panic region; mkadt.build(qemu=True) has none, the phone and QEMU both get it here
+    drop(root, 'pram', 'sweet-ufs')
+    root.children.append(node('pram', [('AAPL,phandle', u32(899)),
+                                       ('reg', u64(PANIC_LOG_PA, mkadt.PANIC_LOG_SIZE))]))
     return root
 
 
 if __name__ == '__main__':
-    blob = adt.serialize(build())
+    blob = adt.serialize(build(qemu='--qemu' in sys.argv))
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
         adt.dump(adt.parse(blob)[0])
