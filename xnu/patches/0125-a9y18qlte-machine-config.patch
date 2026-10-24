@@ -184,6 +184,39 @@ index 0000000..7c82491
 +
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..fb8feb3 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -20,6 +20,9 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++extern "C" void sweet_gic_dump(const char *when);       /* pexpert/arm/pe_fiq.c */
++#endif
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -154,6 +157,18 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		if (kr != KERN_SUCCESS) {
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++		/*
++		 * The first boot on the phone hung right here, in IOSleep(): show
++		 * whether timer interrupts and the self-SGI arrive, spinning instead.
++		 */
++		sweet_gic_dump("start");
++		nanoseconds_to_deadline(NSEC_PER_SEC, &deadline);
++		while (mach_absolute_time() < deadline) {
++			;
++		}
++		sweet_gic_dump("1s");
++#endif
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 index 2514af3..a48fecf 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
@@ -383,6 +416,24 @@ index cd7cc4c..4cf963e 100644
  	__asm__ volatile("dsb ishst" ::: "memory");
  }
  #endif
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..13d00e2 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1864,6 +1864,13 @@ sleh_irq(arm_saved_state_t *state)
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+ 
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	/* read by sweet_gic_dump() (pexpert/arm/pe_fiq.c), defined there */
++	sweet_irq_counts[intid == sweet_vtimer_intid ? 0 : intid < 16 ? 1 : intid < 1020 ? 2 : 3]++;
++	if (intid >= 16 && intid < 1020 && intid != sweet_vtimer_intid) {
++		sweet_irq_last_other = intid;
++	}
++#endif
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index 145bb8b..45d4ddc 100644
 --- a/osfmk/arm64/start.s
@@ -507,6 +558,79 @@ index 54edb01..0e9b358 100644
  			panic("kmem_range_init: vm_map_locate_space failing for claim %s",
  			    sp.kc_name);
  		}
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..b253ac6 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -222,6 +222,51 @@ pe_init_fiq()
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++#define GICR_ISPENDR0                           0x10200
++#define GICR_ISACTIVER0                         0x10300
++#define GICD_TYPER                              0x4
++#define GICD_ISENABLER(n)                       (0x100 + 4 * (n))
++#define GICD_ISPENDR(n)                         (0x200 + 4 * (n))
++
++uint64_t sweet_irq_counts[4];
++uint32_t sweet_irq_last_other;
++void sweet_gic_dump(const char *when);
++
++/*
++ * a9y18qlte bring-up: this CPU's timer and GIC state, read without taking
++ * an interrupt, for when IRQs never arrive on the phone.
++ */
++void
++sweet_gic_dump(const char *when)
++{
++	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++
++	kprintf("SWEET GIC %s: DAIF=0x%llx CNTV_CTL=0x%llx CNTV_CVAL=0x%llx CNTVCT=0x%llx CNTP_CTL=0x%llx\n",
++	    when, __builtin_arm_rsr64("DAIF"), __builtin_arm_rsr64("CNTV_CTL_EL0"),
++	    __builtin_arm_rsr64("CNTV_CVAL_EL0"), __builtin_arm_rsr64("CNTVCT_EL0"),
++	    __builtin_arm_rsr64("CNTP_CTL_EL0"));
++	kprintf("SWEET GIC %s: HPPIR1=%llu RPR=0x%llx PMR=0x%llx IGRPEN1=%llu CTLR=0x%llx GICD_CTLR=0x%x\n",
++	    when, __builtin_arm_rsr64("ICC_HPPIR1_EL1"), __builtin_arm_rsr64("ICC_RPR_EL1"),
++	    __builtin_arm_rsr64("ICC_PMR_EL1"), __builtin_arm_rsr64("ICC_IGRPEN1_EL1"),
++	    __builtin_arm_rsr64("ICC_CTLR_EL1"), gicd_read32(GICD_CTLR));
++	kprintf("SWEET GIC %s: GICR en=0x%x pend=0x%x act=0x%x grp=0x%x\n",
++	    when, gicr_read32(GICR_ISENABLER0), gicr_read32(GICR_ISPENDR0),
++	    gicr_read32(GICR_ISACTIVER0), gicr_read32(GICR_IGROUPR0));
++	kprintf("SWEET GIC %s: IRQs timer=%llu ipi=%llu other=%llu (last %u) spurious=%llu\n",
++	    when, sweet_irq_counts[0], sweet_irq_counts[1], sweet_irq_counts[2],
++	    sweet_irq_last_other, sweet_irq_counts[3]);
++	unsigned int lines = 32 * ((gicd_read32(GICD_TYPER) & 0x1f) + 1);
++	for (unsigned int n = 1; n < lines / 32; n++) {
++		uint32_t en = gicd_read32(GICD_ISENABLER(n)), pend = gicd_read32(GICD_ISPENDR(n));
++		if (en || pend) {
++			kprintf("SWEET GIC %s: SPI %u-%u en=0x%x pend=0x%x\n",
++			    when, 32 * n, 32 * n + 31, en, pend);
++		}
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
+ #else
+ void
+ pe_init_fiq()
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 9004f2b..0e7f0f6 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -39,6 +39,12 @@ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern uint32_t sweet_vtimer_intid;
+ #endif
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++/* sleh_irq() counts: timer, IPI, other, spurious; sweet_gic_dump() prints them */
++extern uint64_t sweet_irq_counts[4];
++extern uint32_t sweet_irq_last_other;
++void sweet_gic_dump(const char *when);
++#endif
+ 
+ #ifdef PRIVATE
+ /**
 diff --git a/pexpert/pexpert/arm64/A9Y18QLTE.h b/pexpert/pexpert/arm64/A9Y18QLTE.h
 new file mode 100644
 index 0000000..eae2405
