@@ -559,7 +559,7 @@ index 54edb01..0e9b358 100644
  			    sp.kc_name);
  		}
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index 6089db9..fd1f001 100644
+index 6089db9..3e2fcb2 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
 @@ -148,7 +148,16 @@ pe_init_fiq()
@@ -579,7 +579,23 @@ index 6089db9..fd1f001 100644
  		gicr_waker &= ~GICR_WAKER_PROCESSORSLEEP;
  
  		gicr_write32(GICR_WAKER, gicr_waker);
-@@ -175,7 +184,19 @@ pe_init_fiq()
+@@ -170,12 +179,35 @@ pe_init_fiq()
+ 	 * non-secure writes to it are ignored. Everything we own is Group 1 NS
+ 	 * and arrives as an IRQ (see sleh_irq). GICR_IGROUPR0 reads as zero
+ 	 * from the non-secure side even after this write; delivery still works.
++	 *
++	 * Affinity routing first, as Linux's gic_dist_init() does: until
++	 * ARE_NS is set the redistributor's SGI/PPI registers ignore
++	 * non-secure writes. flame's ABL leaves it set, a9y18qlte's leaves
++	 * GICD_CTLR at 0 (the enables below read back 0 on the phone).
+ 	 */
++	if (!(gicd_read32(GICD_CTLR) & GICD_CTLR_ARE_NS)) {
++		gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) | GICD_CTLR_ARE_NS);
++		while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++			;
++		}
++	}
+ 	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);
  	for (unsigned int i = 0; i < 32; i += 4) {
  		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
  	}
@@ -599,7 +615,7 @@ index 6089db9..fd1f001 100644
  #else
  	// Configure timers and legacy FIQ to be group 0
  	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
-@@ -222,6 +243,57 @@ pe_init_fiq()
+@@ -222,6 +254,57 @@ pe_init_fiq()
  	__builtin_arm_isb(ISB_SY);
  #endif /* SWEET */
  }
