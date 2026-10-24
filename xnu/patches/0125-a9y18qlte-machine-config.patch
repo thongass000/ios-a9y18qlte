@@ -394,6 +394,36 @@ index c013288..37610a9 100644
  #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
  #endif
  
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+index 54edb01..0e9b358 100644
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -3641,6 +3641,25 @@ kmem_scramble_ranges(void)
+ 		struct mach_vm_range *sp_range = sp.kc_range;
+ 		if (vm_map_locate_space(kernel_map, sp.kc_size, 0,
+ 		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL) != KERN_SUCCESS) {
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++			/* bring-up: the kernel map and claims behind this failure */
++			vm_map_size_t a9y_free = 0, a9y_largest = 0;
++			vm_map_sizes(kernel_map, NULL, &a9y_free, &a9y_largest);
++			printf("A9Y kmem: claim %u/%u %s size %#llx, start %#llx, map %#llx-%#llx free %#llx largest %#llx\n",
++			    i, kmem_claim_count, sp.kc_name, (uint64_t)sp.kc_size, (uint64_t)start,
++			    (uint64_t)kernel_map->min_offset, (uint64_t)kernel_map->max_offset,
++			    (uint64_t)a9y_free, (uint64_t)a9y_largest);
++			for (uint32_t j = 0; j < kmem_claim_count; j++) {
++				printf("A9Y kmem:  claim %u %s size %#llx range %#llx-%#llx\n", j,
++				    kmem_claims[j].kc_name, (uint64_t)kmem_claims[j].kc_size,
++				    (uint64_t)kmem_claims[j].kc_range->min_address,
++				    (uint64_t)kmem_claims[j].kc_range->max_address);
++			}
++			for (vm_map_entry_t e = vm_map_first_entry(kernel_map);
++			    e != vm_map_to_entry(kernel_map); e = e->vme_next) {
++				printf("A9Y kmem:  entry %#llx-%#llx\n", (uint64_t)e->vme_start, (uint64_t)e->vme_end);
++			}
++#endif
+ 			panic("kmem_range_init: vm_map_locate_space failing for claim %s",
+ 			    sp.kc_name);
+ 		}
 diff --git a/pexpert/pexpert/arm64/A9Y18QLTE.h b/pexpert/pexpert/arm64/A9Y18QLTE.h
 new file mode 100644
 index 0000000..eae2405
