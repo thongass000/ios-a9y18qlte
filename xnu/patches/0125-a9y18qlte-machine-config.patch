@@ -307,6 +307,19 @@ index da0bbba..04c315c 100644
  	cbz		w10, Ltrylock_dequeue_success
  
  	mov		x0, #-1			// Failed
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index bd099f8..7c03d6c 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10893,6 +10893,8 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 
+ 	do {
+ 		int text_leaf_index = random() % num_ptes;
++		/* a VM page is PAGE_RATIO leaf entries and must start on a VM page boundary */
++		text_leaf_index &= ~(PAGE_RATIO - 1);
+ 
+ 		// Generate a VA for the commpage text with the same root and twig index as data
+ 		// comm page, but with new leaf index we've just generated.
 diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
 index 75f3db0..cdb3389 100644
 --- a/osfmk/arm/pmap/pmap.h
