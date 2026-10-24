@@ -27,6 +27,39 @@ index d405964..5d43ce3 100644
  
  static LCK_GRP_DECLARE(sweet_pmem_grp, "sweet_pmem");
  static LCK_MTX_DECLARE(sweet_pmem_lock, &sweet_pmem_grp);
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 6a121c5..af5e8ce 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -59,6 +59,11 @@ sweet_spmi_init(void)
+ 		return sp_ready ? 0 : -1;
+ 	}
+ 	sp_attempted = true;
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	/* SDM660's arbiter is v3 at 0x0800f000 (core) / 0x09400000 (obsrvr): not ported, no reads */
++	printf("SWEET BATTERY: SPMI not supported on a9y18qlte yet\n");
++	return -1;
++#endif
+ 	sp_lock = IOLockAlloc();
+ 	if (!sp_lock) {
+ 		return -1;
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 99a9c87..444c68e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -705,7 +705,12 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+  *   +0x1000 ring bytes (offset of byte n = n % ring size)
+  * The next shim boot copies its tail to UFS (tools/flame-log-pull.sh rescue).
+  */
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++/* a9y18qlte RAM ends at 0x1fd8c0000: mirror at 0x1fd400000-0x1fd801000, XNU below it */
++#define SWEET_MIRROR_PA         0x1fd400000ULL
++#else
+ #define SWEET_MIRROR_PA         0x1fe000000ULL
++#endif
+ struct sweet_mirror_header {
+ 	char magic[8];
+ 	uint64_t total;
 diff --git a/config/MASTER.arm64.a9y18qlte b/config/MASTER.arm64.a9y18qlte
 new file mode 100644
 index 0000000..7c82491
@@ -151,6 +184,22 @@ index 0000000..7c82491
 +
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 2514af3..a48fecf 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -33,7 +33,11 @@ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+  */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++#define FLAME_WDT_PA    0x17817000      /* SDM660 qcom,wdt@17817000, same register layout */
++#else
+ #define FLAME_WDT_PA    0x17c10000
++#endif
+ #define FLAME_WDT_RST   0x04
+ #define FLAME_WDT_EN    0x08
+ #define FLAME_WDT_PET_S 5
 diff --git a/libkern/conf/Makefile.template b/libkern/conf/Makefile.template
 index aca295c..5067fb4 100644
 --- a/libkern/conf/Makefile.template
@@ -259,13 +308,20 @@ index da0bbba..04c315c 100644
  
  	mov		x0, #-1			// Failed
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
-index cd7cc4c..ce03f02 100644
+index cd7cc4c..4cf963e 100644
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1833,21 +1833,25 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+@@ -1832,22 +1832,31 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+  * for a framebuffer alias that survives bootstrap TTBR0 teardown. Device-GRE
   * like start.s: the 32MB block reaches into pil_slpi_region on flame.
   */
- #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
+-#define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
++/*
++ * LOW_GLOBAL_BASE_ADDRESS, not VM_MIN_KERNEL_ADDRESS: the same address with
++ * ARM_LARGE_MEMORY, but in the 4K/iOS layout (A9Y18QLTE) only the low
++ * globals' L1 entry (shared with the kernel image) has an L2 table yet.
++ */
++#define SWEET_EARLY_FB_VA (LOW_GLOBAL_BASE_ADDRESS + ARM_TT_L2_SIZE)
 +/* the window start.s maps: one L2 block with 16K pages, sixteen with 4K (A9Y18QLTE) */
 +#define SWEET_EARLY_FB_SPAN (32ULL << 20)
  
@@ -340,10 +396,10 @@ index c013288..37610a9 100644
  
 diff --git a/pexpert/pexpert/arm64/A9Y18QLTE.h b/pexpert/pexpert/arm64/A9Y18QLTE.h
 new file mode 100644
-index 0000000..8be1857
+index 0000000..eae2405
 --- /dev/null
 +++ b/pexpert/pexpert/arm64/A9Y18QLTE.h
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,29 @@
 +/*
 + * Board config for the Samsung Galaxy A9 2018 ("a9y18qlte", Qualcomm SDM660):
 + * Kryo 260 = Cortex-A73 + Cortex-A53, ARMv8.0: no LSE, no PAN, no PAC, and
@@ -358,6 +414,17 @@ index 0000000..8be1857
 +#define _PEXPERT_ARM64_A9Y18QLTE_H
 +
 +#define A9Y18QLTE                 1
++
++/*
++ * Splash framebuffer the bootloader scans out (cont_splash_mem, video-mode
++ * S6E3FA7 panel), 1080x2220 a8r8g8b8 with 4320-byte rows: MDP VIG0 as read by
++ * the a9y18qlte probe shim. Inside the same 32MB block as flame's.
++ */
++#define SWEET_EARLY_FB_PA         0x9d400000
++#define SWEET_EARLY_FB_BLOCK_PA   0x9c000000
++#define SWEET_EARLY_FB_WIDTH      1080
++#define SWEET_EARLY_FB_HEIGHT     2220
++#define SWEET_EARLY_FB_STRIDE     4320
 +
 +#include <pexpert/arm64/SWEET.h>
 +
@@ -377,7 +444,7 @@ index c7d274f..8fad651 100644
  
  # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
-index 963e02d..6d1541b 100644
+index 963e02d..b87877e 100644
 --- a/pexpert/pexpert/arm64/SWEET.h
 +++ b/pexpert/pexpert/arm64/SWEET.h
 @@ -33,8 +33,10 @@
@@ -390,6 +457,22 @@ index 963e02d..6d1541b 100644
 +#endif
  
  #define HAS_GIC_V3                1
+ 
+@@ -55,12 +57,15 @@
+  * ABL leaves the command-mode panel autorefreshing), 1080x2280 a8r8g8b8,
+  * 4320-byte rows. The bootstrap console uses it before the ADT is parsed.
+  * SWEET_EARLY_FB_BLOCK_PA is the 32MB L2 block holding it.
++ * A board header may set its own before including this one (A9Y18QLTE.h).
+  */
++#ifndef SWEET_EARLY_FB_PA
+ #define SWEET_EARLY_FB_PA         0x9c400000
+ #define SWEET_EARLY_FB_BLOCK_PA   0x9c000000
+ #define SWEET_EARLY_FB_WIDTH      1080
+ #define SWEET_EARLY_FB_HEIGHT     2280
+ #define SWEET_EARLY_FB_STRIDE     4320
++#endif
+ 
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
  
 diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
 index 88e524a..5ef2c86 100644
