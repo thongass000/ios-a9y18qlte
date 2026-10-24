@@ -8,7 +8,9 @@ the a9y18qlte DTB, /proc/iomem or the probe shim's log. Nodes for hardware
 this board does not have, or whose drivers are not ported (Wi-Fi, display),
 are dropped. sweet-ufs points at the SDM660 UFS host; on A9Y18QLTE
 sweet_ufs.c starts only the console log after it, none of the flame drivers.
-Usage:  mkadt_a9y18qlte.py OUT.adt [--dump] [--qemu]
+Usage:  mkadt_a9y18qlte.py OUT.adt [--dump] [--qemu] [--root-runs FIEMAP.txt]
+--root-runs: the root is a preallocated file in userdata; FIEMAP.txt is
+tools/fiemap's output for it (a9y-ios), its extents become a9y,root-runs.
 --qemu: the phone's RAM map with QEMU virt's GIC, CNTFRQ and one CPU (the
 kernel's console mirror sits just below the phone's end of RAM, so QEMU
 needs the same memory layout, not mkadt.py --qemu's).
@@ -70,7 +72,7 @@ def drop(n, *names):
     n.children = [c for c in n.children if prop(c, 'name') not in [cstr(x) for x in names]]
 
 
-def build(qemu=False):
+def build(qemu=False, root_runs=None):
     root = mkadt.build(qemu=qemu, highmem=True)
 
     set_prop(root, 'compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet')
@@ -123,12 +125,39 @@ def build(qemu=False):
     root.children.append(node('pram', [('AAPL,phandle', u32(899)),
                                        ('reg', u64(PANIC_LOG_PA, mkadt.PANIC_LOG_SIZE))]))
     if not qemu:	# bsd/dev/sweet_ufs.c: the UFS host ABL leaves running
-        set_prop(child(root, 'sweet-ufs'), 'reg', u64(UFS, UFS_SIZE))
+        ufs = child(root, 'sweet-ufs')
+        set_prop(ufs, 'reg', u64(UFS, UFS_SIZE))
+        if root_runs:
+            set_prop(ufs, 'a9y,root-runs', b''.join(u64(*r) for r in root_runs))
     return root
 
 
+def read_runs(path):
+    """tools/fiemap output for the root file in userdata (bytes, hex) ->
+    physically contiguous runs in 4 KiB blocks: (logical, physical, count)."""
+    runs = []
+    for line in open(path):
+        if not line.startswith('0x'):
+            continue
+        lo, ph, ln = (int(x, 16) for x in line.split()[:3])
+        if (lo | ph | ln) % 4096:
+            raise SystemExit(f'{path}: extent not 4 KiB aligned: {line.strip()}')
+        lo, ph, ln = lo // 4096, ph // 4096, ln // 4096
+        if runs and runs[-1][0] + runs[-1][2] == lo and runs[-1][1] + runs[-1][2] == ph:
+            runs[-1][2] += ln
+        else:
+            runs.append([lo, ph, ln])
+    if not runs or runs[0][0] != 0 or any(a[0] + a[2] != b[0] for a, b in zip(runs, runs[1:])):
+        raise SystemExit(f'{path}: extents do not cover the file from 0 without holes')
+    return [tuple(r) for r in runs]
+
+
 if __name__ == '__main__':
-    blob = adt.serialize(build(qemu='--qemu' in sys.argv))
+    runs = None
+    if '--root-runs' in sys.argv:
+        runs = read_runs(sys.argv[sys.argv.index('--root-runs') + 1])
+        print(f'root file: {len(runs)} runs, {sum(r[2] for r in runs) * 4096 >> 20} MiB', file=sys.stderr)
+    blob = adt.serialize(build(qemu='--qemu' in sys.argv, root_runs=runs))
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
         adt.dump(adt.parse(blob)[0])
