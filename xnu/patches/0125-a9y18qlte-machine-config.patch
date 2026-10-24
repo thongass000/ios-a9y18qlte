@@ -44,7 +44,7 @@ index 6a121c5..af5e8ce 100644
  	if (!sp_lock) {
  		return -1;
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 99a9c87..e4c3db4 100644
+index 99a9c87..14de826 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -110,6 +110,7 @@ static struct {
@@ -225,24 +225,135 @@ index 99a9c87..e4c3db4 100644
  struct sweet_mirror_header {
  	char magic[8];
  	uint64_t total;
-@@ -837,10 +925,16 @@ struct sweet_log_header {
+@@ -834,56 +922,95 @@ struct sweet_log_header {
+ 	uint64_t total, seq;
+ };
+ 
++/* device block of the log's header, 0 = no log; what is on disk so far */
++static uint64_t sweet_log_base, sweet_log_flushed, sweet_log_seq;
++
++/* Bring the on-disk log up to date. Called with sweet_ufs_lock held (or from a panic). */
++static int
++sweet_log_write(void)
++{
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	if (total == sweet_log_flushed) {
++		return 0;
++	}
++	uint64_t pos = total - sweet_log_flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : sweet_log_flushed;
++	int error = 0;
++
++	while (pos < total && !error) {
++		uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
++		uint32_t blk = off / UFS_BLOCK;
++		uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
++		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++		memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++		error = ufs_write_blocks(sweet_log_base + 1 + blk, n);
++		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++	}
++	if (!error) {
++		struct sweet_log_header h = {
++			.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++			.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++sweet_log_seq,
++		};
++		bzero(bounce, UFS_BLOCK);
++		memcpy(bounce, &h, sizeof(h));
++		error = ufs_write_blocks(sweet_log_base, 1);
++	}
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	if (!error) {
++		sweet_log_flushed = total;
++	}
++	return error;
++}
++
  static void
  sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
  {
 -	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
+-	uint64_t flushed = 0, seq = 0;
+-	void *bounce = (void *)(su.dma + DMA_BOUNCE);
 +	uint32_t run = SWEET_LOG_BLOCKS;
 +	uint64_t base = ufs_map(su.nblocks - SWEET_LOG_BLOCKS, &run);
- 	uint64_t flushed = 0, seq = 0;
- 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
  
 +	if (run != SWEET_LOG_BLOCKS) {
 +		printf("SWEET LOG: the log area is not contiguous on the device, no log\n");
 +		return;
 +	}
-+
  	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
  	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
++	lck_mtx_lock(&sweet_ufs_lock);
++	sweet_log_base = base;
++	lck_mtx_unlock(&sweet_ufs_lock);
  	for (;;) {
+ 		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
+-		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
+-		if (total == flushed) {
+-			continue;
+-		}
+-		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
+-		int error = 0;
+-
+ 		lck_mtx_lock(&sweet_ufs_lock);
+-		while (pos < total && !error) {
+-			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
+-			uint32_t blk = off / UFS_BLOCK;
+-			uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
+-			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
+-			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+-			memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+-			error = ufs_write_blocks(base + 1 + blk, n);
+-			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
+-		}
+-		if (!error) {
+-			struct sweet_log_header h = {
+-				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
+-				.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++seq,
+-			};
+-			bzero(bounce, UFS_BLOCK);
+-			memcpy(bounce, &h, sizeof(h));
+-			error = ufs_write_blocks(base, 1);
+-		}
+-		if (!error) {
+-			error = ufs_sync_cache();
+-		}
++		int error = sweet_log_write();
+ 		lck_mtx_unlock(&sweet_ufs_lock);
+ 		if (error) {
+ 			printf("SWEET LOG: write failed (%d), stopping\n", error);
++			sweet_log_base = 0;
+ 			return;
+ 		}
+-		flushed = total;
+ 	}
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++/*
++ * a9y18qlte's DRAM does not survive the watchdog reset that follows a
++ * panic, so the panic path (osfmk/kern/debug.c, after the panic log) writes
++ * the console out here, polled. Not while a transfer holds the bounce
++ * buffer: then the log stays at the thread's last flush.
++ */
++void sweet_log_panic_flush(void);
++
++void
++sweet_log_panic_flush(void)
++{
++	if (sweet_log_base && su.ready && !kdp_lck_mtx_lock_spin_is_acquired(&sweet_ufs_lock)) {
++		(void)sweet_log_write();
++	}
++}
++#endif
++
+ static void
+ sweet_log_start(void)
+ {
 diff --git a/config/MASTER.arm64.a9y18qlte b/config/MASTER.arm64.a9y18qlte
 new file mode 100644
 index 0000000..7c82491
@@ -664,6 +775,24 @@ index 145bb8b..45d4ddc 100644
  #endif
  
  	/* Ensure TTEs are visible */
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 437adb1..0c897c4 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1309,6 +1309,13 @@ debugger_collect_diagnostics(unsigned int exception, unsigned int code, unsigned
+ 		 * hooked up for embedded
+ 		 */
+ 		SavePanicInfo(debugger_message, debugger_panic_data, debugger_panic_options);
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++		{
++			/* bsd/dev/sweet_ufs.c: the console to disk, RAM is lost in the reset */
++			extern void sweet_log_panic_flush(void);
++			sweet_log_panic_flush();
++		}
++#endif
+ 
+ #if DEVELOPMENT || DEBUG
+ 		INJECT_NESTED_PANIC_IF_REQUESTED(PANIC_TEST_CASE_RECURPANIC_POSTLOG);
 diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
 index 182b44a..39f2d91 100644
 --- a/osfmk/kern/zalloc.c
