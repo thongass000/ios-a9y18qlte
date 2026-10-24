@@ -559,10 +559,47 @@ index 54edb01..0e9b358 100644
  			    sp.kc_name);
  		}
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index 6089db9..b253ac6 100644
+index 6089db9..fd1f001 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
-@@ -222,6 +222,51 @@ pe_init_fiq()
+@@ -148,7 +148,16 @@ pe_init_fiq()
+ 
+ 	// Mark this PE to be awake
+ 	uint32_t gicr_waker = gicr_read32(GICR_WAKER);
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	kprintf("SWEET GIC: GICR_WAKER=0x%x\n", gicr_waker);
++	/*
++	 * As Linux does: ABL can leave ProcessorSleep set while ChildrenAsleep
++	 * still reads 0, and the redistributor then takes none of our enables.
++	 */
++	if (gicr_waker & (GICR_WAKER_CHILDRENASLEEP | GICR_WAKER_PROCESSORSLEEP)) {
++#else
+ 	if (gicr_waker & GICR_WAKER_CHILDRENASLEEP) {
++#endif
+ 		gicr_waker &= ~GICR_WAKER_PROCESSORSLEEP;
+ 
+ 		gicr_write32(GICR_WAKER, gicr_waker);
+@@ -175,7 +184,19 @@ pe_init_fiq()
+ 	for (unsigned int i = 0; i < 32; i += 4) {
+ 		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	/* Linux's gic_cpu_config(): nothing active, no PPI ABL left enabled */
++	gicr_write32(0x10380 /* GICR_ICACTIVER0 */, 0xFFFFFFFF);
++	gicr_write32(0x10180 /* GICR_ICENABLER0 */, 0xFFFF0000);
++#endif
+ 	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	while (gicr_read32(0x0 /* GICR_CTLR */) & 0x8 /* RWP */) {
++		;
++	}
++	kprintf("SWEET GIC: GICR_WAKER=0x%x ISENABLER0=0x%x after setup\n",
++	    gicr_read32(GICR_WAKER), gicr_read32(GICR_ISENABLER0));
++#endif
+ #else
+ 	// Configure timers and legacy FIQ to be group 0
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
+@@ -222,6 +243,57 @@ pe_init_fiq()
  	__builtin_arm_isb(ISB_SY);
  #endif /* SWEET */
  }
@@ -595,9 +632,15 @@ index 6089db9..b253ac6 100644
 +	    when, __builtin_arm_rsr64("ICC_HPPIR1_EL1"), __builtin_arm_rsr64("ICC_RPR_EL1"),
 +	    __builtin_arm_rsr64("ICC_PMR_EL1"), __builtin_arm_rsr64("ICC_IGRPEN1_EL1"),
 +	    __builtin_arm_rsr64("ICC_CTLR_EL1"), gicd_read32(GICD_CTLR));
-+	kprintf("SWEET GIC %s: GICR en=0x%x pend=0x%x act=0x%x grp=0x%x\n",
++	kprintf("SWEET GIC %s: GICR en=0x%x pend=0x%x act=0x%x grp=0x%x waker=0x%x\n",
 +	    when, gicr_read32(GICR_ISENABLER0), gicr_read32(GICR_ISPENDR0),
-+	    gicr_read32(GICR_ISACTIVER0), gicr_read32(GICR_IGROUPR0));
++	    gicr_read32(GICR_ISACTIVER0), gicr_read32(GICR_IGROUPR0), gicr_read32(GICR_WAKER));
++	if (!(gicr_read32(GICR_ISENABLER0) & (1U << sweet_vtimer_intid))) {
++		gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++		__builtin_arm_dsb(DSB_SY);
++		kprintf("SWEET GIC %s: timer not enabled, wrote ISENABLER0 again: en=0x%x\n",
++		    when, gicr_read32(GICR_ISENABLER0));
++	}
 +	kprintf("SWEET GIC %s: IRQs timer=%llu ipi=%llu other=%llu (last %u) spurious=%llu\n",
 +	    when, sweet_irq_counts[0], sweet_irq_counts[1], sweet_irq_counts[2],
 +	    sweet_irq_last_other, sweet_irq_counts[3]);
