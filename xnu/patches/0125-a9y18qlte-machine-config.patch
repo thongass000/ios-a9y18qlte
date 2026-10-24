@@ -28,10 +28,10 @@ index d405964..5d43ce3 100644
  static LCK_GRP_DECLARE(sweet_pmem_grp, "sweet_pmem");
  static LCK_MTX_DECLARE(sweet_pmem_lock, &sweet_pmem_grp);
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
-index 6a121c5..1395b4a 100644
+index 6a121c5..e88776f 100644
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
-@@ -15,9 +15,28 @@
+@@ -15,17 +15,56 @@
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  
@@ -44,7 +44,6 @@ index 6a121c5..1395b4a 100644
 +#define SP_OBS_PA       0x09400000u
 +#define SP_CFG_PA       0x0800a000u
 +#define SP_CORE_SIZE    0x1000u
-+#define SP_OBS_SIZE     0x1000000u
 +#define SP_APID_MAP     0x800u
 +#define SP_CHAN_STRIDE  0x8000u
 +#define SP_MAX_APIDS    512u
@@ -59,8 +58,38 @@ index 6a121c5..1395b4a 100644
 +#endif
  #define SP_NO_APID 0xffffu
  
- static vm_offset_t sp_core, sp_obs, sp_cfg;
-@@ -40,7 +59,7 @@ sp_find_apid(unsigned ppid)
+-static vm_offset_t sp_core, sp_obs, sp_cfg;
++static vm_offset_t sp_core, sp_cfg;
++#if !defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++static vm_offset_t sp_obs;
++#endif
+ static IOLock *sp_lock;
+ static unsigned sp_count;
+ static bool sp_attempted, sp_ready;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+ static bool sp_poisoned[512];
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++/* v3's 512 channels span 16 MiB, more than the I/O map has: a page each, on first use */
++static vm_offset_t sp_chan_va[SP_MAX_APIDS];
++#endif
++
++/* Observer channel of an APID, 0 if it cannot be mapped (call with sp_lock held). */
++static vm_offset_t
++sp_chan(uint16_t apid)
++{
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	if (!sp_chan_va[apid]) {
++		sp_chan_va[apid] = ml_io_map(SP_OBS_PA + SP_CHAN_STRIDE * apid, 0x1000);
++	}
++	return sp_chan_va[apid];
++#else
++	return sp_obs + SP_CHAN_STRIDE * apid;
++#endif
++}
+ 
+ static uint32_t
+ sp_rd(vm_offset_t base, unsigned off)
+@@ -40,7 +79,7 @@ sp_find_apid(unsigned ppid)
  {
  	uint16_t found = SP_NO_APID;
  	for (unsigned i = 0; i < sp_count; ++i) {
@@ -69,7 +98,7 @@ index 6a121c5..1395b4a 100644
  		if (!map || ((map >> 8) & 0xfffu) != ppid) {
  			continue;
  		}
-@@ -63,17 +82,23 @@ sweet_spmi_init(void)
+@@ -63,17 +102,29 @@ sweet_spmi_init(void)
  	if (!sp_lock) {
  		return -1;
  	}
@@ -77,8 +106,15 @@ index 6a121c5..1395b4a 100644
 +	sp_core = ml_io_map(SP_CORE_PA, SP_CORE_SIZE);
  	sp_cfg = ml_io_map(SP_CFG_PA, 0x1000);
 -	sp_obs = ml_io_map(SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
+-	if (!sp_core || !sp_cfg || !sp_obs) {
++#if !defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
 +	sp_obs = ml_io_map(SP_OBS_PA, SP_OBS_SIZE);
- 	if (!sp_core || !sp_cfg || !sp_obs) {
++	if (!sp_obs) {
++		printf("SWEET BATTERY: SPMI mapping failed\n");
++		return -1;
++	}
++#endif
++	if (!sp_core || !sp_cfg) {
  		printf("SWEET BATTERY: SPMI mapping failed\n");
  		return -1;
  	}
@@ -95,15 +131,34 @@ index 6a121c5..1395b4a 100644
  		printf("SWEET BATTERY: unsupported SPMI arb=%#x APIDs=%u\n",
  		    arb_version, sp_count);
  		return -1;
-@@ -100,7 +125,7 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+@@ -100,19 +151,23 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
  		IOLockUnlock(sp_lock);
  		return -1;
  	}
 -	unsigned off = 0x80u * apid;
-+	unsigned off = SP_CHAN_STRIDE * apid;
++	vm_offset_t chan = sp_chan(apid);
++	if (!chan) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
  	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);
  	__asm__ volatile("dmb oshst" ::: "memory");
- 	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
+-	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
++	*(volatile uint32_t *)chan = cmd; /* EXT_READL, BC=0 */
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ 	for (unsigned i = 0; i < 1000; ++i) {
+-		uint32_t status = sp_rd(sp_obs, off + 0x08u);
++		uint32_t status = sp_rd(chan, 0x08u);
+ 		if (status & 1u) {
+ 			if (status & 0x0eu) {
+ 				IOLockUnlock(sp_lock);
+ 				return -1;
+ 			}
+-			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
++			*out = (uint8_t)sp_rd(chan, 0x18u);
+ 			IOLockUnlock(sp_lock);
+ 			return 0;
+ 		}
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index 99a9c87..14de826 100644
 --- a/bsd/dev/sweet_ufs.c
