@@ -5,8 +5,8 @@
 Starts from mkadt.py's tree (the /chosen identity the iOS userland needs stays
 in step with it) and replaces what is board specific. Every address is from
 the a9y18qlte DTB, /proc/iomem or the probe shim's log. Nodes for hardware
-this board does not have, or whose drivers are not ported (Wi-Fi, display),
-are dropped. sweet-ufs points at the SDM660 UFS host; on A9Y18QLTE
+this board does not have, or whose drivers are not ported (Wi-Fi), are
+dropped; disp0 is the CPU framebuffer on the splash buffer. sweet-ufs points at the SDM660 UFS host; on A9Y18QLTE
 sweet_ufs.c starts only the console log after it, none of the flame drivers.
 Usage:  mkadt_a9y18qlte.py OUT.adt [--dump] [--qemu] [--root-runs FIEMAP.txt]
 --root-runs: the root is a preallocated file in userdata; FIEMAP.txt is
@@ -112,7 +112,8 @@ def build(qemu=False, root_runs=None):
         gic = child(arm_io, 'gic')
         set_prop(gic, 'reg', u64(GICD - SOC_BASE, GICD_SIZE, GICR - SOC_BASE, GICR_SIZE))
         set_prop(gic, 'virtual-timer-intid', u32(VTIMER_INTID))
-    drop(arm_io, 'wlan', 'disp0')
+    # disp0 stays: SweetFramebuffer (CPU copies into the splash buffer ABL keeps scanning out)
+    drop(arm_io, 'wlan')
 
     fbcon = child(root, 'sweet-fbcon')
     set_prop(fbcon, 'reg', u64(FB, FB_SIZE))
