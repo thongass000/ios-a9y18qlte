@@ -44,10 +44,54 @@ index 6a121c5..af5e8ce 100644
  	if (!sp_lock) {
  		return -1;
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 99a9c87..444c68e 100644
+index 99a9c87..a123748 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -705,7 +705,12 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+@@ -637,6 +637,26 @@ sweet_ufs_init(void)
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	/*
++	 * a9y18qlte keeps Android: the root is a preallocated file in its
++	 * userdata, written to the raw blocks (under file-based encryption, not
++	 * through the file). ufsfirst= / ufscount= give that file's 4 KiB
++	 * blocks relative to the partition; they must lie wholly inside it.
++	 */
++	uint64_t first = 0, count = 0;
++	if (!error && PE_parse_boot_argn("ufsfirst", &first, sizeof(first)) &&
++	    PE_parse_boot_argn("ufscount", &count, sizeof(count))) {
++		if (count == 0 || first >= su.nblocks || count > su.nblocks - first) {
++			printf("SWEET UFS: blocks 0x%llx+0x%llx not inside \"%s\" (0x%llx blocks)\n",
++			    first, count, want, su.nblocks);
++			error = ERANGE;
++		} else {
++			su.first_block += first;
++			su.nblocks = count;
++		}
++	}
++#endif
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+ 		return error;
+@@ -660,6 +680,8 @@ sweet_ufs_init(void)
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
++#if !defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	/* these drive SM7150/SM8150 blocks (OSM, Wi-Fi, Adreno 6xx, PM8150, touch, DWC3) */
+ 	sweet_sample_start();
+ 	sweet_cpufreq_init();
+ 	sweet_pmem_init();       /* /dev/pmem: bsd/dev/sweet_pmem.c */
+@@ -670,6 +692,7 @@ sweet_ufs_init(void)
+ 	sweet_touch_init();
+ 	sweet_fts_init();
+ 	sweet_usb_probe();
++#endif
+ 	return 0;
+ }
+ 
+@@ -705,7 +728,12 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
   *   +0x1000 ring bytes (offset of byte n = n % ring size)
   * The next shim boot copies its tail to UFS (tools/flame-log-pull.sh rescue).
   */

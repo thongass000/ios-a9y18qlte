@@ -5,9 +5,9 @@
 Starts from mkadt.py's tree (the /chosen identity the iOS userland needs stays
 in step with it) and replaces what is board specific. Every address is from
 the a9y18qlte DTB, /proc/iomem or the probe shim's log. Nodes for hardware
-this board does not have, or whose drivers are not ported (UFS, Wi-Fi,
-display), are dropped: the flame drivers only start from sweet-ufs, so
-without it none of them touches SDM660 registers.
+this board does not have, or whose drivers are not ported (Wi-Fi, display),
+are dropped. sweet-ufs points at the SDM660 UFS host; on A9Y18QLTE
+sweet_ufs.c starts only the console log after it, none of the flame drivers.
 Usage:  mkadt_a9y18qlte.py OUT.adt [--dump] [--qemu]
 --qemu: the phone's RAM map with QEMU virt's GIC, CNTFRQ and one CPU (the
 kernel's console mirror sits just below the phone's end of RAM, so QEMU
@@ -38,6 +38,9 @@ VTIMER_INTID = 19
 # cont_splash_mem: MDP VIG0 scans out 1080x2220 a8r8g8b8, 4320-byte rows
 FB, FB_SIZE = 0x9d400000, 0x23ff000
 FB_W, FB_H, FB_STRIDE = 1080, 2220, 1080 * 4
+
+# ufshc@1da4000 "ufs_mem" (the ICE at 0x1db0000 stays off: requests carry no crypto)
+UFS, UFS_SIZE = 0x1da4000, 0x3000
 
 # Kryo 260: cpu0-3 Cortex-A53 based (MPIDR 0x0-0x3), cpu4-7 Cortex-A73 based (0x100-0x103)
 CPUS = [(0x000 + i, 1843200000) for i in range(4)] + [(0x100 + i, 2208000000) for i in range(4)]
@@ -116,9 +119,11 @@ def build(qemu=False):
     set_prop(fbcon, 'stride', u32(FB_STRIDE))
 
     # iBoot's panic region; mkadt.build(qemu=True) has none, the phone and QEMU both get it here
-    drop(root, 'pram', 'sweet-ufs')
+    drop(root, 'pram')
     root.children.append(node('pram', [('AAPL,phandle', u32(899)),
                                        ('reg', u64(PANIC_LOG_PA, mkadt.PANIC_LOG_SIZE))]))
+    if not qemu:	# bsd/dev/sweet_ufs.c: the UFS host ABL leaves running
+        set_prop(child(root, 'sweet-ufs'), 'reg', u64(UFS, UFS_SIZE))
     return root
 
 
