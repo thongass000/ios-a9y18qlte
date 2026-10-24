@@ -307,6 +307,25 @@ index da0bbba..04c315c 100644
  	cbz		w10, Ltrylock_dequeue_success
  
  	mov		x0, #-1			// Failed
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index 75f3db0..cdb3389 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -111,6 +111,14 @@
+  * Upper limit on how many pages can be consumed by bootstrap page tables
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
++#elif defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++/*
++ * 4K pages and ~4GB of RAM at 0x100000000: start.s maps all of it twice (V=P
++ * and KVA) with one L2 page per GB, plus the early framebuffer's own L2 page.
++ * 8 pages overflowed into the kernel's data (topology_info). 2 L1 + 2*8 L2
++ * (up to 8GB) + 1 + 1 spare.
++ */
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 20)
+ #else /* defined(ARM_LARGE_MEMORY) */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
+ #endif /* defined(ARM_LARGE_MEMORY) */
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 index cd7cc4c..4cf963e 100644
 --- a/osfmk/arm64/arm_vm_init.c
