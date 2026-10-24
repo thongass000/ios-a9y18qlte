@@ -378,6 +378,23 @@ index 145bb8b..cdcb0f1 100644
  #endif
  
  	/* Ensure TTEs are visible */
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 182b44a..39f2d91 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -160,10 +160,10 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #define ZONE_GUARD_SPARSE       (64  * 1024)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
+-#if XNU_PLATFORM_MacOSX
++#if XNU_PLATFORM_MacOSX && !defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+-#else /* XNU_PLATFORM_MacOSX */
++#else /* XNU_PLATFORM_MacOSX; a9y18qlte has the iOS kernel VA (~46GB free), not macOS's */
+ #define ZONE_MAP_MAX            (8ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (24ULL << 30)
+ #endif /* !XNU_PLATFORM_MacOSX */
 diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
 index c013288..37610a9 100644
 --- a/osfmk/mach/arm/vm_param.h
@@ -394,6 +411,20 @@ index c013288..37610a9 100644
  #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
  #endif
  
+diff --git a/osfmk/vm/vm_compressor.c b/osfmk/vm/vm_compressor.c
+index 1e7ca07..79721d4 100644
+--- a/osfmk/vm/vm_compressor.c
++++ b/osfmk/vm/vm_compressor.c
+@@ -811,7 +811,8 @@ vm_compressor_set_size(void)
+ 	compressor_pool_max_size = C_SEG_MAX_LIMIT;
+ 	compressor_pool_max_size *= c_seg_bufsize;
+ 
+-#if XNU_TARGET_OS_OSX
++	/* a9y18qlte: the iOS kernel VA, so iOS sizing (macOS's 16 * max_mem would not fit) */
++#if XNU_TARGET_OS_OSX && !defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
+ 
+ 	if (vm_compression_limit == 0) {
+ 		if (max_mem <= (4ULL * 1024ULL * 1024ULL * 1024ULL)) {
 diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
 index 54edb01..0e9b358 100644
 --- a/osfmk/vm/vm_kern.c
