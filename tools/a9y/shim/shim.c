@@ -1805,6 +1805,24 @@ static void __attribute__((noreturn)) boot_xnu(const volatile struct payload *p)
 	ba->deviceTreeLength = (u32)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
+	/*
+	 * The GPU firmware blob stays where build.sh put it, below XNU's RAM,
+	 * for bsd/dev/a9y_gpu.c: a9ygpufw=<its physical address>.
+	 */
+	uintptr_t blob = (uintptr_t)_head + GPUFW_OFF;
+	if (rd32(blob) == 0x47593941 && rd32(blob + 4) == 0x57465550) {	/* "A9YG" "PUFW" */
+		int n = 0;
+		while (n < BOOT_LINE_LENGTH && ba->CommandLine[n])
+			n++;
+		static const char key[] = " a9ygpufw=0x";
+		if (n + (int)sizeof(key) + 16 < BOOT_LINE_LENGTH) {
+			for (int i = 0; key[i]; i++)
+				ba->CommandLine[n++] = key[i];
+			for (int sh = 60; sh >= 0; sh -= 4)
+				ba->CommandLine[n++] = "0123456789abcdef"[(blob >> sh) & 15];
+			ba->CommandLine[n] = 0;
+		}
+	}
 	ba->memSizeActual = p->mem_size;
 
 	uintptr_t entry = p->entry_va + pa_of_va;

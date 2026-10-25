@@ -14,10 +14,10 @@ index f2d8bf8..c427fc7 100644
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index df7c863..f4aacdc 100644
+index df7c863..51db997 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,10 @@ bsd/dev/sweet_sample.c			standard
+@@ -109,6 +109,11 @@ bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
  bsd/dev/sweet_fts.c			standard
@@ -25,9 +25,653 @@ index df7c863..f4aacdc 100644
 +bsd/dev/a9y_keys.c			standard
 +bsd/dev/a9y_i2cbb.c			standard
 +bsd/dev/a9y_sm5705.c			standard
++bsd/dev/a9y_gpu.c			standard
  bsd/dev/sweet_cpufreq.c			standard
  bsd/dev/sweet_poke.c			standard
  bsd/dev/sweet_files.c			standard
+diff --git a/bsd/dev/a9y_gpu.c b/bsd/dev/a9y_gpu.c
+new file mode 100644
+index 0000000..19cc388
+--- /dev/null
++++ b/bsd/dev/a9y_gpu.c
+@@ -0,0 +1,637 @@
++/*
++ * a9y18qlte (Galaxy A9 2018, SDM660) Adreno 512 (kgsl-3d0@5000000, chip id
++ * 0x05010200): bring-up, first worked out in the probe shim (a9-ios shim.c
++ * gpu_probe, tools/a9y/shim in the fork):
++ *   - GCC GPU AHB/BIMC branches, GPUCC CXO/rbbmtimer/gfx3d (XO), CX GDSC,
++ *     then the GX block reset, GMEM reset pulse, clamp off and GX GDSC.
++ *   - The GPU SMMU (arm,smmu-kgsl@5040000, qsmmuv2, qcom,skip-init) sits
++ *     behind the hypervisor: it refuses bypass, a mask spanning streams 0
++ *     and 2, and never completes a TLB sync for us. So, as Linux leaves it:
++ *     micro MMU halt + attach-impl-defs + resume, sCR0 fault reporting,
++ *     exact SMRs (stream 0 -> CB0, stream 2 -> CB1, the CP's fetches while
++ *     it is still secure), stage-1 context banks over an identity map of
++ *     the carve-out's GiB (TCR2.SEP upstream, or bit 31 picks TTBR1), and
++ *     no TLB syncs at all (the TLBs are empty at boot).
++ *   - a530 PM4/PFP microcode and kgsl's a5xx_start() values for the a512
++ *     (without the fetch queue thresholds the CP never reads the ring).
++ *   - The GPU comes up secure (RBBM_SECVID_TRUST_CNTL 1; a non-secure write
++ *     to it stalls the bus): ME_INIT runs secure, TZ loads the a512_zap
++ *     shader (SCM PAS 13), then CP_SET_SECURE_MODE(0) from the ring.
++ * The firmware is not in the kernel: the shim leaves its blob ("A9YGPUFW",
++ * shim build.sh) in RAM below XNU's and passes it as a9ygpufw=<pa>. The
++ * GPU's own memory is a carve-out in that RAM too (the dead Linux image),
++ * mapped uncached. A self test follows: a CP_MEM_WRITE, and a 2D-engine
++ * rectangle (on the a512 only BLIT_OP_SCALE writes, and its source reads
++ * as 0: tools/a9y/gpu/kgsltest).
++ */
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void IOSleep(unsigned int milliseconds);
++void a9y_gpu_init(void);
++
++#define GCC_GPU_PA              0x00171000u     /* + 0x004 cfg AHB, 0x010 GPU BIMC, 0x06c BIMC GFX */
++#define GPUCC_PA                0x05065000u
++#define GPU_PA                  0x05000000u
++#define SMMU_PA                 0x05040000u
++
++/* the carve-out: below XNU's RAM (0x100000000), in the Linux image the shim did not boot */
++#define CARVE_PA                0x82000000u
++#define CARVE_SIZE              0x00400000u
++#define C_PT                    0x000000u       /* SMMU level 1 table */
++#define C_RING                  0x001000u       /* 32 KiB */
++#define C_PM4                   0x010000u
++#define C_PFP                   0x018000u
++#define C_SCRATCH               0x020000u
++#define C_ZAP                   0x100000u       /* 1 MiB aligned: the zap segment's p_align */
++#define C_SURF                  0x200000u       /* self test surfaces */
++#define RING_DWORDS             8192
++
++#define GPUCC_CXO_CBCR          0x1020
++#define GPUCC_GFX3D_RCGR        0x1070
++#define GPUCC_GFX3D_CBCR        0x1098
++#define GPUCC_RBBMTIMER_RCGR    0x10b0
++#define GPUCC_RBBMTIMER_CBCR    0x10d0
++#define GPUCC_GX_DOMAIN_MISC    0x0130
++#define GPUCC_CX_GDSC           0x1004
++#define GPUCC_GX_BCR            0x1090
++#define GPUCC_GX_GDSC           0x1094
++
++#define CP_ME_INIT              0x48
++#define CP_MEM_WRITE            0x3d
++#define CP_SET_SECURE_MODE      0x66
++#define CP_WAIT_FOR_IDLE        0x26
++#define CP_EVENT_WRITE          0x46
++#define CP_SET_RENDER_MODE      0x6c
++#define CP_BLIT                 0x2c
++
++#define GPU_MAGIC               0xa9c0ffeeu
++#define GPU_BLIT_DONE           0xb117d0e5u
++
++static vm_offset_t gcc, gpucc, gpu, smmu, carve;
++static uint64_t gpufw_pa;
++static vm_offset_t gpufw;
++static uint32_t ring_w;
++
++static inline uint32_t
++rd(vm_offset_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static inline void
++wr(vm_offset_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++}
++
++#define GR(r)                   (gpu + (vm_offset_t)(r) * 4)
++#define C(off)                  (carve + (off))
++#define CPA(off)                ((uint64_t)CARVE_PA + (off))
++
++static void
++spin_us(uint32_t us)
++{
++	uint64_t end = mach_absolute_time() + (uint64_t)us * 192 / 10;      /* 19.2 MHz timebase */
++	while (mach_absolute_time() < end) {
++		;
++	}
++}
++
++static int
++branch_on(vm_offset_t cbcr)
++{
++	wr(cbcr, rd(cbcr) | 1);
++	for (int i = 0; i < 1000; i++) {
++		if (!(rd(cbcr) >> 31)) {        /* CLK_OFF clear */
++			return 0;
++		}
++		spin_us(1);
++	}
++	return -1;
++}
++
++/* RCG to XO, divider 1, latched with UPDATE; root forced on if asked */
++static int
++rcg_xo(vm_offset_t rcgr, int force_root)
++{
++	wr(rcgr + 4, 0);
++	wr(rcgr, rd(rcgr) | 1 | (force_root ? 2 : 0));
++	for (int i = 0; i < 1000; i++) {
++		if (!(rd(rcgr) & 1)) {
++			return 0;
++		}
++		spin_us(1);
++	}
++	return -1;
++}
++
++static int
++gdsc_on(vm_offset_t gdscr)
++{
++	wr(gdscr, rd(gdscr) & ~1u);
++	for (int i = 0; i < 2000; i++) {
++		if (rd(gdscr) >> 31) {          /* PWR_ON */
++			return 0;
++		}
++		spin_us(1);
++	}
++	return -1;
++}
++
++static int
++gpu_power(void)
++{
++	int rc = branch_on(gcc + 0x004) | branch_on(gcc + 0x010) | branch_on(gcc + 0x06c);
++	rc |= branch_on(gpucc + GPUCC_CXO_CBCR) << 1;
++	rc |= rcg_xo(gpucc + GPUCC_RBBMTIMER_RCGR, 0) << 2;
++	rc |= branch_on(gpucc + GPUCC_RBBMTIMER_CBCR) << 3;
++	rc |= rcg_xo(gpucc + GPUCC_GFX3D_RCGR, 1) << 4;
++	rc |= gdsc_on(gpucc + GPUCC_CX_GDSC) << 5;
++	return rc;
++}
++
++/* GX: block reset pulse, GMEM reset pulse, clamp off, power, core clock */
++static int
++gpu_power_gx(void)
++{
++	wr(gpucc + GPUCC_GX_BCR, rd(gpucc + GPUCC_GX_BCR) | 1);
++	spin_us(1);
++	wr(gpucc + GPUCC_GX_BCR, rd(gpucc + GPUCC_GX_BCR) & ~1u);
++	wr(gpucc + GPUCC_GX_DOMAIN_MISC, rd(gpucc + GPUCC_GX_DOMAIN_MISC) | (1u << 4));
++	spin_us(1);
++	wr(gpucc + GPUCC_GX_DOMAIN_MISC, rd(gpucc + GPUCC_GX_DOMAIN_MISC) & ~(1u << 4));
++	wr(gpucc + GPUCC_GX_DOMAIN_MISC, rd(gpucc + GPUCC_GX_DOMAIN_MISC) & ~1u);
++	int rc = gdsc_on(gpucc + GPUCC_GX_GDSC);
++	rc |= branch_on(gpucc + GPUCC_GFX3D_CBCR) << 1;
++	return rc;
++}
++
++/*
++ * ---- GPU SMMU ----
++ * DT attach-impl-defs, written with the micro MMU halted; then streams 0
++ * and 2 to context banks 0 and 1, both over one identity-mapped GiB.
++ */
++static const uint32_t smmu_impl[][2] = {
++	{ 0x6000, 0x2378 }, { 0x6060, 0x1055 }, { 0x678c, 0x08 }, { 0x6794, 0x28 },
++	{ 0x6800, 0x06 }, { 0x6900, 0x3ff }, { 0x6924, 0x204 }, { 0x6928, 0x11000 },
++	{ 0x6930, 0x800 }, { 0x6960, 0xffffffff }, { 0x6b64, 0x1a5551 }, { 0x6b68, 0x9a82a382 },
++};
++static const uint32_t smmu_sid[2] = { 0, 2 };
++
++#define SMMU_GR1                (smmu + 0x1000)
++#define SMMU_CB(n)              (smmu + 0x8000 + (n) * 0x1000)
++
++static int
++gpu_smmu(void)
++{
++	uint32_t cr0 = rd(smmu), idr0 = rd(smmu + 0x20);
++	if ((cr0 & 1) || !((cr0 >> 10) & 1) || (idr0 & 0xff) < 2 || (rd(smmu + 0x800) >> 31)) {
++		printf("A9Y GPU: smmu not as at boot (cr0 %x idr0 %x smr0 %x)\n", cr0, idr0,
++		    rd(smmu + 0x800));
++		return -1;
++	}
++	wr(smmu + 0x6000, rd(smmu + 0x6000) | (1u << 2));            /* LOCAL_HALT_REQ */
++	for (int i = 0; i < 1000 && !(rd(smmu + 0x6000) & (1u << 3)); i++) {    /* IDLE */
++		spin_us(1);
++	}
++	for (unsigned k = 0; k < sizeof(smmu_impl) / sizeof(smmu_impl[0]); k++) {
++		wr(smmu + smmu_impl[k][0], smmu_impl[k][1]);
++	}
++	wr(smmu + 0x6000, rd(smmu + 0x6000) & ~(1u << 2));
++	wr(smmu + 0x48, rd(smmu + 0x48));       /* sGFSR clear */
++	wr(smmu + 0x68, 0xffffffff);            /* TLBIALLNSNH; no sTLBGSYNC: it never completes */
++	wr(smmu + 0x6c, 0xffffffff);            /* TLBIALLH */
++	cr0 |= 1u << 1 | 1u << 2 | 1u << 4 | 1u << 5;    /* GFRE GFIE GCFGFRE GCFGFIE */
++	cr0 |= 1u << 11 | 1u << 12;                      /* VMIDPNE PTM */
++	cr0 &= ~(1u | 1u << 13 | 3u << 14);              /* CLIENTPD FB BSU */
++	cr0 |= 3u << 22;                                 /* SHCFG NSH */
++	wr(smmu, cr0);
++
++	/* level 1, 4K granule, 32-bit input: the carve-out's GiB (and the framebuffer's) */
++	volatile uint64_t *pt = (volatile uint64_t *)C(C_PT);
++	for (int i = 0; i < 512; i++) {
++		pt[i] = 0;
++	}
++	uint64_t gib = CARVE_PA >> 30;
++	pt[gib] = gib << 30 | 1 | 1u << 6 | 1u << 10;   /* block, AttrIndx 0, AP RW, AF */
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	int rc = 0;
++	for (uint32_t n = 0; n < 2; n++) {
++		vm_offset_t cb = SMMU_CB(n);
++		wr(cb, 0);
++		wr(SMMU_GR1 + 0x800 + 4 * n, 1);                /* CBA2R: VA64 */
++		/* CBAR: S1 + S2 bypass, NSH, WB, VMID cb + 1 as Linux's arm-smmu */
++		wr(SMMU_GR1 + 4 * n, 1u << 16 | 3u << 8 | 0xfu << 12 | (n + 1));
++		wr(cb + 0x20, (uint32_t)CPA(C_PT));             /* TTBR0, ASID 0 */
++		wr(cb + 0x24, 0);
++		wr(cb + 0x10, 2 | 7u << 15);                    /* TCR2: 40-bit PA, SEP upstream */
++		wr(cb + 0x30, 32 | 1u << 23);                   /* TCR: T0SZ 32, 4K, no TTBR1 */
++		wr(cb + 0x38, 0x44);                            /* MAIR0: normal non-cacheable */
++		wr(cb + 4, 0x70000000);                         /* ACTLR: Qualcomm ISH/OSH/NSH */
++		wr(cb + 0x58, 0xffffffff);                      /* FSR clear */
++		wr(cb + 0x618, 0);                              /* TLBIALL; no TLBSYNC */
++		wr(cb, 1 | 1u << 1 | 1u << 2 | 1u << 5);        /* SCTLR: M, TRE, AFE, CFRE */
++		/* SMR before S2CR, as Linux's arm-smmu; exact stream ids */
++		wr(smmu + 0x800 + 4 * n, 1u << 31 | smmu_sid[n]);
++		__asm__ volatile ("dsb sy; isb" ::: "memory");
++		wr(smmu + 0xc00 + 4 * n, 3u << 8 | n);          /* translate, SHCFG NSH */
++		__asm__ volatile ("dsb sy; isb" ::: "memory");
++		if (!(rd(smmu + 0x800 + 4 * n) >> 31) || (rd(smmu + 0xc00 + 4 * n) & 0x300ff) != n) {
++			rc = -2;
++		}
++	}
++	printf("A9Y GPU: smmu cr0 %x, stream 0 -> cb0 (smr %x s2cr %x), stream 2 -> cb1 (smr %x s2cr %x)\n",
++	    rd(smmu), rd(smmu + 0x800), rd(smmu + 0xc00), rd(smmu + 0x804), rd(smmu + 0xc04));
++	return rc;
++}
++
++/* ---- firmware from the shim's blob ---- */
++static int
++streq_fw(vm_offset_t a, const char *b)
++{
++	for (int i = 0; i < 16; i++) {
++		char c = *(volatile char *)(a + i);
++		if (c != b[i]) {
++			return 0;
++		}
++		if (!c) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/* file NAME in the blob: its offset from the blob's start, *size; 0 if missing */
++static uint32_t
++gpufw_find(const char *name, uint32_t *size)
++{
++	uint32_t n = rd(gpufw + 8);
++	for (uint32_t i = 0; i < n && i < 16; i++) {
++		vm_offset_t e = gpufw + 12 + 24 * i;
++		if (streq_fw(e, name)) {
++			*size = rd(e + 20);
++			return rd(e + 16);
++		}
++	}
++	return 0;
++}
++
++/* microcode NAME without its first dword into the carve-out at OFF */
++static int
++gpufw_copy(const char *name, uint32_t off, uint32_t max)
++{
++	uint32_t size = 0, at = gpufw_find(name, &size);
++	if (!at || size < 8 || size - 4 > max) {
++		return -1;
++	}
++	for (uint32_t w = 0; w < (size - 4) / 4; w++) {
++		wr(C(off) + 4 * w, rd(gpufw + at + 4 + 4 * w));
++	}
++	return (int)(size - 4);
++}
++
++/*
++ * ---- TZ peripheral authentication for the zap shader ----
++ * SCM service 2, ARMv8 SMC convention (Linux qcom_scm-smc.c): x0 = SMC64
++ * SIP | svc << 8 | cmd, x1 = arginfo, x2.. = args, x6 = 0; busy (-12) is retried.
++ */
++#define PAS_INIT_IMAGE          1
++#define PAS_MEM_SETUP           2
++#define PAS_AUTH_AND_RESET      5
++#define GPU_PAS_ID              13
++
++static long
++scm_pas(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c)
++{
++	register uint64_t x0 __asm__("x0");
++	for (int tries = 0; tries < 100; tries++) {
++		register uint64_t x1 __asm__("x1") = arginfo;
++		register uint64_t x2 __asm__("x2") = a;
++		register uint64_t x3 __asm__("x3") = b;
++		register uint64_t x4 __asm__("x4") = c;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = 0;
++		x0 = 0x42000000ul | 2 << 8 | cmd;
++		__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4),
++                         "+r"(x5), "+r"(x6) : : "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++                         "x14", "x15", "x16", "x17", "memory");
++		if ((long)x0 != -12) {
++			break;
++		}
++		spin_us(100);
++	}
++	return (long)x0;
++}
++
++/* metadata = the whole .mdt (headers + hash), one relocatable segment (.b02) */
++static int
++gpu_zap(void)
++{
++	uint32_t mdt_size = 0, seg_size = 0;
++	uint32_t mdt = gpufw_find("a512_zap.mdt", &mdt_size), seg = gpufw_find("a512_zap.b02", &seg_size);
++	uint32_t region = (seg_size + 0xfff) & ~0xfffu;
++	if (!mdt || !seg) {
++		return -1;
++	}
++	long rc1 = scm_pas(PAS_INIT_IMAGE, 2 | 2 << 6, GPU_PAS_ID, gpufw_pa + mdt, 0);
++	long rc2 = rc1 ? -1 : scm_pas(PAS_MEM_SETUP, 3, GPU_PAS_ID, CPA(C_ZAP), region);
++	if (!rc1 && !rc2) {
++		for (uint32_t w = 0; w < region / 4; w++) {
++			wr(C(C_ZAP) + 4 * w, 4 * w < seg_size ? rd(gpufw + seg + 4 * w) : 0);
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	long rc3 = rc1 || rc2 ? -1 : scm_pas(PAS_AUTH_AND_RESET, 1, GPU_PAS_ID, 0, 0);
++	printf("A9Y GPU: zap pas init %ld mem setup %ld auth %ld\n", rc1, rc2, rc3);
++	return rc1 || rc2 || rc3 ? -2 : 0;
++}
++
++/* ---- PM4 packets ---- */
++static uint32_t
++pm4_parity(uint32_t v)
++{
++	return (0x9669 >> (0xf & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^
++	       (v >> 24) ^ (v >> 28)))) & 1;
++}
++
++static uint32_t
++pkt7(uint32_t op, uint32_t cnt)
++{
++	return 0x70000000u | cnt | pm4_parity(cnt) << 15 | op << 16 | pm4_parity(op) << 23;
++}
++
++static uint32_t
++pkt4(uint32_t reg, uint32_t cnt)
++{
++	return 0x40000000u | cnt | pm4_parity(cnt) << 7 | reg << 8 | pm4_parity(reg) << 27;
++}
++
++static void
++ring(uint32_t v)
++{
++	wr(C(C_RING) + 4 * ring_w, v);
++	ring_w++;
++}
++
++/* hand the ring to the CP up to here; wait for RPTR to catch up */
++static int
++ring_kick(uint32_t ms)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(GR(0x807), ring_w);                  /* CP_RB_WPTR */
++	for (uint32_t i = 0; i < ms * 2; i++) {
++		if (rd(GR(0x806)) == ring_w) {  /* CP_RB_RPTR */
++			return 0;
++		}
++		spin_us(500);
++	}
++	return -1;
++}
++
++static int
++wait_word(vm_offset_t a, uint32_t v, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms * 2; i++) {
++		if (rd(a) == v) {
++			return 0;
++		}
++		spin_us(500);
++	}
++	return -1;
++}
++
++/*
++ * ---- self test: the 2D engine ----
++ * freedreno fd5_blitter.c's emit_setup + sysmem prep around one RGBA8
++ * rectangle; ends with CCU flush and CACHE_FLUSH_TS writing DONE.
++ */
++static void
++gpu_rect(uint64_t src, uint64_t dst, uint32_t width, uint32_t height, uint32_t pitch, uint64_t done)
++{
++	ring(pkt7(CP_SET_RENDER_MODE, 5));
++	ring(1);                                /* BYPASS */
++	for (int k = 0; k < 4; k++) {
++		ring(0);
++	}
++	ring(pkt4(0xe91, 5));                   /* UCHE_CACHE_INVALIDATE_MIN/MAX, INVALIDATE */
++	for (int k = 0; k < 4; k++) {
++		ring(0);
++	}
++	ring(0x12);
++	ring(pkt7(CP_WAIT_FOR_IDLE, 0));
++	ring(pkt7(0x1d, 1));                    /* CP_SKIP_IB2_ENABLE_GLOBAL */
++	ring(0);
++	ring(pkt7(CP_EVENT_WRITE, 1));
++	ring(0x19);                             /* PC_CCU_INVALIDATE_COLOR */
++	ring(pkt4(0xe3b0, 1));                  /* PC_POWER_CNTL: 2 SP cores */
++	ring(1);
++	ring(pkt4(0xe4f0, 1));                  /* VFD_POWER_CNTL */
++	ring(1);
++	ring(pkt7(CP_WAIT_FOR_IDLE, 0));
++	ring(pkt4(0x0cc7, 1));                  /* RB_CCU_CNTL: BYPASS */
++	ring(0x10000000);
++	static const uint16_t setup[][2] = {
++		{ 0xe141, 0x8 },                /* RB_RENDER_CNTL */
++		{ 0x0cc6, 0x4 },                /* RB_MODE_CNTL */
++		{ 0x0ec2, 0xc },                /* SP_MODE_CNTL */
++		{ 0x0f02, 0x344 },              /* TPL1_MODE_CNTL */
++		{ 0x0e06, 0x2 },                /* HLSQ_MODE_CNTL */
++		{ 0xe000, 0x181 },              /* GRAS_CL_CNTL */
++		{ 0x2184, 0x9 },                /* UNKNOWN_2184 */
++		{ 0xe140, 1u << 17 },           /* RB_CNTL: BYPASS */
++	};
++	for (unsigned k = 0; k < sizeof(setup) / sizeof(setup[0]); k++) {
++		ring(pkt4(setup[k][0], 1));
++		ring(setup[k][1]);
++	}
++	ring(pkt4(0x2100, 1));                  /* RB_2D_BLIT_CNTL */
++	ring(0x86000000);
++	ring(pkt4(0x2180, 1));                  /* GRAS_2D_BLIT_CNTL */
++	ring(0x86000000);
++	/* RB5_R8G8B8A8_UNORM, linear; pitch and array pitch in 64-byte units */
++	uint32_t info = 0x30, size = pitch >> 6 | ((pitch * height) >> 6) << 16;
++	ring(pkt7(CP_SET_RENDER_MODE, 1));
++	ring(7);                                /* BLIT2DSCALE */
++	for (int s = 0; s < 2; s++) {
++		uint64_t a = s ? dst : src;
++		ring(pkt4(s ? 0x2110 : 0x2107, 9));     /* RB_2D_SRC/DST_INFO, address, size, 5 unknown */
++		ring(info);
++		ring((uint32_t)a);
++		ring((uint32_t)(a >> 32));
++		ring(size);
++		for (int k = 0; k < 5; k++) {
++			ring(0);
++		}
++		ring(pkt4(s ? 0x2182 : 0x2181, 1));     /* GRAS_2D_SRC/DST_INFO */
++		ring(info);
++	}
++	ring(pkt7(CP_BLIT, 5));
++	ring(3);                                /* BLIT_OP_SCALE: the one op that writes */
++	ring(0);
++	ring((width - 1) | (height - 1) << 16);
++	ring(0);
++	ring((width - 1) | (height - 1) << 16);
++	ring(pkt7(CP_SET_RENDER_MODE, 1));
++	ring(8);                                /* END2D */
++	ring(pkt7(CP_WAIT_FOR_IDLE, 0));
++	ring(pkt7(CP_EVENT_WRITE, 4));
++	ring(0x1d);                             /* PC_CCU_FLUSH_COLOR_TS */
++	ring((uint32_t)(done + 8));
++	ring((uint32_t)((done + 8) >> 32));
++	ring(0);
++	ring(pkt7(CP_EVENT_WRITE, 4));
++	ring(0x04);                             /* CACHE_FLUSH_TS */
++	ring((uint32_t)done);
++	ring((uint32_t)(done >> 32));
++	ring(GPU_BLIT_DONE);
++}
++
++static int
++gpu_start(void)
++{
++	int npm4 = gpufw_copy("a530_pm4.fw", C_PM4, 0x8000);
++	int npfp = gpufw_copy("a530_pfp.fw", C_PFP, 0x8000);
++	if (npm4 <= 0 || npfp <= 0) {
++		printf("A9Y GPU: no microcode in the blob (pm4 %d pfp %d)\n", npm4, npfp);
++		return -1;
++	}
++	static const uint32_t regs[][2] = {
++		{ 0x860, 1 },                   /* CP_ADDR_MODE_CNTL: 64 bit */
++		{ 0x838, (uint32_t)(CARVE_PA + C_PM4) }, { 0x839, 0 },   /* CP_PM4_INSTR_BASE */
++		{ 0x835, (uint32_t)(CARVE_PA + C_PFP) }, { 0x836, 0 },   /* CP_PFP_INSTR_BASE */
++		{ 0x800, (uint32_t)(CARVE_PA + C_RING) }, { 0x801, 0 },  /* CP_RB_BASE */
++		{ 0x802, 12 | 2u << 8 | 1u << 27 },     /* CP_RB_CNTL: 32 KiB, no rptr update */
++		{ 0x807, 0 },                   /* CP_RB_WPTR */
++		{ 0xf810, 1 },                  /* SECVID_TSB_ADDR_MODE_CNTL: 64 bit */
++		{ 0xf800, 0 }, { 0xf801, 0 }, { 0xf802, 0 },     /* no trusted TSB range */
++		/* kgsl a5xx_start() for the a512 */
++		{ 0x3049, 0x3 },                /* VBIF_ROUND_ROBIN_QOS_ARB */
++		{ 0x302a, 0x9 },                /* VBIF_GATE_OFF_WRREQ_EN */
++		{ 0x93, 0x1 },                  /* RBBM_AHB_CNTL0 */
++		{ 0x94, 0xa6ffffff },           /* RBBM_AHB_CNTL1 */
++		{ 0x95, 0x3f },                 /* RBBM_AHB_CNTL2 */
++		{ 0xe96, 0x2 },                 /* UCHE_CACHE_WAYS */
++		{ 0xe89, 0xffff0000 }, { 0xe8a, 0x0001ffff },    /* UCHE_TRAP_BASE */
++		{ 0xe87, 0xffff0000 }, { 0xe88, 0x0001ffff },    /* UCHE_WRITE_THRU_BASE */
++		{ 0xe8b, 0x100000 }, { 0xe8c, 0 },               /* UCHE_GMEM_RANGE: 272 KiB GMEM */
++		{ 0xe8d, 0x100000 + 0x44000 - 1 }, { 0xe8e, 0 },
++		{ 0xe81, 1u << 29 },            /* UCHE_MODE_CNTL */
++		{ 0x825, 0x40 },                /* CP_MEQ_THRESHOLDS */
++		{ 0x826, 0x400 },               /* CP_MERCIU_SIZE */
++		{ 0x820, 0x80000060 },          /* CP_ROQ_THRESHOLDS_2 */
++		{ 0x81f, 0x40201b16 },          /* CP_ROQ_THRESHOLDS_1 */
++		{ 0x833, 0x02000000 },          /* CP_CHICKEN_DBG */
++		{ 0x67, 0 },                    /* RBBM_CLOCK_CNTL: hw clock gating off */
++	};
++	for (unsigned k = 0; k < sizeof(regs) / sizeof(regs[0]); k++) {
++		wr(GR(regs[k][0]), regs[k][1]);
++	}
++
++	ring_w = 0;
++	ring(pkt7(CP_ME_INIT, 8));
++	ring(0x0000002f);
++	ring(0x00000003);                       /* multiple hardware contexts */
++	ring(0x20000000);                       /* error detection */
++	for (int k = 0; k < 5; k++) {
++		ring(0);
++	}
++	wr(GR(0x832), 0);                       /* CP_ME_CNTL: run ME and PFP */
++	int me = ring_kick(100);
++	printf("A9Y GPU: microcode pm4 %d pfp %d, ME_INIT %s (rptr %u, rbbm status %x), trust cntl %x\n",
++	    npm4, npfp, me ? "STUCK" : "done", rd(GR(0x806)), rd(GR(0x4f5)), rd(GR(0xf400)));
++	if (me) {
++		return -2;
++	}
++	if (gpu_zap() == 0) {
++		ring(pkt7(CP_SET_SECURE_MODE, 1));
++		ring(0);
++	}
++	vm_offset_t scratch = C(C_SCRATCH);
++	wr(scratch, 0);
++	ring(pkt7(CP_MEM_WRITE, 3));
++	ring((uint32_t)CPA(C_SCRATCH));
++	ring(0);
++	ring(GPU_MAGIC);
++	ring_kick(100);
++	int ok = wait_word(scratch, GPU_MAGIC, 100) == 0;
++	printf("A9Y GPU: CP_MEM_WRITE %s (scratch %x, rptr %u), trust cntl %x\n",
++	    ok ? "ran" : "FAILED", rd(scratch), rd(GR(0x806)), rd(GR(0xf400)));
++	return ok ? 0 : -3;
++}
++
++/* the 2D engine fills a magenta 256x256 RGBA8 surface: expect black everywhere */
++static void
++gpu_selftest(void)
++{
++	const uint32_t w = 256, h = 256, pitch = w * 4, n = w * h;
++	vm_offset_t dst = C(C_SURF + 0x100000), done = C(C_SCRATCH + 0x40);
++	for (uint32_t k = 0; k < n; k++) {
++		wr(dst + 4 * k, 0xffff00ff);
++	}
++	wr(done, 0);
++	gpu_rect(CPA(C_SURF), CPA(C_SURF + 0x100000), w, h, pitch, CPA(C_SCRATCH + 0x40));
++	ring_kick(500);
++	int ok = wait_word(done, GPU_BLIT_DONE, 500) == 0;
++	uint32_t black = 0, untouched = 0;
++	for (uint32_t k = 0; k < n; k++) {
++		uint32_t d = rd(dst + 4 * k);
++		black += d == 0;
++		untouched += d == 0xffff00ff;
++	}
++	printf("A9Y GPU: 2D rect %ux%u %s: %u of %u pixels written black, %u untouched; "
++	    "smmu gfsr %x cb0 fsr %x\n", w, h, ok ? "done" : "NOT DONE", black, n, untouched,
++	    rd(smmu + 0x48), rd(SMMU_CB(0) + 0x58));
++}
++
++static void
++gpu_thread(void *arg __unused, wait_result_t wr_ __unused)
++{
++	gcc = ml_io_map(GCC_GPU_PA, 0x1000);
++	gpucc = ml_io_map(GPUCC_PA, 0x2000);
++	gpu = ml_io_map(GPU_PA, 0x40000);
++	smmu = ml_io_map(SMMU_PA, 0x10000);
++	carve = ml_io_map(CARVE_PA, CARVE_SIZE);
++	gpufw = ml_io_map((vm_offset_t)(gpufw_pa & ~0xfffull), 0x100000) + (gpufw_pa & 0xfff);
++	if (rd(gpufw) != 0x47593941 || rd(gpufw + 4) != 0x57465550) {          /* "A9YG" "PUFW" */
++		printf("A9Y GPU: no firmware blob at a9ygpufw=%llx\n", gpufw_pa);
++		return;
++	}
++
++	int rc = gpu_power();
++	int smmu_rc = rc ? -1 : gpu_smmu();     /* with only CX up, as Linux's probe */
++	int gx = rc || smmu_rc ? -1 : gpu_power_gx();
++	uint32_t a = rd(GR(0x4d2));             /* RBBM_ALWAYSON_COUNTER_LO */
++	spin_us(1000);
++	uint32_t b = rd(GR(0x4d2));
++	printf("A9Y GPU: power %x smmu %d gx %x, cx gdsc %x gx gdsc %x, alwayson %x -> %x\n", rc,
++	    smmu_rc, gx, rd(gpucc + GPUCC_CX_GDSC), rd(gpucc + GPUCC_GX_GDSC), a, b);
++	if (gx || a == b) {
++		return;
++	}
++	if (gpu_start() == 0) {
++		gpu_selftest();
++	}
++}
++
++void
++a9y_gpu_init(void)
++{
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("a9ygpufw", &gpufw_pa, sizeof(gpufw_pa)) || !gpufw_pa) {
++		printf("A9Y GPU: no a9ygpufw= from the shim, not touching the GPU\n");
++		return;
++	}
++	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
 diff --git a/bsd/dev/a9y_i2cbb.c b/bsd/dev/a9y_i2cbb.c
 new file mode 100644
 index 0000000..8e2cf4f
@@ -865,7 +1509,7 @@ index 6a121c5..bbf7129 100644
  			return 0;
  		}
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 99a9c87..dedfd6c 100644
+index 99a9c87..f56a922 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -110,6 +110,7 @@ static struct {
@@ -1028,7 +1672,7 @@ index 99a9c87..dedfd6c 100644
  	lck_mtx_unlock(&sweet_ufs_lock);
  	if (error) {
  		return error;
-@@ -660,6 +752,15 @@ sweet_ufs_init(void)
+@@ -660,6 +752,17 @@ sweet_ufs_init(void)
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
  	sweet_log_start();
@@ -1036,15 +1680,17 @@ index 99a9c87..dedfd6c 100644
 +	{
 +		extern void a9y_touch_init(void);       /* bsd/dev/a9y_touch.c: Zinitix ZT7548 */
 +		extern void a9y_keys_init(void);        /* bsd/dev/a9y_keys.c: power, volume */
++		extern void a9y_gpu_init(void);         /* bsd/dev/a9y_gpu.c: Adreno 512 */
 +		a9y_touch_init();
 +		a9y_keys_init();
++		a9y_gpu_init();
 +	}
 +#else
 +	/* these drive SM7150/SM8150 blocks (OSM, Wi-Fi, Adreno 6xx, PM8150, touch, DWC3) */
  	sweet_sample_start();
  	sweet_cpufreq_init();
  	sweet_pmem_init();       /* /dev/pmem: bsd/dev/sweet_pmem.c */
-@@ -670,6 +771,7 @@ sweet_ufs_init(void)
+@@ -670,6 +773,7 @@ sweet_ufs_init(void)
  	sweet_touch_init();
  	sweet_fts_init();
  	sweet_usb_probe();
@@ -1052,7 +1698,7 @@ index 99a9c87..dedfd6c 100644
  	return 0;
  }
  
-@@ -705,7 +807,12 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+@@ -705,7 +809,12 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
   *   +0x1000 ring bytes (offset of byte n = n % ring size)
   * The next shim boot copies its tail to UFS (tools/flame-log-pull.sh rescue).
   */
@@ -1065,7 +1711,7 @@ index 99a9c87..dedfd6c 100644
  struct sweet_mirror_header {
  	char magic[8];
  	uint64_t total;
-@@ -834,56 +941,95 @@ struct sweet_log_header {
+@@ -834,56 +943,95 @@ struct sweet_log_header {
  	uint64_t total, seq;
  };
  
