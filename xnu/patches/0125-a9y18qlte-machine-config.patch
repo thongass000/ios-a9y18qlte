@@ -607,7 +607,7 @@ index 0000000..7c82491
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 2545cf9..fe99814 100644
+index 2545cf9..6d3c7e9 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
 @@ -20,6 +20,9 @@
@@ -620,7 +620,22 @@ index 2545cf9..fe99814 100644
  
  class SweetCPU;
  static SweetCPU *sweet_cpus[MAX_CPUS];
-@@ -154,6 +157,10 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -73,9 +76,14 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	/* SDM660 is not DynamIQ: Aff1 = cluster (0 Kryo 260 silver, 1 gold), Aff0 = core 0-3 */
++	if ((cpu->phys_id & ~0x103u) != 0 || topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++#else
+ 	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+ 	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++#endif
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+@@ -154,6 +162,10 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  		if (kr != KERN_SUCCESS) {
  			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
  		}

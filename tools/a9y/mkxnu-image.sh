@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the a9y18qlte XNU test boot image (Vol Down at the shim screen boots XNU).
-#   [FLAMEREBOOT=SECS] tools/mkxnu-image.sh KERNEL OUT.img [EXTRA BOOT-ARGS]
+#   [CPUS=N] [FLAMEREBOOT=SECS] tools/mkxnu-image.sh KERNEL OUT.img [EXTRA BOOT-ARGS]
 # FLAMEREBOOT: XNU stops petting the watchdog after SECS (default 120): the reset ends the run
 # ADT with the root file's extent map (logs/ios-root-extents.txt), root on
 # it (rd=ufsroot0), console log to disk, and sweetrtcoff = now - PM660 RTC,
@@ -16,7 +16,7 @@ trap 'rm -rf "$W"' EXIT
 
 rtc=$(adb shell cat /sys/class/rtc/rtc0/since_epoch | tr -d '\r')
 off=$(( $(date -u +%s) - rtc ))
-args="debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1 flamereboot=${FLAMEREBOOT:-120}"
+args="debug=0xc serial=3 cpus=${CPUS:-1} keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1 flamereboot=${FLAMEREBOOT:-120}"
 args="$args rd=ufsroot0 ufsroot=userdata ufsrw=1 rootrw=1 ufslogsecs=2 sweetrtcoff=$off"
 # the iOS userland on a macOS-target xnu, as ios-flame's flame-run.sh boots it
 args="$args unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 $EXTRA"
