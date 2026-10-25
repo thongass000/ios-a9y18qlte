@@ -31,10 +31,10 @@ index df7c863..51db997 100644
  bsd/dev/sweet_files.c			standard
 diff --git a/bsd/dev/a9y_gpu.c b/bsd/dev/a9y_gpu.c
 new file mode 100644
-index 0000000..19cc388
+index 0000000..b64d900
 --- /dev/null
 +++ b/bsd/dev/a9y_gpu.c
-@@ -0,0 +1,637 @@
+@@ -0,0 +1,638 @@
 +/*
 + * a9y18qlte (Galaxy A9 2018, SDM660) Adreno 512 (kgsl-3d0@5000000, chip id
 + * 0x05010200): bring-up, first worked out in the probe shim (a9-ios shim.c
@@ -80,14 +80,14 @@ index 0000000..19cc388
 +
 +/* the carve-out: below XNU's RAM (0x100000000), in the Linux image the shim did not boot */
 +#define CARVE_PA                0x82000000u
-+#define CARVE_SIZE              0x00400000u
++#define CARVE_SIZE              0x00050000u      /* mapped in small pieces: ml_io_map has little room */
 +#define C_PT                    0x000000u       /* SMMU level 1 table */
 +#define C_RING                  0x001000u       /* 32 KiB */
 +#define C_PM4                   0x010000u
 +#define C_PFP                   0x018000u
 +#define C_SCRATCH               0x020000u
-+#define C_ZAP                   0x100000u       /* 1 MiB aligned: the zap segment's p_align */
-+#define C_SURF                  0x200000u       /* self test surfaces */
++#define C_ZAP                   0x100000u       /* 1 MiB aligned (the segment's p_align), mapped apart */
++#define C_SURF                  0x030000u       /* self test surfaces, 64 KiB each */
 +#define RING_DWORDS             8192
 +
 +#define GPUCC_CXO_CBCR          0x1020
@@ -111,7 +111,7 @@ index 0000000..19cc388
 +#define GPU_MAGIC               0xa9c0ffeeu
 +#define GPU_BLIT_DONE           0xb117d0e5u
 +
-+static vm_offset_t gcc, gpucc, gpu, smmu, carve;
++static vm_offset_t gcc, gpucc, gpu, smmu, carve, zap;
 +static uint64_t gpufw_pa;
 +static vm_offset_t gpufw;
 +static uint32_t ring_w;
@@ -382,7 +382,7 @@ index 0000000..19cc388
 +	long rc2 = rc1 ? -1 : scm_pas(PAS_MEM_SETUP, 3, GPU_PAS_ID, CPA(C_ZAP), region);
 +	if (!rc1 && !rc2) {
 +		for (uint32_t w = 0; w < region / 4; w++) {
-+			wr(C(C_ZAP) + 4 * w, 4 * w < seg_size ? rd(gpufw + seg + 4 * w) : 0);
++			wr(zap + 4 * w, 4 * w < seg_size ? rd(gpufw + seg + 4 * w) : 0);
 +		}
 +		__asm__ volatile ("dsb sy" ::: "memory");
 +	}
@@ -608,13 +608,13 @@ index 0000000..19cc388
 +static void
 +gpu_selftest(void)
 +{
-+	const uint32_t w = 256, h = 256, pitch = w * 4, n = w * h;
-+	vm_offset_t dst = C(C_SURF + 0x100000), done = C(C_SCRATCH + 0x40);
++	const uint32_t w = 128, h = 128, pitch = w * 4, n = w * h;
++	vm_offset_t dst = C(C_SURF + 0x10000), done = C(C_SCRATCH + 0x40);
 +	for (uint32_t k = 0; k < n; k++) {
 +		wr(dst + 4 * k, 0xffff00ff);
 +	}
 +	wr(done, 0);
-+	gpu_rect(CPA(C_SURF), CPA(C_SURF + 0x100000), w, h, pitch, CPA(C_SCRATCH + 0x40));
++	gpu_rect(CPA(C_SURF), CPA(C_SURF + 0x10000), w, h, pitch, CPA(C_SCRATCH + 0x40));
 +	ring_kick(500);
 +	int ok = wait_word(done, GPU_BLIT_DONE, 500) == 0;
 +	uint32_t black = 0, untouched = 0;
@@ -636,7 +636,8 @@ index 0000000..19cc388
 +	gpu = ml_io_map(GPU_PA, 0x40000);
 +	smmu = ml_io_map(SMMU_PA, 0x10000);
 +	carve = ml_io_map(CARVE_PA, CARVE_SIZE);
-+	gpufw = ml_io_map((vm_offset_t)(gpufw_pa & ~0xfffull), 0x100000) + (gpufw_pa & 0xfff);
++	zap = ml_io_map(CARVE_PA + C_ZAP, 0x2000);
++	gpufw = ml_io_map((vm_offset_t)(gpufw_pa & ~0xfffull), 0x20000) + (gpufw_pa & 0xfff);
 +	if (rd(gpufw) != 0x47593941 || rd(gpufw + 4) != 0x57465550) {          /* "A9YG" "PUFW" */
 +		printf("A9Y GPU: no firmware blob at a9ygpufw=%llx\n", gpufw_pa);
 +		return;
