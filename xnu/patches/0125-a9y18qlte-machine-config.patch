@@ -1163,10 +1163,10 @@ index 0000000..7c82491
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
-index 9969739..ead7236 100644
+index 9969739..65f84ba 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
-@@ -203,6 +203,51 @@ SweetBattery::estimatePercent(unsigned mv)
+@@ -203,6 +203,56 @@ SweetBattery::estimatePercent(unsigned mv)
  	return 100;
  }
  
@@ -1187,11 +1187,13 @@ index 9969739..ead7236 100644
 +	    !sweet_spmi_read(0, 0x1310, &usb) &&
 +	    !sweet_spmi_read(0, 0x1006, &charger);
 +	(void)sweet_spmi_read(0, 0x160b, &path);       /* POWER_PATH_STATUS */
++	uint8_t pon = 0;
++	(void)sweet_spmi_read(0, 0x0810, &pon);        /* PON INT_RT_STS: bit 2 CBLPWR, cable power */
 +	static uint32_t lastRaw = 0xffffffffu;
-+	uint32_t raw = (uint32_t)usb | (uint32_t)charger << 8 | (uint32_t)path << 16;
++	uint32_t raw = (uint32_t)usb | (uint32_t)charger << 8 | (uint32_t)path << 16 | (uint32_t)(pon & 4u) << 24;
 +	if (valid && raw != lastRaw) {
-+		IOLog("SWEET BATTERY: usbin rt %#x charger status %#x power path %#x soc %u\n",
-+		    usb, charger, path, msoc);
++		IOLog("SWEET BATTERY: usbin rt %#x charger status %#x power path %#x pon %#x soc %u\n",
++		    usb, charger, path, pon, msoc);
 +		lastRaw = raw;
 +	}
 +	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 122070u) / 1000000u) : 0;
@@ -1200,8 +1202,11 @@ index 9969739..ead7236 100644
 +		publish(100, 4200, 0, true, true, false, true, false, false);
 +		return;
 +	}
-+	/* USBIN plug-in RT status, or the power path running from USBIN with a valid source */
-+	bool external = (usb & 0x10u) != 0 || ((path & 0x10u) && (path & 0x01u));
++	/*
++	 * PON CBLPWR (followed plugging and unplugging on the phone), USBIN
++	 * plug-in RT status, or the power path running from USBIN with a valid source
++	 */
++	bool external = (pon & 0x04u) || (usb & 0x10u) || ((path & 0x10u) && (path & 0x01u));
 +	unsigned state = charger & 7u;
 +	bool charging = external && state <= 4;
 +	bool full = external && state == 5;
@@ -1218,7 +1223,7 @@ index 9969739..ead7236 100644
  void
  SweetBattery::poll(void)
  {
-@@ -245,6 +290,7 @@ SweetBattery::poll(void)
+@@ -245,6 +295,7 @@ SweetBattery::poll(void)
  	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
  	    charging, full, true, currentValid);
  }
@@ -1226,7 +1231,7 @@ index 9969739..ead7236 100644
  
  void
  SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
-@@ -262,7 +308,11 @@ SweetBattery::start(IOService *provider)
+@@ -262,7 +313,11 @@ SweetBattery::start(IOService *provider)
  	if (!IOPMPowerSource::start(provider)) {
  		return false;
  	}
