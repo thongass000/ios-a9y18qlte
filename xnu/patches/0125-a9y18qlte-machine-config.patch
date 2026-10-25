@@ -2782,6 +2782,71 @@ index 0000000..7c82491
 +
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 0254860..d05b7be 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -115,6 +115,18 @@ SweetAccelerator::start(IOService *provider)
+ 	/* sweetmtl=1: SweetMetal (host-made templates, phone/metal); sweetmtl=2: SweetMetal2 (metal2vulkan + Turnip, phone/metal2) */
+ 	uint32_t which = 1;
+ 	PE_parse_boot_argn("sweetmtl", &which, sizeof(which));
++	if (which == 3) {
++		/* sweetmtl=3: the user client alone, no Metal or GL plugin (a9y18qlte: none drives the A512 yet) */
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++		setProperty("model", "Adreno 512");
++#else
++		setProperty("model", "Adreno 640");
++#endif
++		setProperty(kIOUserClientClassKey, "SweetAcceleratorUserClient");
++		registerService();
++		IOLog("SWEET MTL: IOAcceleratorES published without a Metal plugin (user client only)\n");
++		return true;
++	}
+ 	const char *plugin = which == 2 ? "SweetMetal2" : "SweetMetal";
+ 	setProperty("MetalPluginName", plugin);
+ 	setProperty("MetalPluginClassName", which == 2 ? "SweetMTL2Device" : "SweetMTLDevice");
+@@ -413,8 +425,13 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
+ 		if (args->scalarOutputCount < 3) {
+ 			return kIOReturnBadArgument;
+ 		}
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++		out[0] = 512;
++		out[1] = 0x05010200;
++#else
+ 		out[0] = 640;
+ 		out[1] = 0x06040001;
++#endif
+ 		out[2] = sweet_gpu_ready();
+ 		return kIOReturnSuccess;
+ 	case 1: {
+@@ -662,6 +679,19 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 	}
+ 	case NativeAdrenoMethodGetDeviceInfo: {
+ 		V2_OUT(NativeAdrenoAbiDeviceInfo);
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++		/* what bsd/dev/sweet_a5xx.c programs: GMEM 272 KB at 0x100000, UCHE trap 0x1ffffffff0000, no UBWC */
++		rp->chip_id = 0x05010200;
++		rp->gmem_bytes = 0x44000;
++		rp->gmem_base = 0x100000;
++		rp->uche_trap_base = 0x1ffffffff0000ULL;
++		rp->va_start = fWinBase;
++		rp->va_size = fWinSize;
++		rp->highest_bank_bit = 14;
++		rp->ubwc_swizzle = 0;
++		rp->macrotile_mode = 0;
++		rp->ubwc_version = 0;
++#else
+ 		/* what bsd/dev/sweet_a6xx.c's hw_init programs: GMEM 1 MB at 0x100000, UBWC 3 (hbb 15, lvl 2+3 swizzle) */
+ 		rp->chip_id = 0x06040001;
+ 		rp->gmem_bytes = 0x100000;
+@@ -673,6 +703,7 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 		rp->ubwc_swizzle = 0x6;
+ 		rp->macrotile_mode = 0;
+ 		rp->ubwc_version = 3;
++#endif
+ 		rp->flags = NativeAdrenoDeviceClientIova;
+ 		return kIOReturnSuccess;
+ 	}
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
 index 9969739..a7e8b6e 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
