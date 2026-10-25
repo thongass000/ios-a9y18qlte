@@ -31,10 +31,10 @@ index df7c863..51db997 100644
  bsd/dev/sweet_files.c			standard
 diff --git a/bsd/dev/a9y_gpu.c b/bsd/dev/a9y_gpu.c
 new file mode 100644
-index 0000000..b64d900
+index 0000000..f2c29c8
 --- /dev/null
 +++ b/bsd/dev/a9y_gpu.c
-@@ -0,0 +1,638 @@
+@@ -0,0 +1,643 @@
 +/*
 + * a9y18qlte (Galaxy A9 2018, SDM660) Adreno 512 (kgsl-3d0@5000000, chip id
 + * 0x05010200): bring-up, first worked out in the probe shim (a9-ios shim.c
@@ -643,9 +643,14 @@ index 0000000..b64d900
 +		return;
 +	}
 +
++	/*
++	 * The rbbmtimer branch never reports on (in the shim either), harmless:
++	 * go on once the CX GDSC is powered.
++	 */
 +	int rc = gpu_power();
-+	int smmu_rc = rc ? -1 : gpu_smmu();     /* with only CX up, as Linux's probe */
-+	int gx = rc || smmu_rc ? -1 : gpu_power_gx();
++	int cx = rd(gpucc + GPUCC_CX_GDSC) >> 31;
++	int smmu_rc = cx ? gpu_smmu() : -1;     /* with only CX up, as Linux's probe */
++	int gx = smmu_rc ? -1 : gpu_power_gx();
 +	uint32_t a = rd(GR(0x4d2));             /* RBBM_ALWAYSON_COUNTER_LO */
 +	spin_us(1000);
 +	uint32_t b = rd(GR(0x4d2));
