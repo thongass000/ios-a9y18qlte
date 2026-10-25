@@ -555,7 +555,7 @@ index d405964..5d43ce3 100644
  static LCK_GRP_DECLARE(sweet_pmem_grp, "sweet_pmem");
  static LCK_MTX_DECLARE(sweet_pmem_lock, &sweet_pmem_grp);
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
-index 6a121c5..dedb903 100644
+index 6a121c5..2d8ea1c 100644
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
 @@ -15,17 +15,56 @@
@@ -658,7 +658,7 @@ index 6a121c5..dedb903 100644
  		printf("SWEET BATTERY: unsupported SPMI arb=%#x APIDs=%u\n",
  		    arb_version, sp_count);
  		return -1;
-@@ -89,9 +140,14 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+@@ -89,9 +140,17 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
  {
  	/* Restrict access to the battery blocks and the RTC (0x60); keys retain their own lanes. */
  	unsigned peripheral = addr >> 8;
@@ -668,15 +668,18 @@ index 6a121c5..dedb903 100644
 +	bool allowed = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
 +	    peripheral == 0x13 || peripheral == 0x48 || peripheral == 0x60);
 +#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
-+	/* a9y_keys.c: PM660 PON (power, volume down), PM660L GPIO 7/8 (volume up, Bixby) */
-+	allowed = allowed || (sid == 0 && peripheral == 0x08) ||
++	/*
++	 * a9y_keys.c: PM660 PON (power, volume down), PM660L GPIO 7/8 (volume up,
++	 * Bixby); SweetBattery: PM660 FG gen3 BATT_SOC/BATT_INFO (0x40/0x41)
++	 */
++	allowed = allowed || (sid == 0 && (peripheral == 0x08 || peripheral == 0x40 || peripheral == 0x41)) ||
 +	    (sid == 2 && (peripheral == 0xc6 || peripheral == 0xc7));
 +#endif
 +	if (!sp_ready || !out || addr > 0xffffu || !allowed) {
  		return -1;
  	}
  	IOLockLock(sp_lock);
-@@ -100,19 +156,23 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+@@ -100,19 +159,23 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
  		IOLockUnlock(sp_lock);
  		return -1;
  	}
@@ -1158,6 +1161,73 @@ index 0000000..7c82491
 +
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..3b7d08c 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -203,6 +203,42 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	return 100;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++/*
++ * a9y18qlte: PM660 FG gen3 and SMB2 (qpnp-fg-gen3.c, smb-lib.c). Monotonic
++ * SOC 0x4009 (0-255), VBATT 0x41a0 (122.07 uV), IBATT 0x41a2 (signed,
++ * 488.281 uA, positive discharging), BATTERY_CHARGER_STATUS_1 0x1006 bits
++ * 2:0 (0-4 charging, 5 terminated), USBIN_INT_RT_STS 0x1310 bit 4 plugged.
++ */
++void
++SweetBattery::poll(void)
++{
++	uint8_t msoc, usb, charger;
++	uint16_t rawVoltage, rawCurrent;
++	bool valid = fReal && !sweet_spmi_read(0, 0x4009, &msoc) &&
++	    readWord(0x41a0, &rawVoltage) &&
++	    !sweet_spmi_read(0, 0x1310, &usb) &&
++	    !sweet_spmi_read(0, 0x1006, &charger);
++	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 122070u) / 1000000u) : 0;
++	valid = valid && mv >= 2800 && mv <= 4600;
++	if (!valid) {
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	bool external = (usb & 0x10u) != 0;
++	unsigned state = charger & 7u;
++	bool charging = external && state <= 4;
++	bool full = external && state == 5;
++	int ma = 0;
++	bool currentValid = readWord(0x41a2, &rawCurrent);
++	if (currentValid) {
++		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
++		ma = (int)(-((int64_t)signedRaw * 488281) / 1000000);
++	}
++	unsigned percent = full ? 100 : ((unsigned)msoc * 100 + 127) / 255;
++	publish(percent ? percent : 1, mv, ma, external, external, charging, full, true, currentValid);
++}
++#else
+ void
+ SweetBattery::poll(void)
+ {
+@@ -245,6 +281,7 @@ SweetBattery::poll(void)
+ 	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+ 	    charging, full, true, currentValid);
+ }
++#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
+ 
+ void
+ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -262,7 +299,11 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	int real = 1;   /* the PM660 fuel gauge's own SOC: on unless sweetbattery=0 */
++#else
+ 	int real = 0;
++#endif
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
 index 2545cf9..6d3c7e9 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
