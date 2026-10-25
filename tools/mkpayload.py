@@ -155,7 +155,8 @@ def add_poke_to_adt(adt_blob, script):
     return adt.serialize(root)
 
 
-GPU_FW = ('a640_gmu.bin', 'a630_sqe.fw', 'a640_zap.mdt', 'a640_zap.b02')
+GPU_FW = ('a640_gmu.bin', 'a630_sqe.fw', 'a640_zap.mdt', 'a640_zap.b02',     # Adreno 640 (sweet_a6xx.c)
+          'a530_pm4.fw', 'a530_pfp.fw', 'a512_zap.mdt', 'a512_zap.b02')        # Adreno 512 (sweet_a5xx.c)
 
 
 def add_gpufw_to_adt(adt_blob, fw_dir):
@@ -163,7 +164,7 @@ def add_gpufw_to_adt(adt_blob, fw_dir):
     root, _ = adt.parse(adt_blob)
     chosen = next(c for c in root.children if c.name == 'chosen')
     chosen.props = [p for p in chosen.props if not p[0].startswith('gpufw,')]
-    for name in GPU_FW:
+    for name in (n for n in GPU_FW if os.path.isfile(os.path.join(fw_dir, n))):
         chosen.props.append(('gpufw,' + name, 0, open(os.path.join(fw_dir, name), 'rb').read()))
     return adt.serialize(root)
 

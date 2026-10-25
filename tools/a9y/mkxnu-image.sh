@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build the a9y18qlte XNU test boot image (Vol Down at the shim screen boots XNU).
-#   [CPUS=N] [FLAMEREBOOT=SECS] tools/mkxnu-image.sh KERNEL OUT.img [EXTRA BOOT-ARGS]
+#   [CPUS=N] [FLAMEREBOOT=SECS] [GPUFW=DIR] tools/mkxnu-image.sh KERNEL OUT.img [EXTRA BOOT-ARGS]
+# GPUFW: Adreno firmware into the ADT (/chosen/gpufw,*) for bsd/dev/sweet_gpu.c (sweetgpu=1)
 # FLAMEREBOOT: XNU stops petting the watchdog after SECS (default 120): the reset ends the run
 # ADT with the root file's extent map (logs/ios-root-extents.txt), root on
 # it (rd=ufsroot0), console log to disk, and sweetrtcoff = now - PM660 RTC,
@@ -23,6 +24,7 @@ args="$args unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checki
 
 python3 -I "$FLAME/mkadt_a9y18qlte.py" "$W/phone.adt" --root-runs "$A9/logs/ios-root-extents.txt" 2>&1 |
 	grep 'root file'
-python3 -I "$FLAME/mkpayload.py" "$K" "$W/phone.adt" "$W/payload.bin" --cmdline "$args" > /dev/null
+python3 -I "$FLAME/mkpayload.py" "$K" "$W/phone.adt" "$W/payload.bin" --cmdline "$args" \
+	${GPUFW:+--gpufw "$GPUFW"} > /dev/null
 "$A9/shim/build.sh" --xnu "$W/payload.bin" "$A9/backup/boot-lineage-23.2-20261024.img" "$OUT" | tail -1
 echo "boot-args: $args"

@@ -14,10 +14,10 @@ index f2d8bf8..c427fc7 100644
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index df7c863..51db997 100644
+index df7c863..87cd671 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,11 @@ bsd/dev/sweet_sample.c			standard
+@@ -109,6 +109,12 @@ bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
  bsd/dev/sweet_fts.c			standard
@@ -26,15 +26,16 @@ index df7c863..51db997 100644
 +bsd/dev/a9y_i2cbb.c			standard
 +bsd/dev/a9y_sm5705.c			standard
 +bsd/dev/a9y_gpu.c			standard
++bsd/dev/sweet_a5xx.c			standard
  bsd/dev/sweet_cpufreq.c			standard
  bsd/dev/sweet_poke.c			standard
  bsd/dev/sweet_files.c			standard
 diff --git a/bsd/dev/a9y_gpu.c b/bsd/dev/a9y_gpu.c
 new file mode 100644
-index 0000000..53f3bf5
+index 0000000..f4b5f94
 --- /dev/null
 +++ b/bsd/dev/a9y_gpu.c
-@@ -0,0 +1,647 @@
+@@ -0,0 +1,652 @@
 +/*
 + * a9y18qlte (Galaxy A9 2018, SDM660) Adreno 512 (kgsl-3d0@5000000, chip id
 + * 0x05010200): bring-up, first worked out in the probe shim (a9-ios shim.c
@@ -672,7 +673,12 @@ index 0000000..53f3bf5
 +a9y_gpu_init(void)
 +{
 +	thread_t thread;
++	uint32_t sweetgpu = 0;
 +
++	/* sweetgpu=1: bsd/dev/sweet_gpu.c (over sweet_a5xx.c) owns the GPU */
++	if (PE_parse_boot_argn("sweetgpu", &sweetgpu, sizeof(sweetgpu)) && sweetgpu) {
++		return;
++	}
 +	if (!PE_parse_boot_argn("a9ygpufw", &gpufw_pa, sizeof(gpufw_pa)) || !gpufw_pa) {
 +		printf("A9Y GPU: no a9ygpufw= from the shim, not touching the GPU\n");
 +		return;
@@ -1351,6 +1357,807 @@ index 0000000..91746ca
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
+diff --git a/bsd/dev/sweet_a5xx.c b/bsd/dev/sweet_a5xx.c
+new file mode 100644
+index 0000000..161126e
+--- /dev/null
++++ b/bsd/dev/sweet_a5xx.c
+@@ -0,0 +1,719 @@
++/*
++ * Adreno 512 core for the a9y18qlte (SDM660): the sweet_a6xx.h core API
++ * (same a6_* names, so bsd/dev/sweet_gpu.c and the accelerator above it run
++ * unchanged), built instead of sweet_a6xx.c on this board. The bring-up is
++ * the one the probe shim (tools/a9y/shim, gpu_probe) and bsd/dev/a9y_gpu.c
++ * proved on the phone; this file has no GMU, HFI or RPMh stages (the A5xx
++ * has none of them):
++ *
++ *   - CX: GCC GPU AHB/BIMC branches, GPUCC CXO/rbbmtimer/gfx3d (XO), CX
++ *     GDSC. The rbbmtimer branch never reports on; harmless.
++ *   - SMMU (arm,smmu-kgsl@5040000, qsmmuv2, qcom,skip-init), behind the
++ *     hypervisor: it refuses bypass and a mask spanning streams 0 and 2,
++ *     and a TLB sync (global or per bank) never completes for us, the
++ *     write itself stalls. As Linux leaves it: micro MMU halt +
++ *     attach-impl-defs + resume, sCR0 fault reporting, exact SMRs, stream
++ *     0 -> CB0 and stream 2 -> CB1 (the CP's fetches while still secure),
++ *     both over the one page table. TLB invalidates are posted and not
++ *     synced (a6_tlb_flush).
++ *   - GX: block reset, GMEM reset pulse, clamp off, GX GDSC, gfx3d.
++ *   - CP: a530 PM4/PFP microcode, kgsl's a5xx_start() values for the a512
++ *     (without the fetch queue thresholds the CP never reads the ring),
++ *     ME_INIT while secure, the a512_zap shader through TZ PAS, then
++ *     CP_SET_SECURE_MODE(0).
++ *
++ * The zap shader's region is outside XNU's RAM (TZ locks it: a speculative
++ * CPU access through the physmap would be a fatal XPU violation), in the
++ * Linux image the shim did not boot. The pool's SQE area holds the PM4
++ * (+0x200000) and PFP (+0x208000) microcode.
++ *
++ * GPU page tables: 39-bit iovas from level 1, non-cacheable walks (this
++ * SMMU does not snoop).
++ *
++ * a6_blit_ib: the a512's 2D engine copies nothing (tools/a9y/gpu/kgsltest),
++ * so there is no blit stream yet: it returns 0 dwords, and the display stays
++ * on its CPU present (SweetFramebuffer.cpp).
++ */
++#if defined(KERNEL) && defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <libkern/libkern.h>
++#include "sweet_a6xx.h"
++
++#define rd32		a6_rd
++#define wr32		a6_wr
++
++static void wr64(uint64_t pa, uint64_t v)
++{
++	wr32(pa, (uint32_t)v);
++	wr32(pa + 4, (uint32_t)(v >> 32));
++}
++
++static int wait_bit(uint64_t pa, uint32_t mask, int set, unsigned us)
++{
++	for (unsigned i = 0; i <= us; i++) {
++		if (!!(rd32(pa) & mask) == set)
++			return 0;
++		if (i < us)
++			a6_delay_us(1);
++	}
++	return -1;
++}
++
++static void zero_pa(uint64_t pa, uint64_t size)
++{
++	static const uint8_t z[0x4000];
++	for (uint64_t o = 0; o < size; o += sizeof(z))
++		a6_write(pa + o, z, (size_t)(size - o < sizeof(z) ? size - o : sizeof(z)));
++}
++
++/* ---- registers ---- */
++
++#define GCC		0x00100000ull
++#define GCC_GPU_AHB	(GCC + 0x71004)
++#define GCC_GPU_BIMC	(GCC + 0x71010)
++#define GCC_BIMC_GFX	(GCC + 0x7106c)
++#define GPUCC		A6_GPUCC
++#define GPUCC_CXO	(GPUCC + 0x1020)
++#define GPUCC_GFX3D_RCG	(GPUCC + 0x1070)
++#define GPUCC_GFX3D	(GPUCC + 0x1098)
++#define GPUCC_RBBM_RCG	(GPUCC + 0x10b0)
++#define GPUCC_RBBM	(GPUCC + 0x10d0)
++#define GPUCC_GX_MISC	(GPUCC + 0x0130)	/* bit 4 GMEM reset, bit 0 clamp IO */
++#define GPUCC_CX_GDSCR	(GPUCC + 0x1004)
++#define GPUCC_GX_BCR	(GPUCC + 0x1090)
++#define GPUCC_GX_GDSCR	(GPUCC + 0x1094)
++#define GREG(o)		A6_GREG(o)
++
++#define SMMU		A6_SMMU
++#define SMMU_GR1	(SMMU + 0x1000)
++#define SMMU_CB(n)	A6_SMMU_CB(n)
++#define SMR(n)		(SMMU + 0x800 + 4 * (n))
++#define S2CR(n)		(SMMU + 0xc00 + 4 * (n))
++#define CBAR(n)		(SMMU_GR1 + 4 * (n))
++#define CBA2R(n)	(SMMU_GR1 + 0x800 + 4 * (n))
++#define CB_SCTLR	0x00
++#define CB_ACTLR	0x04
++#define CB_TCR2		0x10
++#define CB_TTBR0	0x20
++#define CB_TCR		0x30
++#define CB_MAIR0	0x38
++#define CB_FSR		0x58
++#define CB_FAR		0x60
++#define CB_FSYNR0	0x68
++#define CB_TLBIALL	0x618
++#define TCR2_VAL	((7u << 15) | 2u)	/* SEP upstream (else bit 31 picks TTBR1), 40-bit PA */
++#define TCR_VAL		(25u | (1u << 23))	/* 39-bit iovas, 4K, non-cacheable walks, no TTBR1 */
++#define GPU_NSTREAM	2			/* stream n -> SMR n -> CB n */
++
++#define CP_RB_BASE	0x800
++#define CP_RB_CNTL	0x802
++#define CP_RB_RPTR	0x806
++#define CP_RB_WPTR	0x807
++#define CP_ME_CNTL	0x832
++#define CP_PFP_BASE	0x835
++#define CP_PM4_BASE	0x838
++#define CP_HW_FAULT	0xb1a
++#define RBBM_STATUS	0x4f5
++#define RBBM_INT_STATUS	0x4e1
++#define RBBM_ALWAYSON	0x4d2
++#define SECVID_TRUST	0xf400
++
++#define OFF_PM4		A6_OFF_SQE
++#define OFF_PFP		(A6_OFF_SQE + 0x8000)
++
++static bool is_on(uint64_t gdscr)
++{
++	return (rd32(gdscr) >> 31) & 1;
++}
++
++bool a6_cx_up(void)
++{
++	return is_on(GPUCC_CX_GDSCR);
++}
++
++bool a6_gx_up(void)
++{
++	return is_on(GPUCC_GX_GDSCR);
++}
++
++bool a6_cp_running(const struct a6_gpu *g)
++{
++	(void)g;
++	return a6_gx_up() && rd32(GREG(CP_ME_CNTL)) == 0;
++}
++
++void a6_init_state(struct a6_gpu *g, uint64_t pool_pa)
++{
++	memset(g, 0, sizeof(*g));
++	g->pool_pa = pool_pa;
++	g->gmu_smr = g->gmu_cb = -1;
++	g->gpu_smr = g->gpu_cb = 0;
++}
++
++/* ---- stage 1: clocks and CX power ---- */
++
++static int branch_on(uint64_t cbcr)
++{
++	wr32(cbcr, rd32(cbcr) | 1);
++	return wait_bit(cbcr, 1u << 31, 0, 1000);	/* CLK_OFF clear */
++}
++
++/* RCG to XO, divider 1, latched with UPDATE; root forced on if asked */
++static int rcg_xo(uint64_t rcgr, bool force_root)
++{
++	wr32(rcgr + 4, 0);
++	wr32(rcgr, rd32(rcgr) | 1 | (force_root ? 2 : 0));
++	return wait_bit(rcgr, 1, 0, 1000);
++}
++
++static int gdsc_on(uint64_t gdscr)
++{
++	wr32(gdscr, rd32(gdscr) & ~1u);
++	return wait_bit(gdscr, 1u << 31, 1, 2000);
++}
++
++static int power_cx(void)
++{
++	int rc = branch_on(GCC_GPU_AHB) | branch_on(GCC_GPU_BIMC) | branch_on(GCC_BIMC_GFX);
++	rc |= branch_on(GPUCC_CXO) << 1;
++	rc |= rcg_xo(GPUCC_RBBM_RCG, false) << 2;
++	(void)branch_on(GPUCC_RBBM);		/* never reports on: harmless */
++	rc |= rcg_xo(GPUCC_GFX3D_RCG, true) << 3;
++	rc |= gdsc_on(GPUCC_CX_GDSCR) << 4;
++	a6_log("cx: rc %x, cx gdsc %x\n", rc, rd32(GPUCC_CX_GDSCR));
++	return a6_cx_up() ? 0 : -1;
++}
++
++/* GX: block reset pulse, GMEM reset pulse, clamp off, GX GDSC, core clock */
++static int power_gx(void)
++{
++	wr32(GPUCC_GX_BCR, rd32(GPUCC_GX_BCR) | 1);
++	a6_delay_us(1);
++	wr32(GPUCC_GX_BCR, rd32(GPUCC_GX_BCR) & ~1u);
++	wr32(GPUCC_GX_MISC, rd32(GPUCC_GX_MISC) | (1u << 4));
++	a6_delay_us(1);
++	wr32(GPUCC_GX_MISC, rd32(GPUCC_GX_MISC) & ~(1u << 4));
++	wr32(GPUCC_GX_MISC, rd32(GPUCC_GX_MISC) & ~1u);
++	int rc = gdsc_on(GPUCC_GX_GDSCR) | branch_on(GPUCC_GFX3D) << 1;
++	uint32_t a = rd32(GREG(RBBM_ALWAYSON));
++	a6_delay_us(100);
++	uint32_t b = rd32(GREG(RBBM_ALWAYSON));
++	a6_log("gx: rc %x, gx gdsc %x, alwayson %x -> %x\n", rc, rd32(GPUCC_GX_GDSCR), a, b);
++	return a6_gx_up() && a != b ? 0 : -1;
++}
++
++/* ---- SMMU ---- */
++
++static const uint32_t smmu_impl[][2] = {
++	{ 0x6000, 0x2378 }, { 0x6060, 0x1055 }, { 0x678c, 0x08 }, { 0x6794, 0x28 },
++	{ 0x6800, 0x06 }, { 0x6900, 0x3ff }, { 0x6924, 0x204 }, { 0x6928, 0x11000 },
++	{ 0x6930, 0x800 }, { 0x6960, 0xffffffff }, { 0x6b64, 0x1a5551 }, { 0x6b68, 0x9a82a382 },
++};
++static const uint32_t gpu_sid[GPU_NSTREAM] = { 0, 2 };
++
++/* As Linux's arm_smmu_device_reset() + qsmmuv2_device_reset() with qcom,skip-init, minus the sync */
++static int smmu_reset(void)
++{
++	uint32_t cr0 = rd32(SMMU), idr0 = rd32(SMMU + 0x20);
++	if ((cr0 & 1) || (idr0 & 0xff) < GPU_NSTREAM || (rd32(SMR(0)) >> 31) || (rd32(SMR(1)) >> 31)) {
++		a6_log("smmu: not as at boot (cr0 %x idr0 %x smr0 %x smr1 %x)\n", cr0, idr0, rd32(SMR(0)),
++		       rd32(SMR(1)));
++		return -1;
++	}
++	wr32(SMMU + 0x6000, rd32(SMMU + 0x6000) | (1u << 2));	/* LOCAL_HALT_REQ */
++	(void)wait_bit(SMMU + 0x6000, 1u << 3, 1, 1000);		/* IDLE */
++	for (unsigned k = 0; k < sizeof(smmu_impl) / sizeof(smmu_impl[0]); k++)
++		wr32(SMMU + smmu_impl[k][0], smmu_impl[k][1]);
++	wr32(SMMU + 0x6000, rd32(SMMU + 0x6000) & ~(1u << 2));
++	wr32(SMMU + 0x48, rd32(SMMU + 0x48));		/* sGFSR clear */
++	wr32(SMMU + 0x68, 0xffffffff);			/* TLBIALLNSNH */
++	wr32(SMMU + 0x6c, 0xffffffff);			/* TLBIALLH */
++	cr0 |= 1u << 1 | 1u << 2 | 1u << 4 | 1u << 5;	/* GFRE GFIE GCFGFRE GCFGFIE */
++	cr0 |= 1u << 11 | 1u << 12;			/* VMIDPNE PTM */
++	cr0 &= ~(1u | 1u << 13 | 3u << 14);		/* CLIENTPD FB BSU */
++	cr0 |= 3u << 22;				/* SHCFG NSH */
++	wr32(SMMU, cr0);
++	return 0;
++}
++
++static int smmu_banks(uint64_t ttbr0)
++{
++	int rc = 0;
++	for (uint32_t n = 0; n < GPU_NSTREAM; n++) {
++		uint64_t c = SMMU_CB(n);
++		wr32(c + CB_SCTLR, 0);
++		wr32(CBA2R(n), 1);				/* AArch64 descriptors */
++		/* S1 + S2 bypass, NSH, WB, VMID cb + 1 as Linux's arm-smmu */
++		wr32(CBAR(n), (1u << 16) | (0xfu << 12) | (3u << 8) | (n + 1));
++		wr32(c + CB_TCR2, TCR2_VAL);
++		wr64(c + CB_TTBR0, ttbr0);
++		wr32(c + CB_TCR, TCR_VAL);
++		wr32(c + CB_MAIR0, 0x0000ff44);			/* 0: normal NC, 1: WB */
++		wr32(c + CB_ACTLR, 0x70000000);			/* Qualcomm ISH/OSH/NSH */
++		wr32(c + CB_FSR, 0xffffffff);
++		wr32(c + CB_TLBIALL, 0);
++		wr32(c + CB_SCTLR, 1 | 2 | 4 | 0x20);		/* M TRE AFE CFRE */
++		/* SMR before S2CR, exact stream id; S2CR: translate, SHCFG NSH */
++		wr32(SMR(n), (1u << 31) | gpu_sid[n]);
++		wr32(S2CR(n), (3u << 8) | n);
++		if (!(rd32(SMR(n)) >> 31) || (rd32(S2CR(n)) & 0x300ff) != n)
++			rc = -1;
++		a6_log("smmu: stream %u -> smr%u %x s2cr %x cb%u cbar %x tcr %x tcr2 %x\n", gpu_sid[n], n,
++		       rd32(SMR(n)), rd32(S2CR(n)), n, rd32(CBAR(n)), rd32(c + CB_TCR), rd32(c + CB_TCR2));
++	}
++	return rc;
++}
++
++/* Posted, never synced: a TLB sync (global or per bank) stalls forever on this SMMU */
++void a6_tlb_flush(const struct a6_gpu *g)
++{
++	(void)g;
++	for (uint32_t n = 0; n < GPU_NSTREAM; n++)
++		wr32(SMMU_CB(n) + CB_TLBIALL, 0);
++	(void)rd32(SMMU_CB(0) + CB_SCTLR);
++}
++
++uint32_t a6_fault_status(const struct a6_gpu *g, uint64_t *far, uint32_t *fsynr0)
++{
++	(void)g;
++	uint32_t fsr = 0;
++	for (uint32_t n = 0; n < GPU_NSTREAM && !fsr; n++) {
++		uint64_t c = SMMU_CB(n);
++		fsr = rd32(c + CB_FSR) & A6_FSR_FAULT;
++		if (fsr && far)
++			*far = rd32(c + CB_FAR) | ((uint64_t)rd32(c + CB_FAR + 4) << 32);
++		if (fsr && fsynr0)
++			*fsynr0 = rd32(c + CB_FSYNR0);
++	}
++	return fsr;
++}
++
++int a6_clear_fault(const struct a6_gpu *g)
++{
++	uint64_t far = 0;
++	uint32_t syn = 0, fsr = a6_fault_status(g, &far, &syn);
++	if (!fsr)
++		return 0;
++	a6_log("clearing smmu fault: fsr %x far %llx fsynr0 %x\n", fsr, (unsigned long long)far, syn);
++	for (uint32_t n = 0; n < GPU_NSTREAM; n++)
++		wr32(SMMU_CB(n) + CB_FSR, rd32(SMMU_CB(n) + CB_FSR));
++	return 1;
++}
++
++/* ---- zap shader through TrustZone PAS ---- */
++
++#define PAS_GPU		13
++#define ZAP_REGION	0x82100000ull	/* 1 MB aligned (the segment's p_align), below XNU's RAM */
++#define ZAP_SIZE	0x2000u
++#define SCM_PIL(cmd)	(0x42000000ull | (2u << 8) | (cmd))
++
++static int64_t scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1)
++{
++	uint64_t x[8] = { SCM_PIL(cmd), arginfo, a, b, c, 0, 0, 0 };
++	a6_smc(x);	/* sweet_smc: resumes interrupted calls */
++	if (r1)
++		*r1 = x[1];
++	return (int64_t)x[0];
++}
++
++static int zap_load(struct a6_gpu *g)
++{
++	uint32_t mlen, slen;
++	const uint8_t *mdt = a6_firmware("a512_zap.mdt", &mlen), *b02 = a6_firmware("a512_zap.b02", &slen);
++	if (!mdt || !b02 || slen > ZAP_SIZE || mlen > A6_OFF_GT_L1 - A6_OFF_ZAP_META)
++		return -1;
++	a6_write(a6_pool_pa(g, A6_OFF_ZAP_META), mdt, (mlen + 3) & ~3u);
++	int64_t rc1 = scm(1, 2 | (2u << 6), PAS_GPU, a6_pool_pa(g, A6_OFF_ZAP_META), 0, NULL);
++	int64_t rc2 = rc1 ? -1 : scm(2, 3, PAS_GPU, ZAP_REGION, ZAP_SIZE, NULL);
++	if (!rc1 && !rc2) {
++		static uint8_t seg[ZAP_SIZE];
++		memset(seg, 0, sizeof(seg));
++		memcpy(seg, b02, slen);
++		a6_write(ZAP_REGION, seg, ZAP_SIZE);
++	}
++	int64_t rc3 = rc1 || rc2 ? -1 : scm(5, 1, PAS_GPU, 0, 0, NULL);
++	a6_log("zap: init image %lld, mem setup %lld, auth and reset %lld\n", (long long)rc1, (long long)rc2,
++	       (long long)rc3);
++	return rc1 || rc2 || rc3 ? -1 : 0;
++}
++
++/* The zap shader is already in TrustZone after a GPU reset: resume it (Linux: SCM_GPU_ZAP_SHADER_RESUME) */
++static int zap_resume(void)
++{
++	uint64_t x[8] = { 0x42000000ull | (1u << 8) | 0x0a, 2, 0 /* resume */, PAS_GPU, 0, 0, 0, 0 };
++	a6_smc(x);
++	a6_log("zap: resume rc %lld\n", (long long)x[0]);
++	return x[0] ? -1 : 0;
++}
++
++/* ---- ring ---- */
++
++static uint32_t pm4_parity(uint32_t v)
++{
++	return (0x9669 >> (0xf & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^
++				  (v >> 24) ^ (v >> 28)))) & 1;
++}
++
++uint32_t a6_pkt7(uint32_t op, uint32_t cnt)
++{
++	return 0x70000000 | cnt | (pm4_parity(cnt) << 15) | ((op & 0x7f) << 16) | (pm4_parity(op) << 23);
++}
++
++uint32_t a6_pkt4(uint32_t reg, uint32_t cnt)
++{
++	return 0x40000000 | cnt | (pm4_parity(cnt) << 7) | ((reg & 0x3ffff) << 8) | (pm4_parity(reg) << 27);
++}
++
++/* RBBM_STATUS bit 31: GPU busy (a5xx.xml A5XX_RBBM_STATUS_GPU_BUSY_IGN_AHB is bit 31) */
++int a6_ring(struct a6_gpu *g, const uint32_t *dw, uint32_t n, const char *what, unsigned timeout_ms)
++{
++	if (n >= A6_RING_DW)
++		return -1;
++	uint32_t w = g->wptr, first = n < A6_RING_DW - w ? n : A6_RING_DW - w;
++	a6_write(a6_pool_pa(g, A6_OFF_RING) + 4ull * w, dw, 4ull * first);
++	if (first < n)
++		a6_write(a6_pool_pa(g, A6_OFF_RING), dw + first, 4ull * (n - first));
++	g->wptr = (w + n) % A6_RING_DW;
++	wr32(GREG(CP_RB_WPTR), g->wptr);
++	unsigned i;
++	for (i = 0; i < timeout_ms * 50 + 8; i++) {
++		if (rd32(GREG(CP_RB_RPTR)) == g->wptr)
++			break;
++		if (i >= 8)
++			a6_delay_us(20);
++	}
++	bool ok = i < timeout_ms * 50 + 8;
++	if (what || !ok)
++		a6_log("ring %s: rptr %x wptr %x status %x int %x hwfault %x trust %x %s\n", what ? what : "",
++		       rd32(GREG(CP_RB_RPTR)), g->wptr, rd32(GREG(RBBM_STATUS)), rd32(GREG(RBBM_INT_STATUS)),
++		       rd32(GREG(CP_HW_FAULT)), rd32(GREG(SECVID_TRUST)), ok ? "read" : "TIMEOUT");
++	return ok ? 0 : -1;
++}
++
++uint32_t a6_fence_read(const struct a6_gpu *g)
++{
++	uint32_t v = 0;
++	a6_read(a6_pool_pa(g, A6_OFF_SCRATCH), &v, 4);
++	return v;
++}
++
++/*
++ * Up to A6_SUBMIT_MAX IBs, wrapped as Linux's a5xx_submit: CCU invalidates, a timestamp of
++ * RBBM_ALWAYSON before and after, the IBs, WFI, then the fence by CACHE_FLUSH_TS.
++ */
++uint32_t a6_submit_ibs_async(struct a6_gpu *g, const uint64_t *iova, const uint32_t *dwords, unsigned nib,
++			     unsigned timeout_ms)
++{
++	uint64_t fva = a6_pool_va(A6_OFF_SCRATCH);
++	uint64_t ts = a6_pool_va(A6_OFF_SCRATCH + A6_TS_OFF) + 16ull * ((g->fence + 1) % A6_TS_SLOTS);
++	uint32_t dw[4 + 4 + 4 * A6_SUBMIT_MAX + 5 + 5], n = 0;
++	if (nib == 0 || nib > A6_SUBMIT_MAX)
++		return 0;
++	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 1);
++	dw[n++] = 0x18;				/* PC_CCU_INVALIDATE_DEPTH */
++	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 1);
++	dw[n++] = 0x19;				/* PC_CCU_INVALIDATE_COLOR */
++	dw[n++] = a6_pkt7(0x3e, 3);		/* CP_REG_TO_MEM RBBM_ALWAYSON, 2 dwords -> ts */
++	dw[n++] = RBBM_ALWAYSON | 2u << 18;
++	dw[n++] = (uint32_t)ts;
++	dw[n++] = (uint32_t)(ts >> 32);
++	for (unsigned i = 0; i < nib; i++) {
++		dw[n++] = a6_pkt7(A6_CP_INDIRECT_BUFFER, 3);
++		dw[n++] = (uint32_t)iova[i];
++		dw[n++] = (uint32_t)(iova[i] >> 32);
++		dw[n++] = dwords[i] & 0xfffff;
++	}
++	dw[n++] = a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0);
++	dw[n++] = a6_pkt7(0x3e, 3);		/* ... -> ts + 8 */
++	dw[n++] = RBBM_ALWAYSON | 2u << 18;
++	dw[n++] = (uint32_t)(ts + 8);
++	dw[n++] = (uint32_t)((ts + 8) >> 32);
++	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 4);
++	dw[n++] = 0x04;				/* CACHE_FLUSH_TS: the fence lands once the caches are clean */
++	dw[n++] = (uint32_t)fva;
++	dw[n++] = (uint32_t)(fva >> 32);
++	dw[n++] = g->fence + 1;
++	for (unsigned i = 0; ; i++) {
++		uint32_t r = rd32(GREG(CP_RB_RPTR)), used = (g->wptr + A6_RING_DW - r) % A6_RING_DW;
++		if (used + n + 16 < A6_RING_DW)
++			break;
++		if (i >= timeout_ms * 50)
++			return 0;
++		a6_delay_us(20);
++	}
++	uint32_t w = g->wptr, first = n < A6_RING_DW - w ? n : A6_RING_DW - w;
++	a6_write(a6_pool_pa(g, A6_OFF_RING) + 4ull * w, dw, 4ull * first);
++	if (first < n)
++		a6_write(a6_pool_pa(g, A6_OFF_RING), dw + first, 4ull * (n - first));
++	g->wptr = (w + n) % A6_RING_DW;
++	wr32(GREG(CP_RB_WPTR), g->wptr);
++	return ++g->fence;
++}
++
++uint32_t a6_submit_ib_async(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned timeout_ms)
++{
++	return a6_submit_ibs_async(g, &iova, &dwords, 1, timeout_ms);
++}
++
++void a6_fence_force(struct a6_gpu *g)
++{
++	uint32_t v = g->fence;
++	a6_write(a6_pool_pa(g, A6_OFF_SCRATCH), &v, 4);
++}
++
++uint64_t a6_submit_time(const struct a6_gpu *g, uint32_t fence)
++{
++	uint64_t t[2] = { 0, 0 };
++	a6_read(a6_pool_pa(g, A6_OFF_SCRATCH + A6_TS_OFF) + 16ull * (fence % A6_TS_SLOTS), t, 16);
++	return t[1] > t[0] ? t[1] - t[0] : 0;
++}
++
++uint64_t a6_timestamp(const struct a6_gpu *g)
++{
++	(void)g;
++	uint32_t hi = rd32(GREG(RBBM_ALWAYSON + 1)), lo = rd32(GREG(RBBM_ALWAYSON));
++	uint32_t hi2 = rd32(GREG(RBBM_ALWAYSON + 1));
++	if (hi2 != hi)
++		lo = rd32(GREG(RBBM_ALWAYSON));
++	return (uint64_t)hi2 << 32 | lo;
++}
++
++bool a6_fence_done(const struct a6_gpu *g, uint32_t fence)
++{
++	return (int32_t)(a6_fence_read(g) - fence) >= 0;
++}
++
++int a6_submit_ib(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned timeout_ms)
++{
++	uint64_t fva = a6_pool_va(A6_OFF_SCRATCH);
++	uint32_t fence = ++g->fence;
++	uint32_t dw[] = {
++		a6_pkt7(A6_CP_INDIRECT_BUFFER, 3), (uint32_t)iova, (uint32_t)(iova >> 32), dwords,
++		a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0),
++		a6_pkt7(A6_CP_MEM_WRITE, 3), (uint32_t)fva, (uint32_t)(fva >> 32), fence,
++	};
++	if (a6_ring(g, dw, sizeof(dw) / 4, NULL, timeout_ms))
++		return -1;
++	for (unsigned i = 0; i < timeout_ms * 50 && a6_fence_read(g) != fence; i++)
++		a6_delay_us(20);
++	return a6_fence_read(g) != fence ? -1 : 0;
++}
++
++/* ---- GPU page tables (as sweet_a6xx.c) ---- */
++
++static void map_gpu_low(struct a6_gpu *g)
++{
++	uint64_t l1 = a6_pool_pa(g, A6_OFF_GT_L1), l2 = a6_pool_pa(g, A6_OFF_GT_L2);
++	zero_pa(l1, 0x2000);
++	wr64(l1 + 0, l2 | 3);		/* VA 0-1 GB */
++	for (uint64_t o = 0; o < A6_POOL_SIZE; o += 0x200000)	/* AP=01, NC, 2 MB blocks */
++		wr64(l2 + 8 * (((A6_GVA_POOL + o) >> 21) & 0x1ff),
++		     (g->pool_pa + o) | (1u << 10) | (3u << 8) | (1u << 6) | 1u);
++	for (uint64_t o = 0; o < A6_FB_SIZE; o += 0x200000)
++		wr64(l2 + 8 * (((A6_GVA_FB + o) >> 21) & 0x1ff),
++		     (A6_FB_PA + o) | (1u << 10) | (3u << 8) | (1u << 6) | 1u);
++}
++
++static uint64_t pt_alloc(struct a6_gpu *g)
++{
++	const uint32_t arena = (uint32_t)((A6_OFF_SQE - A6_OFF_PT_ARENA) / 0x1000);
++	uint64_t pa = g->pt_next < arena ? a6_pool_pa(g, A6_OFF_PT_ARENA + 0x1000ull * g->pt_next) :
++	    a6_pt_extra(g->pt_next - arena);
++	if (!pa)
++		return 0;
++	g->pt_next++;
++	zero_pa(pa, 0x1000);
++	return pa;
++}
++
++static uint64_t pt_walk(struct a6_gpu *g, uint64_t table, unsigned idx)
++{
++	uint64_t e = 0;
++	a6_read(table + 8ull * idx, &e, 8);
++	if (e & 1)
++		return (e & 3) == 3 ? e & 0xfffffff000ull : 0;	/* 0: a block */
++	uint64_t t = pt_alloc(g);
++	if (t)
++		wr64(table + 8ull * idx, t | 3);
++	return t;
++}
++
++static int map_4k(struct a6_gpu *g, uint64_t iova, uint32_t n4k, uint64_t (*pa_of)(const void *, uint32_t),
++		  const void *arg)
++{
++	static uint64_t pte[512];
++	uint64_t l1 = a6_pool_pa(g, A6_OFF_GT_L1);
++	for (uint32_t i = 0; i < n4k;) {
++		uint64_t va = iova + 0x1000ull * i;
++		uint64_t l2 = pt_walk(g, l1, (va >> 30) & 0x1ff);
++		uint64_t l3 = l2 ? pt_walk(g, l2, (va >> 21) & 0x1ff) : 0;
++		if (!l3) {
++			a6_log("map: no page table for %llx (arena full, or a block there)\n", (unsigned long long)va);
++			return -1;
++		}
++		unsigned first = (va >> 12) & 0x1ff, k = 0;
++		while (first + k < 512 && i < n4k)
++			pte[k++] = pa_of(arg, i++) | (1u << 10) | (3u << 8) | (1u << 6) | 3u;
++		a6_write(l3 + 8ull * first, pte, 8ull * k);
++	}
++	return 0;
++}
++
++static uint64_t linear_pa(const void *arg, uint32_t i)
++{
++	return *(const uint64_t *)arg + 0x1000ull * i;
++}
++
++int a6_map(struct a6_gpu *g, uint64_t iova, uint64_t pa, uint64_t size)
++{
++	return map_4k(g, iova, (uint32_t)((size + 0xfff) >> 12), linear_pa, &pa);
++}
++
++struct page_list {
++	const uint64_t *pages;
++	uint32_t shift;		/* log2(page_size / 4K) */
++};
++
++static uint64_t list_pa(const void *arg, uint32_t i)
++{
++	const struct page_list *l = arg;
++	return l->pages[i >> l->shift] + 0x1000ull * (i & ((1u << l->shift) - 1));
++}
++
++int a6_map_pages(struct a6_gpu *g, uint64_t iova, const uint64_t *pages, uint32_t npages, uint32_t page_size)
++{
++	struct page_list l = { pages, 0 };
++	while ((0x1000u << l.shift) < page_size)
++		l.shift++;
++	return map_4k(g, iova, npages << l.shift, list_pa, &l);
++}
++
++void a6_unmap(struct a6_gpu *g, uint64_t iova, uint64_t size)
++{
++	static const uint64_t zeros[512];
++	uint64_t l1 = a6_pool_pa(g, A6_OFF_GT_L1);
++	uint64_t end = iova + ((size + 0xfff) & ~0xfffull);
++	for (uint64_t va = iova & ~0xfffull; va < end;) {
++		uint64_t e = 0, l2, l3;
++		a6_read(l1 + 8 * ((va >> 30) & 0x1ff), &e, 8);
++		l2 = (e & 3) == 3 ? e & 0xfffffff000ull : 0;
++		e = 0;
++		if (l2)
++			a6_read(l2 + 8 * ((va >> 21) & 0x1ff), &e, 8);
++		l3 = (e & 3) == 3 ? e & 0xfffffff000ull : 0;
++		uint64_t next = (va | 0x1fffffull) + 1;
++		if (next > end)
++			next = end;
++		if (l3)
++			a6_write(l3 + 8 * ((va >> 12) & 0x1ff), zeros, (size_t)((next - va) >> 12) * 8);
++		va = next;
++	}
++}
++
++void a6_unmap_high(struct a6_gpu *g)
++{
++	static const uint64_t zeros[511];
++	a6_write(a6_pool_pa(g, A6_OFF_GT_L1) + 8, zeros, sizeof(zeros));
++	g->pt_next = 0;
++	a6_tlb_flush(g);
++}
++
++/* ---- CP ---- */
++
++static int gpu_cp_init(struct a6_gpu *g, bool resume)
++{
++	uint32_t l4, lf;
++	const uint8_t *pm4 = a6_firmware("a530_pm4.fw", &l4), *pfp = a6_firmware("a530_pfp.fw", &lf);
++	if (!pm4 || !pfp || l4 < 8 || lf < 8 || l4 > 0x8000 || lf > 0x8000)
++		return -1;
++	a6_write(a6_pool_pa(g, OFF_PM4), pm4 + 4, (l4 - 4 + 3) & ~3u);	/* minus the first dword */
++	a6_write(a6_pool_pa(g, OFF_PFP), pfp + 4, (lf - 4 + 3) & ~3u);
++	const uint64_t pm4_va = a6_pool_va(OFF_PM4), pfp_va = a6_pool_va(OFF_PFP), rb = a6_pool_va(A6_OFF_RING);
++	const uint32_t init[][2] = {
++		{ 0x860, 1 },				/* CP_ADDR_MODE_CNTL: 64 bit */
++		{ CP_PM4_BASE, (uint32_t)pm4_va }, { CP_PM4_BASE + 1, (uint32_t)(pm4_va >> 32) },
++		{ CP_PFP_BASE, (uint32_t)pfp_va }, { CP_PFP_BASE + 1, (uint32_t)(pfp_va >> 32) },
++		{ CP_RB_BASE, (uint32_t)rb }, { CP_RB_BASE + 1, (uint32_t)(rb >> 32) },
++		{ CP_RB_CNTL, 12 | 2u << 8 | 1u << 27 },	/* 32 KB, 32-byte blocks, no rptr update */
++		{ CP_RB_WPTR, 0 },
++		{ 0xf810, 1 },				/* SECVID_TSB_ADDR_MODE_CNTL: 64 bit */
++		{ 0xf800, 0 }, { 0xf801, 0 }, { 0xf802, 0 },	/* no trusted TSB range */
++		/* kgsl a5xx_start() for the a512 */
++		{ 0x3049, 0x3 },			/* VBIF_ROUND_ROBIN_QOS_ARB */
++		{ 0x302a, 0x9 },			/* VBIF_GATE_OFF_WRREQ_EN */
++		{ 0x93, 0x1 }, { 0x94, 0xa6ffffff }, { 0x95, 0x3f },	/* RBBM_AHB_CNTL0/1/2 */
++		{ 0xe96, 0x2 },				/* UCHE_CACHE_WAYS */
++		{ 0xe89, 0xffff0000 }, { 0xe8a, 0x0001ffff },	/* UCHE_TRAP_BASE */
++		{ 0xe87, 0xffff0000 }, { 0xe88, 0x0001ffff },	/* UCHE_WRITE_THRU_BASE */
++		{ 0xe8b, 0x100000 }, { 0xe8c, 0 },	/* UCHE_GMEM_RANGE: 272 KB GMEM */
++		{ 0xe8d, 0x100000 + 0x44000 - 1 }, { 0xe8e, 0 },
++		{ 0xe81, 1u << 29 },			/* UCHE_MODE_CNTL */
++		{ 0x825, 0x40 }, { 0x826, 0x400 },	/* CP_MEQ_THRESHOLDS, CP_MERCIU_SIZE */
++		{ 0x820, 0x80000060 }, { 0x81f, 0x40201b16 },	/* CP_ROQ_THRESHOLDS_2, _1 */
++		{ 0x833, 0x02000000 },			/* CP_CHICKEN_DBG */
++		{ 0x67, 0 },				/* RBBM_CLOCK_CNTL: hw clock gating off */
++	};
++	for (unsigned i = 0; i < sizeof(init) / sizeof(init[0]); i++)
++		wr32(GREG(init[i][0]), init[i][1]);
++	g->wptr = 0;
++	wr32(GREG(CP_ME_CNTL), 0);		/* run ME and PFP */
++
++	uint32_t me_init[] = { a6_pkt7(A6_CP_ME_INIT, 8), 0x2f, 3, 0x20000000, 0, 0, 0, 0, 0 };
++	if (a6_ring(g, me_init, 9, "me_init", 1000))
++		return -1;
++	if (resume ? zap_resume() : zap_load(g))
++		return -1;
++	uint32_t secure[] = { a6_pkt7(A6_CP_SET_SECURE_MODE, 1), 0 };
++	int rc = a6_ring(g, secure, 2, "secure mode off", 1000);
++	a6_log("cp: trust cntl %x\n", rd32(GREG(SECVID_TRUST)));
++	return rc;
++}
++
++/* After a hang or fault: soft reset, then the CP up again (page tables and SMMU banks kept) */
++int a6_recover(struct a6_gpu *g)
++{
++	(void)a6_clear_fault(g);
++	wr32(GREG(0x43), 1);			/* RBBM_SW_RESET_CMD */
++	(void)rd32(GREG(0x43));
++	a6_delay_us(100);
++	wr32(GREG(0x43), 0);
++	a6_delay_ms(1);
++	(void)a6_clear_fault(g);
++	int rc = gpu_cp_init(g, true);
++	a6_log("recover: soft reset + CP init -> %d\n", rc);
++	return rc;
++}
++
++int a6_power_up(struct a6_gpu *g)
++{
++	/* the SMMU with only CX up, as Linux's probe; GX after */
++	if (power_cx() || smmu_reset())
++		return -1;
++	map_gpu_low(g);
++	if (smmu_banks(a6_pool_pa(g, A6_OFF_GT_L1)) || power_gx() || gpu_cp_init(g, false))
++		return -1;
++	/* self test: an IB (scratch + 0x200) whose CP_MEM_WRITE lands at scratch + 0x100 */
++	uint64_t ib = a6_pool_va(A6_OFF_SCRATCH + 0x200), dst = a6_pool_va(A6_OFF_SCRATCH + 0x100);
++	uint32_t zero = 0, got = 0, cmd[] = {
++		a6_pkt7(A6_CP_MEM_WRITE, 3), (uint32_t)dst, (uint32_t)(dst >> 32), 0xa9c0ffee,
++	};
++	a6_write(a6_pool_pa(g, A6_OFF_SCRATCH + 0x100), &zero, 4);
++	a6_write(a6_pool_pa(g, A6_OFF_SCRATCH + 0x200), cmd, sizeof(cmd));
++	int rc = a6_submit_ib(g, ib, sizeof(cmd) / 4, 100);
++	a6_read(a6_pool_pa(g, A6_OFF_SCRATCH + 0x100), &got, 4);
++	a6_log("self test: IB submit %d, fence %u, wrote %x: %s\n", rc, a6_fence_read(g), got,
++	       !rc && got == 0xa9c0ffee ? "the GPU runs IBs through its page tables" : "FAILED");
++	return rc || got != 0xa9c0ffee ? -1 : 0;
++}
++
++/* ---- 2D blit: none yet on the a512 (see the top) ---- */
++
++uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *dw)
++{
++	(void)g;
++	(void)b;
++	(void)dw;
++	return 0;
++}
++#endif /* KERNEL && ARM64_BOARD_CONFIG_A9Y18QLTE */
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 0155304..fb56a32 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -4,7 +4,8 @@
+  * register value (offsets from mainline a6xx_gmu.c/a6xx_gpu.c, a6xx.xml,
+  * gpucc-sm8150.c, sm8150.dtsi).
+  */
+-#if !defined(KERNEL) || defined(ARM64_BOARD_CONFIG_SWEET)
++/* the a9y18qlte (Adreno 512) builds bsd/dev/sweet_a5xx.c instead */
++#if !defined(KERNEL) || (defined(ARM64_BOARD_CONFIG_SWEET) && !defined(ARM64_BOARD_CONFIG_A9Y18QLTE))
+ #ifdef KERNEL
+ #include <sys/param.h>
+ #include <sys/systm.h>
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index d9d7860..d4a079f 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -48,11 +48,19 @@
+ #define A6_RING_SIZE		0x8000u
+ #define A6_RING_DW		(A6_RING_SIZE / 4)
+ 
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++/* the a9y18qlte's Adreno 512 (bsd/dev/sweet_a5xx.c implements this core) */
++#define A6_FB_PA		0x9d400000ull
++#define A6_FB_SIZE		0xa00000ull	/* mapped for the GPU: 5 x 2 MB */
++#define A6_GPU_ID		512
++#define A6_CHIP_ID		0x05010200ull
++#else
+ #define A6_FB_PA		0x9c400000ull
+ #define A6_FB_SIZE		0xa00000ull	/* mapped for the GPU: 5 x 2 MB */
+ 
+ #define A6_GPU_ID		640
+ #define A6_CHIP_ID		0x06040001ull
++#endif
+ 
+ struct a6_gpu {
+ 	uint64_t pool_pa;
+@@ -157,10 +165,16 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
+ #define A6_CP_MEMCPY		0x75
+ 
+ /* Register/state access for status and dumps */
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++#define A6_GPU_BASE		0x05000000ull
++#define A6_GPUCC		0x05065000ull
++#define A6_SMMU			0x05040000ull
++#else
+ #define A6_GPU_BASE		0x02c00000ull
+-#define A6_GREG(o)		(A6_GPU_BASE + 4ull * (o))
+ #define A6_GPUCC		0x02c90000ull
+ #define A6_SMMU			0x02ca0000ull
++#endif
++#define A6_GREG(o)		(A6_GPU_BASE + 4ull * (o))
+ #define A6_SMMU_CB(n)		(A6_SMMU + 0x8000 + 0x1000ull * (n))
+ #define A6_FSR_FAULT		0xc00001feu
+ #define A6_GMEM_LOG_OFF		0x91000ull
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index c87ed5d..0d985d7 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -238,6 +238,7 @@ int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const
+ static void
+ gpu_bus_vote(void)
+ {
++#if !defined(ARM64_BOARD_CONFIG_A9Y18QLTE)     /* SDM660 has RPM, not RPMh: no votes needed to bring it up */
+ 	uint32_t on = 1;
+ 	PE_parse_boot_argn("sweetddr", &on, sizeof(on));
+ 	if (!on) {
+@@ -249,6 +250,7 @@ gpu_bus_vote(void)
+ 		int rc = sweet_rpmh_write(bcm[i], 1, &off, &val);
+ 		a6_log("bus vote %s top -> %d\n", bcm[i], rc);
+ 	}
++#endif
+ }
+ 
+ static void
 diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
 index d405964..5d43ce3 100644
 --- a/bsd/dev/sweet_pmem.c
@@ -1519,7 +2326,7 @@ index 6a121c5..bbf7129 100644
  			return 0;
  		}
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 99a9c87..f56a922 100644
+index 99a9c87..800977f 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -110,6 +110,7 @@ static struct {
@@ -1682,7 +2489,7 @@ index 99a9c87..f56a922 100644
  	lck_mtx_unlock(&sweet_ufs_lock);
  	if (error) {
  		return error;
-@@ -660,6 +752,17 @@ sweet_ufs_init(void)
+@@ -660,6 +752,18 @@ sweet_ufs_init(void)
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
  	sweet_log_start();
@@ -1690,17 +2497,18 @@ index 99a9c87..f56a922 100644
 +	{
 +		extern void a9y_touch_init(void);       /* bsd/dev/a9y_touch.c: Zinitix ZT7548 */
 +		extern void a9y_keys_init(void);        /* bsd/dev/a9y_keys.c: power, volume */
-+		extern void a9y_gpu_init(void);         /* bsd/dev/a9y_gpu.c: Adreno 512 */
++		extern void a9y_gpu_init(void);         /* bsd/dev/a9y_gpu.c: Adreno 512 self test */
 +		a9y_touch_init();
 +		a9y_keys_init();
-+		a9y_gpu_init();
++		a9y_gpu_init();         /* stands down for sweetgpu=1 */
++		sweet_gpu_init();       /* Adreno 512 (sweetgpu=1): bsd/dev/sweet_gpu.c over sweet_a5xx.c */
 +	}
 +#else
 +	/* these drive SM7150/SM8150 blocks (OSM, Wi-Fi, Adreno 6xx, PM8150, touch, DWC3) */
  	sweet_sample_start();
  	sweet_cpufreq_init();
  	sweet_pmem_init();       /* /dev/pmem: bsd/dev/sweet_pmem.c */
-@@ -670,6 +773,7 @@ sweet_ufs_init(void)
+@@ -670,6 +774,7 @@ sweet_ufs_init(void)
  	sweet_touch_init();
  	sweet_fts_init();
  	sweet_usb_probe();
@@ -1708,7 +2516,7 @@ index 99a9c87..f56a922 100644
  	return 0;
  }
  
-@@ -705,7 +809,12 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+@@ -705,7 +810,12 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
   *   +0x1000 ring bytes (offset of byte n = n % ring size)
   * The next shim boot copies its tail to UFS (tools/flame-log-pull.sh rescue).
   */
@@ -1721,7 +2529,7 @@ index 99a9c87..f56a922 100644
  struct sweet_mirror_header {
  	char magic[8];
  	uint64_t total;
-@@ -834,56 +943,95 @@ struct sweet_log_header {
+@@ -834,56 +944,95 @@ struct sweet_log_header {
  	uint64_t total, seq;
  };
  
@@ -2097,7 +2905,7 @@ index 2545cf9..6d3c7e9 100644
  		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
  		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index bc98b59..5f77775 100644
+index bc98b59..05fcf2c 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -144,6 +144,9 @@ public:
@@ -2184,11 +2992,16 @@ index bc98b59..5f77775 100644
  bool
  AppleCLCD::presentGPU(const uint8_t *rec)
  {
-@@ -538,6 +608,11 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -535,9 +605,16 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
++#if !defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
  	if (sweet_gpu_ready() && presentGPU(rec)) {
  		return;
  	}
-+#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++#else
++	/* the a512's 2D engine has no working copy yet (sweet_a5xx.c a6_blit_ib): CPU present */
 +	if (presentFitCPU(rec)) {
 +		return;
 +	}
