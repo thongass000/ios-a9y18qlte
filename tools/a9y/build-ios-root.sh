@@ -90,6 +90,7 @@ if [ ! -f "$IMG" ]; then
 	mnt=$(mktemp -d)
 	sudo mount -t hfsplus -o loop,force "$IMG.tmp" "$mnt"
 	sudo python3 -I "$FLAME/tools/sweet-root-tweaks.py" "$mnt" || { sudo umount "$mnt"; exit 1; }
+	sudo python3 -I "$FLAME/tools/a9y/a9y-root-tweaks.py" "$mnt" || { sudo umount "$mnt"; exit 1; }
 	sudo umount "$mnt"
 	rmdir "$mnt"
 	repair "$IMG.tmp"

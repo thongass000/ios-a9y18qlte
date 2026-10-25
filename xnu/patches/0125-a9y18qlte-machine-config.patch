@@ -1369,7 +1369,7 @@ index bc98b59..5f77775 100644
  		sweet_display_fit_w = 0;        /* touch back to the crop mapping */
  		sweet_display_fit_x = sweet_display_fit_y = sweet_display_fit_h = 0;
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 2514af3..a48fecf 100644
+index 2514af3..b1d6c1b 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 @@ -33,7 +33,11 @@ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
@@ -1384,6 +1384,55 @@ index 2514af3..a48fecf 100644
  #define FLAME_WDT_RST   0x04
  #define FLAME_WDT_EN    0x08
  #define FLAME_WDT_PET_S 5
+@@ -148,6 +152,38 @@ SweetPlatformExpert::setGMTTimeOfDay(long secs)
+ extern "C" void sweet_log_mirror_start(void);
+ extern "C" void sweet_poke_start(void);
+ 
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++#include <IOKit/IORegistryEntry.h>
++/*
++ * a9y18qlte bring-up: Settings' About waited on "IOKit to quiesce (or
++ * timeout)" (IOKitWaitQuiet). Once the boot has settled, log every service
++ * still busy, with its busy count and provider, so the one that never
++ * finishes starting has a name.
++ */
++static void
++sweet_busy_dump(__unused void *arg)
++{
++	IOSleep(90 * 1000);
++	IORegistryIterator *it = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
++	unsigned busy = 0;
++	if (it != NULL) {
++		IORegistryEntry *e;
++		while ((e = it->getNextObject()) != NULL) {
++			IOService *s = OSDynamicCast(IOService, e);
++			if (s != NULL && s->getBusyState() != 0) {
++				IOService *p = s->getProvider();
++				IOLog("SWEET BUSY: %s (%s) busy %u, provider %s\n", s->getName(),
++				    s->getMetaClass()->getClassName(), s->getBusyState(),
++				    p ? p->getName() : "-");
++				busy++;
++			}
++		}
++		it->release();
++	}
++	IOLog("SWEET BUSY: %u busy services at 90 s\n", busy);
++}
++#endif
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+@@ -158,6 +194,9 @@ SweetPlatformExpert::start(IOService *provider)
+ 	}
+ 	flame_wdt_start();
+ 	sweet_poke_start();             /* register scripts: bsd/dev/sweet_poke.c */
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	IOCreateThread(sweet_busy_dump, NULL);
++#endif
+ 	uint32_t rtc = 0;
+ 	uint8_t ctrl = 0;
+ 	if (sweet_rtc_read(&rtc) == 0 && sweet_spmi_read(0, PM8150_RTC_CTRL, &ctrl) == 0) {
 diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
 index f876fb0..4d98724 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
