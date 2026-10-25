@@ -27,10 +27,10 @@ index df7c863..bf0425a 100644
  bsd/dev/sweet_files.c			standard
 diff --git a/bsd/dev/a9y_touch.c b/bsd/dev/a9y_touch.c
 new file mode 100644
-index 0000000..dc8e5d8
+index 0000000..a3d28b9
 --- /dev/null
 +++ b/bsd/dev/a9y_touch.c
-@@ -0,0 +1,403 @@
+@@ -0,0 +1,417 @@
 +/*
 + * a9y18qlte (Galaxy A9 2018, SDM660) touchscreen: Zinitix ZT7548 at 0x20 on
 + * BLSP1 QUP4 I2C (i2c@c178000: SDA/SCL GPIO 14/15, IRQ GPIO 67, low while a
@@ -203,7 +203,11 @@ index 0000000..dc8e5d8
 +	return ok ? 0 : -1;
 +}
 +
-+/* LDO3 (REG_REG_EN 0x03 bit 2) at 3.0 V (REG_LDO3_CFG 0x12: 0.6 V + 96 * 25 mV) */
++/*
++ * LDO3 (REG_REG_EN 0x03 bit 2) at 3.0 V (REG_LDO3_CFG 0x12: 0.6 V + 96 * 25 mV),
++ * off first: the chip may be running from an earlier bring-up (the probe
++ * shim), and only answers the power sequence's vendor commands from reset.
++ */
 +static int
 +touch_power(void)
 +{
@@ -214,9 +218,11 @@ index 0000000..dc8e5d8
 +	if ((cfg & 0x7f) != 96) {
 +		s2dos_write(0x12, (uint8_t)((cfg & 0x80) | 96));
 +	}
-+	if (!(en & 0x04)) {
-+		s2dos_write(0x03, en | 0x04);
++	if (en & 0x04) {
++		s2dos_write(0x03, en & ~0x04);
++		IOSleep(50);	/* CHIP_OFF_DELAY */
 +	}
++	s2dos_write(0x03, en | 0x04);
 +	IOSleep(50);	/* CHIP_ON_DELAY */
 +	(void)s2dos_read(0x02, &stat);
 +	return (stat & 0x04) ? 0 : -1;	/* LDO3 power good */
@@ -340,10 +346,6 @@ index 0000000..dc8e5d8
 +	if (!gcc_vote || !gcc_qup4 || !tlmm || !qup) {
 +		return -1;
 +	}
-+	if (touch_power()) {
-+		printf("A9Y TOUCH: s2dos03 LDO3 did not come up\n");
-+		return -2;
-+	}
 +	wr(gcc_vote + 0x004, rd(gcc_vote + 0x004) | (1u << 17));
 +	wr(gcc_qup4 + 0x008, rd(gcc_qup4 + 0x008) | 1);
 +	for (int i = 0; i < 1000 && (rd(gcc_qup4 + 0x008) >> 31); i++) {
@@ -353,9 +355,21 @@ index 0000000..dc8e5d8
 +	wr(tlmm_cfg(15), 2u << 2);
 +	wr(tlmm_cfg(TOUCH_IRQ), 0);     /* input, no pull */
 +
-+	/* bt532_power_sequence() */
++	/* bt532_power_control(POWER_ON_SEQUENCE): power cycle, then the sequence; 3 retries */
 +	uint8_t code[2] = { 0 };
-+	if (zt_write(0xc000, 1) || zt_read(0xcc00, code, 2) || (code[0] | code[1] << 8) != 0xe548) {
++	int tries;
++	for (tries = 0; tries < 4; tries++) {
++		if (touch_power()) {
++			printf("A9Y TOUCH: s2dos03 LDO3 did not come up\n");
++			continue;
++		}
++		code[0] = code[1] = 0;
++		if (zt_write(0xc000, 1) == 0 && zt_read(0xcc00, code, 2) == 0 &&
++		    (code[0] | code[1] << 8) == 0xe548) {
++			break;
++		}
++	}
++	if (tries == 4) {
 +		printf("A9Y TOUCH: no ZT7548 (chip code %x)\n", code[0] | code[1] << 8);
 +		return -3;
 +	}
