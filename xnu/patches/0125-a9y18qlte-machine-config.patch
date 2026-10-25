@@ -14,18 +14,196 @@ index f2d8bf8..c427fc7 100644
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index df7c863..e068114 100644
+index df7c863..f4aacdc 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,8 @@ bsd/dev/sweet_sample.c			standard
+@@ -109,6 +109,10 @@ bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
  bsd/dev/sweet_fts.c			standard
 +bsd/dev/a9y_touch.c			standard
 +bsd/dev/a9y_keys.c			standard
++bsd/dev/a9y_i2cbb.c			standard
++bsd/dev/a9y_sm5705.c			standard
  bsd/dev/sweet_cpufreq.c			standard
  bsd/dev/sweet_poke.c			standard
  bsd/dev/sweet_files.c			standard
+diff --git a/bsd/dev/a9y_i2cbb.c b/bsd/dev/a9y_i2cbb.c
+new file mode 100644
+index 0000000..8e2cf4f
+--- /dev/null
++++ b/bsd/dev/a9y_i2cbb.c
+@@ -0,0 +1,132 @@
++/*
++ * a9y18qlte bit-banged I2C (see a9y_i2cbb.h). Open drain by hand: a line is
++ * pulled low with the GPIO's output enabled and its output value 0, and
++ * released (pulled up on the board) with the output disabled. ~100 kHz.
++ * One mutex for all buses: they are short register transfers.
++ */
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include "a9y_i2cbb.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define TLMM_OE         (1u << 9)
++
++static LCK_GRP_DECLARE(a9y_bb_grp, "a9y_i2cbb");
++static LCK_MTX_DECLARE(a9y_bb_lock, &a9y_bb_grp);
++
++static void
++bb_line(uintptr_t cfg, int high)
++{
++	*(volatile uint32_t *)(cfg + 4) = 0;            /* output value 0 when driven */
++	*(volatile uint32_t *)cfg = high ? 0 : TLMM_OE; /* gpio function, OE = pull low */
++	delay(5);
++}
++
++static int
++bb_in(uintptr_t cfg)
++{
++	return *(volatile uint32_t *)(cfg + 4) & 1;
++}
++
++static void
++bb_start(struct a9y_bb_bus *b)
++{
++	bb_line(b->sda, 1);
++	bb_line(b->scl, 1);
++	bb_line(b->sda, 0);
++	bb_line(b->scl, 0);
++}
++
++static void
++bb_stop(struct a9y_bb_bus *b)
++{
++	bb_line(b->sda, 0);
++	bb_line(b->scl, 1);
++	bb_line(b->sda, 1);
++}
++
++static int
++bb_write_byte(struct a9y_bb_bus *b, uint8_t v)
++{
++	for (int i = 7; i >= 0; i--) {
++		bb_line(b->sda, (v >> i) & 1);
++		bb_line(b->scl, 1);
++		bb_line(b->scl, 0);
++	}
++	bb_line(b->sda, 1);
++	bb_line(b->scl, 1);
++	int ack = !bb_in(b->sda);
++	bb_line(b->scl, 0);
++	return ack;
++}
++
++static uint8_t
++bb_read_byte(struct a9y_bb_bus *b, int ack)
++{
++	uint8_t v = 0;
++	bb_line(b->sda, 1);
++	for (int i = 0; i < 8; i++) {
++		bb_line(b->scl, 1);
++		v = (uint8_t)(v << 1 | bb_in(b->sda));
++		bb_line(b->scl, 0);
++	}
++	bb_line(b->sda, !ack);
++	bb_line(b->scl, 1);
++	bb_line(b->scl, 0);
++	bb_line(b->sda, 1);
++	return v;
++}
++
++static int
++bb_map(struct a9y_bb_bus *b)
++{
++	if (!b->sda) {
++		b->sda = ml_io_map(b->sda_pa, 0x1000);
++	}
++	if (!b->scl) {
++		b->scl = ml_io_map(b->scl_pa, 0x1000);
++	}
++	return b->sda && b->scl ? 0 : -1;
++}
++
++int
++a9y_bb_read(struct a9y_bb_bus *b, uint8_t addr, uint8_t reg, uint8_t *buf, uint32_t n)
++{
++	lck_mtx_lock(&a9y_bb_lock);
++	int ok = bb_map(b) == 0;
++	if (ok) {
++		bb_start(b);
++		ok = bb_write_byte(b, (uint8_t)(addr << 1)) && bb_write_byte(b, reg);
++		bb_start(b);
++		ok = ok && bb_write_byte(b, (uint8_t)(addr << 1 | 1));
++		for (uint32_t i = 0; ok && i < n; i++) {
++			buf[i] = bb_read_byte(b, i + 1 < n);
++		}
++		bb_stop(b);
++	}
++	lck_mtx_unlock(&a9y_bb_lock);
++	return ok ? 0 : -1;
++}
++
++int
++a9y_bb_write(struct a9y_bb_bus *b, uint8_t addr, uint8_t reg, const uint8_t *buf, uint32_t n)
++{
++	lck_mtx_lock(&a9y_bb_lock);
++	int ok = bb_map(b) == 0;
++	if (ok) {
++		bb_start(b);
++		ok = bb_write_byte(b, (uint8_t)(addr << 1)) && bb_write_byte(b, reg);
++		for (uint32_t i = 0; ok && i < n; i++) {
++			ok = bb_write_byte(b, buf[i]);
++		}
++		bb_stop(b);
++	}
++	lck_mtx_unlock(&a9y_bb_lock);
++	return ok ? 0 : -1;
++}
++#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
+diff --git a/bsd/dev/a9y_i2cbb.h b/bsd/dev/a9y_i2cbb.h
+new file mode 100644
+index 0000000..15046c0
+--- /dev/null
++++ b/bsd/dev/a9y_i2cbb.h
+@@ -0,0 +1,32 @@
++/*
++ * a9y18qlte bit-banged I2C over SDM660 TLMM GPIOs (bsd/dev/a9y_i2cbb.c), for
++ * the buses Linux runs with i2c-gpio: i2c@22 (s2dos03, touch AVDD) and
++ * i2c@24 (SM5705 fuel gauge).
++ */
++#ifndef A9Y_I2CBB_H
++#define A9Y_I2CBB_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* TLMM config page of a GPIO: tiles NORTH 0x03900000, SOUTH 0x03100000, 0x1000 per GPIO */
++#define A9Y_TLMM_NORTH(gpio)    (0x03900000u + 0x1000u * (gpio))
++#define A9Y_TLMM_SOUTH(gpio)    (0x03100000u + 0x1000u * (gpio))
++
++struct a9y_bb_bus {
++	uint32_t sda_pa, scl_pa;        /* TLMM config pages of SDA and SCL */
++	uintptr_t sda, scl;             /* mapped on first use */
++};
++
++/* Register read/write of an 8-bit-register device; 0 on success (all bytes acked). */
++int a9y_bb_read(struct a9y_bb_bus *bus, uint8_t addr, uint8_t reg, uint8_t *buf, uint32_t n);
++int a9y_bb_write(struct a9y_bb_bus *bus, uint8_t addr, uint8_t reg, const uint8_t *buf, uint32_t n);
++
++/* SM5705 fuel gauge (bsd/dev/a9y_sm5705.c): percent x10, mV, mA (positive charging) */
++int a9y_sm5705_read(unsigned *permille, unsigned *mv, int *ma);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
 diff --git a/bsd/dev/a9y_keys.c b/bsd/dev/a9y_keys.c
 new file mode 100644
 index 0000000..bf7474e
@@ -117,12 +295,61 @@ index 0000000..bf7474e
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
+diff --git a/bsd/dev/a9y_sm5705.c b/bsd/dev/a9y_sm5705.c
+new file mode 100644
+index 0000000..3da81c7
+--- /dev/null
++++ b/bsd/dev/a9y_sm5705.c
+@@ -0,0 +1,43 @@
++/*
++ * a9y18qlte battery gauge: the SM5705 fuel gauge (0x71) on the bit-banged
++ * i2c@24 (SDA GPIO 55, SCL GPIO 56, TLMM SOUTH tile). This is what Android
++ * reports (sm5705-fuelgauge); the PM660's own FG gen3 has no battery profile
++ * here. Decoding as Samsung's sm5705_fuelgauge.c, words little endian:
++ *   SOC     0x05: high byte percent, low byte /256 (capacity_max 1000: no scaling)
++ *   VOLTAGE 0x07: bits 13:11 volts, 10:0 /2048
++ *   CURRENT 0x08: bits 12:11 amps, 10:0 /2048, bit 15 negative (discharging)
++ */
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include "a9y_i2cbb.h"
++
++#define SM5705_FG       0x71
++
++static struct a9y_bb_bus sm5705_bus = { A9Y_TLMM_SOUTH(55), A9Y_TLMM_SOUTH(56), 0, 0 };
++
++static int
++sm5705_word(uint8_t reg, uint16_t *v)
++{
++	uint8_t b[2];
++	if (a9y_bb_read(&sm5705_bus, SM5705_FG, reg, b, 2)) {
++		return -1;
++	}
++	*v = (uint16_t)(b[0] | b[1] << 8);
++	return 0;
++}
++
++int
++a9y_sm5705_read(unsigned *permille, unsigned *mv, int *ma)
++{
++	uint16_t soc, volt, cur;
++	if (sm5705_word(0x05, &soc) || sm5705_word(0x07, &volt) || sm5705_word(0x08, &cur)) {
++		return -1;
++	}
++	*permille = ((soc & 0xff00u) >> 8) * 10 + ((soc & 0x00ffu) * 10) / 256;
++	*mv = ((volt & 0x3800u) >> 11) * 1000 + ((volt & 0x07ffu) * 1000) / 2048;
++	int c = (int)(((cur & 0x1800u) >> 11) * 1000 + ((cur & 0x07ffu) * 1000) / 2048);
++	*ma = (cur & 0x8000u) ? -c : c;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
 diff --git a/bsd/dev/a9y_touch.c b/bsd/dev/a9y_touch.c
 new file mode 100644
-index 0000000..a3d28b9
+index 0000000..91746ca
 --- /dev/null
 +++ b/bsd/dev/a9y_touch.c
-@@ -0,0 +1,417 @@
+@@ -0,0 +1,347 @@
 +/*
 + * a9y18qlte (Galaxy A9 2018, SDM660) touchscreen: Zinitix ZT7548 at 0x20 on
 + * BLSP1 QUP4 I2C (i2c@c178000: SDA/SCL GPIO 14/15, IRQ GPIO 67, low while a
@@ -144,6 +371,7 @@ index 0000000..a3d28b9
 +#include <kern/clock.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
++#include "a9y_i2cbb.h"
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern void IOSleep(unsigned int milliseconds);
@@ -153,8 +381,8 @@ index 0000000..a3d28b9
 +#define GCC_VOTE_PA             0x00152000u     /* + 0x004: BLSP1 AHB, bit 17 */
 +#define GCC_QUP4_PA             0x0011f000u     /* + 0x008: QUP4 I2C core CBCR */
 +#define TLMM_PA                 0x03900000u     /* NORTH tile, 0x1000 per GPIO */
-+#define TLMM_FIRST              14              /* GPIOs 14..70 are mapped */
-+#define TLMM_LAST               70
++#define TLMM_FIRST              14              /* GPIOs 14..67 are mapped */
++#define TLMM_LAST               67
 +#define QUP4_PA                 0x0c178000u
 +
 +#define QUP_CONFIG              0x000
@@ -186,7 +414,6 @@ index 0000000..a3d28b9
 +#define S2DOS03                 0x60
 +#define BB_SDA                  66
 +#define BB_SCL                  70
-+#define TLMM_OE                 (1u << 9)
 +#define TOUCH_IRQ               67
 +
 +static vm_offset_t gcc_vote, gcc_qup4, tlmm, qup;
@@ -209,90 +436,20 @@ index 0000000..a3d28b9
 +	return tlmm + 0x1000u * (uint32_t)(gpio - TLMM_FIRST);
 +}
 +
-+/* ---- s2dos03 over the bit-banged bus: open drain by OE with output 0 ---- */
++/* ---- s2dos03 over the bit-banged i2c@22 (bsd/dev/a9y_i2cbb.c) ---- */
 +
-+static void
-+bb_line(int pin, int high)
-+{
-+	wr(tlmm_cfg(pin) + 4, 0);
-+	wr(tlmm_cfg(pin), high ? 0 : TLMM_OE);
-+	delay(5);
-+}
-+
-+static int
-+bb_in(int pin)
-+{
-+	return rd(tlmm_cfg(pin) + 4) & 1;
-+}
-+
-+static void
-+bb_start(void)
-+{
-+	bb_line(BB_SDA, 1);
-+	bb_line(BB_SCL, 1);
-+	bb_line(BB_SDA, 0);
-+	bb_line(BB_SCL, 0);
-+}
-+
-+static void
-+bb_stop(void)
-+{
-+	bb_line(BB_SDA, 0);
-+	bb_line(BB_SCL, 1);
-+	bb_line(BB_SDA, 1);
-+}
-+
-+static int
-+bb_write(uint8_t b)
-+{
-+	for (int i = 7; i >= 0; i--) {
-+		bb_line(BB_SDA, (b >> i) & 1);
-+		bb_line(BB_SCL, 1);
-+		bb_line(BB_SCL, 0);
-+	}
-+	bb_line(BB_SDA, 1);
-+	bb_line(BB_SCL, 1);
-+	int ack = !bb_in(BB_SDA);
-+	bb_line(BB_SCL, 0);
-+	return ack;
-+}
-+
-+static uint8_t
-+bb_read_nack(void)
-+{
-+	uint8_t b = 0;
-+	bb_line(BB_SDA, 1);
-+	for (int i = 0; i < 8; i++) {
-+		bb_line(BB_SCL, 1);
-+		b = (uint8_t)(b << 1 | bb_in(BB_SDA));
-+		bb_line(BB_SCL, 0);
-+	}
-+	bb_line(BB_SCL, 1);	/* SDA released: NACK */
-+	bb_line(BB_SCL, 0);
-+	return b;
-+}
++static struct a9y_bb_bus s2dos_bus = { A9Y_TLMM_NORTH(BB_SDA), A9Y_TLMM_NORTH(BB_SCL), 0, 0 };
 +
 +static int
 +s2dos_read(uint8_t reg, uint8_t *v)
 +{
-+	bb_start();
-+	int ok = bb_write(S2DOS03 << 1) && bb_write(reg);
-+	bb_start();
-+	ok = ok && bb_write(S2DOS03 << 1 | 1);
-+	if (ok) {
-+		*v = bb_read_nack();
-+	}
-+	bb_stop();
-+	return ok ? 0 : -1;
++	return a9y_bb_read(&s2dos_bus, S2DOS03, reg, v, 1);
 +}
 +
 +static int
 +s2dos_write(uint8_t reg, uint8_t v)
 +{
-+	bb_start();
-+	int ok = bb_write(S2DOS03 << 1) && bb_write(reg) && bb_write(v);
-+	bb_stop();
-+	return ok ? 0 : -1;
++	return a9y_bb_write(&s2dos_bus, S2DOS03, reg, &v, 1);
 +}
 +
 +/*
@@ -555,7 +712,7 @@ index d405964..5d43ce3 100644
  static LCK_GRP_DECLARE(sweet_pmem_grp, "sweet_pmem");
  static LCK_MTX_DECLARE(sweet_pmem_lock, &sweet_pmem_grp);
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
-index 6a121c5..29dca03 100644
+index 6a121c5..bbf7129 100644
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
 @@ -15,17 +15,56 @@
@@ -658,7 +815,7 @@ index 6a121c5..29dca03 100644
  		printf("SWEET BATTERY: unsupported SPMI arb=%#x APIDs=%u\n",
  		    arb_version, sp_count);
  		return -1;
-@@ -89,9 +140,18 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+@@ -89,9 +140,17 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
  {
  	/* Restrict access to the battery blocks and the RTC (0x60); keys retain their own lanes. */
  	unsigned peripheral = addr >> 8;
@@ -669,18 +826,17 @@ index 6a121c5..29dca03 100644
 +	    peripheral == 0x13 || peripheral == 0x48 || peripheral == 0x60);
 +#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
 +	/*
-+	 * a9y_keys.c: PM660 PON (power, volume down), PM660L GPIO 7/8 (volume up,
-+	 * Bixby); SweetBattery: PM660 FG gen3 BATT_SOC/BATT_INFO (0x40/0x41), SMB2 MISC (0x16)
++	 * PM660 PON: power and volume down (a9y_keys.c), cable power (SweetBattery);
++	 * PM660L GPIO 7/8: volume up, Bixby
 +	 */
-+	allowed = allowed || (sid == 0 && (peripheral == 0x08 || peripheral == 0x16 || peripheral == 0x40 ||
-+	    peripheral == 0x41)) ||
++	allowed = allowed || (sid == 0 && peripheral == 0x08) ||
 +	    (sid == 2 && (peripheral == 0xc6 || peripheral == 0xc7));
 +#endif
 +	if (!sp_ready || !out || addr > 0xffffu || !allowed) {
  		return -1;
  	}
  	IOLockLock(sp_lock);
-@@ -100,19 +160,23 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+@@ -100,19 +159,23 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
  		IOLockUnlock(sp_lock);
  		return -1;
  	}
@@ -1163,67 +1319,63 @@ index 0000000..7c82491
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
-index 9969739..65f84ba 100644
+index 9969739..82409e2 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
-@@ -203,6 +203,56 @@ SweetBattery::estimatePercent(unsigned mv)
+@@ -15,6 +15,9 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++extern "C" int a9y_sm5705_read(unsigned *permille, unsigned *mv, int *ma);     /* bsd/dev/a9y_sm5705.c */
++#endif
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -203,6 +206,42 @@ SweetBattery::estimatePercent(unsigned mv)
  	return 100;
  }
  
 +#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
 +/*
-+ * a9y18qlte: PM660 FG gen3 and SMB2 (qpnp-fg-gen3.c, smb-lib.c). Monotonic
-+ * SOC 0x4009 (0-255), VBATT 0x41a0 (122.07 uV), IBATT 0x41a2 (signed,
-+ * 488.281 uA, positive discharging), BATTERY_CHARGER_STATUS_1 0x1006 bits
-+ * 2:0 (0-4 charging, 5 terminated), USBIN_INT_RT_STS 0x1310 bit 4 plugged.
++ * a9y18qlte: Samsung's SM5705 charges the battery and gauges it (what
++ * Android shows; the PM660 FG gen3 is unprofiled here and read ~10% high):
++ * percent, voltage and current from bsd/dev/a9y_sm5705.c. Cable power is
++ * PM660 PON INT_RT_STS bit 2, CBLPWR, which follows the charger being
++ * plugged in and out; charging while plugged in, below full, current in.
 + */
 +void
 +SweetBattery::poll(void)
 +{
-+	uint8_t msoc, usb, charger, path = 0;
-+	uint16_t rawVoltage, rawCurrent;
-+	bool valid = fReal && !sweet_spmi_read(0, 0x4009, &msoc) &&
-+	    readWord(0x41a0, &rawVoltage) &&
-+	    !sweet_spmi_read(0, 0x1310, &usb) &&
-+	    !sweet_spmi_read(0, 0x1006, &charger);
-+	(void)sweet_spmi_read(0, 0x160b, &path);       /* POWER_PATH_STATUS */
++	unsigned permille = 0, mv = 0;
++	int ma = 0;
 +	uint8_t pon = 0;
-+	(void)sweet_spmi_read(0, 0x0810, &pon);        /* PON INT_RT_STS: bit 2 CBLPWR, cable power */
-+	static uint32_t lastRaw = 0xffffffffu;
-+	uint32_t raw = (uint32_t)usb | (uint32_t)charger << 8 | (uint32_t)path << 16 | (uint32_t)(pon & 4u) << 24;
-+	if (valid && raw != lastRaw) {
-+		IOLog("SWEET BATTERY: usbin rt %#x charger status %#x power path %#x pon %#x soc %u\n",
-+		    usb, charger, path, pon, msoc);
-+		lastRaw = raw;
-+	}
-+	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 122070u) / 1000000u) : 0;
-+	valid = valid && mv >= 2800 && mv <= 4600;
++	bool valid = fReal && a9y_sm5705_read(&permille, &mv, &ma) == 0 &&
++	    !sweet_spmi_read(0, 0x0810, &pon) && mv >= 2800 && mv <= 4600;
 +	if (!valid) {
 +		publish(100, 4200, 0, true, true, false, true, false, false);
 +		return;
 +	}
-+	/*
-+	 * PON CBLPWR (followed plugging and unplugging on the phone), USBIN
-+	 * plug-in RT status, or the power path running from USBIN with a valid source
-+	 */
-+	bool external = (pon & 0x04u) || (usb & 0x10u) || ((path & 0x10u) && (path & 0x01u));
-+	unsigned state = charger & 7u;
-+	bool charging = external && state <= 4;
-+	bool full = external && state == 5;
-+	int ma = 0;
-+	bool currentValid = readWord(0x41a2, &rawCurrent);
-+	if (currentValid) {
-+		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
-+		ma = (int)(-((int64_t)signedRaw * 488281) / 1000000);
++	bool external = (pon & 0x04u) != 0;
++	unsigned percent = (permille + 5) / 10;
++	bool full = external && percent >= 100;
++	bool charging = external && !full && ma > 0;
++	static bool lastExternal, lastCharging, logged;
++	if (!logged || external != lastExternal || charging != lastCharging) {
++		IOLog("SWEET BATTERY: SM5705 %u.%u%% %umV %dmA cable %d charging %d\n",
++		    permille / 10, permille % 10, mv, ma, external, charging);
++		lastExternal = external;
++		lastCharging = charging;
++		logged = true;
 +	}
-+	unsigned percent = full ? 100 : ((unsigned)msoc * 100 + 127) / 255;
-+	publish(percent ? percent : 1, mv, ma, external, external, charging, full, true, currentValid);
++	publish(percent > 100 ? 100 : (percent ? percent : 1), mv, ma, external, external,
++	    charging, full, true, true);
 +}
 +#else
  void
  SweetBattery::poll(void)
  {
-@@ -245,6 +295,7 @@ SweetBattery::poll(void)
+@@ -245,6 +284,7 @@ SweetBattery::poll(void)
  	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
  	    charging, full, true, currentValid);
  }
@@ -1231,7 +1383,7 @@ index 9969739..65f84ba 100644
  
  void
  SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
-@@ -262,7 +313,11 @@ SweetBattery::start(IOService *provider)
+@@ -262,7 +302,11 @@ SweetBattery::start(IOService *provider)
  	if (!IOPMPowerSource::start(provider)) {
  		return false;
  	}
