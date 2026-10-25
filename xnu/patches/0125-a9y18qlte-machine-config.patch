@@ -1319,7 +1319,7 @@ index 0000000..7c82491
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
-index 9969739..82409e2 100644
+index 9969739..a7e8b6e 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
 @@ -15,6 +15,9 @@
@@ -1332,7 +1332,7 @@ index 9969739..82409e2 100644
  
  class SweetBattery : public IOPMPowerSource {
  	OSDeclareDefaultStructors(SweetBattery);
-@@ -203,6 +206,42 @@ SweetBattery::estimatePercent(unsigned mv)
+@@ -203,6 +206,47 @@ SweetBattery::estimatePercent(unsigned mv)
  	return 100;
  }
  
@@ -1342,7 +1342,7 @@ index 9969739..82409e2 100644
 + * Android shows; the PM660 FG gen3 is unprofiled here and read ~10% high):
 + * percent, voltage and current from bsd/dev/a9y_sm5705.c. Cable power is
 + * PM660 PON INT_RT_STS bit 2, CBLPWR, which follows the charger being
-+ * plugged in and out; charging while plugged in, below full, current in.
++ * plugged in and out; charging while plugged in and below full.
 + */
 +void
 +SweetBattery::poll(void)
@@ -1358,8 +1358,13 @@ index 9969739..82409e2 100644
 +	}
 +	bool external = (pon & 0x04u) != 0;
 +	unsigned percent = (permille + 5) / 10;
++	/*
++	 * Plugged in and not full counts as charging: under load (8 cores, CPU
++	 * rendering) the current hovers around 0 at the SM5705's default input
++	 * limit, and a sign test made the bolt flicker.
++	 */
 +	bool full = external && percent >= 100;
-+	bool charging = external && !full && ma > 0;
++	bool charging = external && !full;
 +	static bool lastExternal, lastCharging, logged;
 +	if (!logged || external != lastExternal || charging != lastCharging) {
 +		IOLog("SWEET BATTERY: SM5705 %u.%u%% %umV %dmA cable %d charging %d\n",
@@ -1375,7 +1380,7 @@ index 9969739..82409e2 100644
  void
  SweetBattery::poll(void)
  {
-@@ -245,6 +284,7 @@ SweetBattery::poll(void)
+@@ -245,6 +289,7 @@ SweetBattery::poll(void)
  	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
  	    charging, full, true, currentValid);
  }
@@ -1383,7 +1388,7 @@ index 9969739..82409e2 100644
  
  void
  SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
-@@ -262,7 +302,11 @@ SweetBattery::start(IOService *provider)
+@@ -262,7 +307,11 @@ SweetBattery::start(IOService *provider)
  	if (!IOPMPowerSource::start(provider)) {
  		return false;
  	}
