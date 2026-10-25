@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write an XNU root image onto the raw blocks of the root file in userdata.
 
-  tools/write-root.py IMAGE EXTENTS [--dry-run]
+  tools/write-root.py IMAGE EXTENTS [--dry-run] [--from N]   (N: resume at range N)
 
 EXTENTS is tools/fiemap's output for /data/ios-root.img, the map the ADT
 was built from (mkadt_a9y18qlte.py --root-runs). The file is only a
@@ -31,7 +31,13 @@ def adb(*args, **kw):
 
 
 def shell(cmd):
-    return adb('shell', cmd, capture_output=True, text=True).stdout.replace('\r', '')
+    for attempt in range(5):	# adb drops now and then on a long run: retry (every command is idempotent)
+        r = subprocess.run(['adb', 'shell', cmd], capture_output=True, text=True)
+        if r.returncode == 0:
+            return r.stdout.replace('\r', '')
+        print(f'  adb shell failed, retry {attempt + 1}', flush=True)
+        subprocess.run(['adb', 'wait-for-device'])
+    sys.exit(f'adb shell kept failing: {cmd}')
 
 
 def runs_of(text):
@@ -120,10 +126,13 @@ def main():
     work = list(chunks(data_regions(image, size), want))
     total = sum(c[2] for c in work)
     print(f'{len(want)} runs, image {size >> 20} MiB, {len(work)} ranges, {total >> 20} MiB to write')
+    first = int(sys.argv[sys.argv.index('--from') + 1]) if '--from' in sys.argv else 1
     for i, (off, poff, ln) in enumerate(work):
+        if i + 1 < first:
+            continue
         bs = best_bs(off, poff, ln)
         assert any(ph <= poff and poff + ln <= ph + l for _, ph, l in want), 'range outside the runs'
-        print(f'[{i + 1}/{len(work)}] image {off:#x} -> {PART} {poff:#x}, {ln >> 10} KiB (bs {bs})')
+        print(f'[{i + 1}/{len(work)}] image {off:#x} -> {PART} {poff:#x}, {ln >> 10} KiB (bs {bs})', flush=True)
         if dry:
             continue
         with open(image, 'rb') as f:
@@ -133,7 +142,13 @@ def main():
         # adb exec-in drops stdin with the Windows adb WSL uses: push, then dd on the phone
         with open(CHUNK_LOCAL, 'wb') as f:
             f.write(data)
-        adb('push', CHUNK_LOCAL, CHUNK_PHONE, capture_output=True)
+        for attempt in range(5):	# a push now and then fails on a busy USB link
+            if subprocess.run(['adb', 'push', CHUNK_LOCAL, CHUNK_PHONE], capture_output=True).returncode == 0:
+                break
+            print(f'  push failed, retry {attempt + 1}', flush=True)
+            subprocess.run(['adb', 'wait-for-device'])
+        else:
+            sys.exit(f'adb push kept failing at range {i + 1}: resume with --from {i + 1}')
         shell(f'dd if={CHUNK_PHONE} of={PART} bs={bs} seek={poff // bs} count={ln // bs} conv=fsync '
               f'2>/dev/null; rm {CHUNK_PHONE}')
         got = shell(f'dd if={PART} bs={bs} skip={poff // bs} count={ln // bs} 2>/dev/null | md5sum').split()[0]

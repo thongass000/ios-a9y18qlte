@@ -160,7 +160,7 @@ index 6a121c5..e88776f 100644
  			return 0;
  		}
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 99a9c87..14de826 100644
+index 99a9c87..3d867a1 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -110,6 +110,7 @@ static struct {
@@ -184,7 +184,7 @@ index 99a9c87..14de826 100644
  		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
  		return EPERM;
  	}
-@@ -297,6 +298,38 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+@@ -297,6 +298,41 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
  	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
  }
  
@@ -198,6 +198,9 @@ index 99a9c87..14de826 100644
 +	uint64_t logical, physical, count;
 +} ufs_runs[UFS_MAX_RUNS];
 +static unsigned int ufs_nruns;
++/* with runs: blocks kept back at the file's end for the log, and the file's end */
++#define UFS_LOG_RESERVE ((16u << 20) / UFS_BLOCK)
++static uint64_t ufs_log_end;
 +
 +/*
 + * Device block of ufsroot0's block lba; *count is cut to the blocks
@@ -223,7 +226,7 @@ index 99a9c87..14de826 100644
  static int
  ufs_sync_cache(void)
  {
-@@ -350,8 +383,8 @@ ufs_find_partition(const char *want)
+@@ -350,8 +386,8 @@ ufs_find_partition(const char *want)
  		if (last < first) {
  			return ENXIO;
  		}
@@ -234,7 +237,7 @@ index 99a9c87..14de826 100644
  		return 0;
  	}
  	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
-@@ -443,19 +476,30 @@ sweet_ufs_strategy(buf_t bp)
+@@ -443,19 +479,30 @@ sweet_ufs_strategy(buf_t bp)
  		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
  		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
  		void *bounce = (void *)(su.dma + DMA_BOUNCE);
@@ -268,7 +271,7 @@ index 99a9c87..14de826 100644
  			}
  		}
  		if (error) {
-@@ -637,6 +681,42 @@ sweet_ufs_init(void)
+@@ -637,6 +684,51 @@ sweet_ufs_init(void)
  	if (!error) {
  		error = ufs_find_partition(want);
  	}
@@ -300,18 +303,27 @@ index 99a9c87..14de826 100644
 +				next += r.count;
 +			}
 +		}
++		/*
++		 * The file's last 16 MiB hold the console log (sweet_log_thread):
++		 * ufsroot0 ends before them, so HFS's alternate volume header (at
++		 * the device's end) is the volume's own, not inside the log.
++		 */
++		if (!error && next <= UFS_LOG_RESERVE) {
++			error = ERANGE;
++		}
 +		if (!error) {
 +			ufs_nruns = n;
-+			su.nblocks = next;
-+			printf("SWEET UFS: root is a file in \"%s\": %u runs, %llu MiB\n",
-+			    want, n, next * UFS_BLOCK >> 20);
++			ufs_log_end = next;
++			su.nblocks = next - UFS_LOG_RESERVE;
++			printf("SWEET UFS: root is a file in \"%s\": %u runs, %llu MiB + %u MiB log\n",
++			    want, n, su.nblocks * UFS_BLOCK >> 20, UFS_LOG_RESERVE * UFS_BLOCK >> 20);
 +		}
 +	}
 +#endif
  	lck_mtx_unlock(&sweet_ufs_lock);
  	if (error) {
  		return error;
-@@ -660,6 +740,8 @@ sweet_ufs_init(void)
+@@ -660,6 +752,8 @@ sweet_ufs_init(void)
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
  	sweet_log_start();
@@ -320,7 +332,7 @@ index 99a9c87..14de826 100644
  	sweet_sample_start();
  	sweet_cpufreq_init();
  	sweet_pmem_init();       /* /dev/pmem: bsd/dev/sweet_pmem.c */
-@@ -670,6 +752,7 @@ sweet_ufs_init(void)
+@@ -670,6 +764,7 @@ sweet_ufs_init(void)
  	sweet_touch_init();
  	sweet_fts_init();
  	sweet_usb_probe();
@@ -328,7 +340,7 @@ index 99a9c87..14de826 100644
  	return 0;
  }
  
-@@ -705,7 +788,12 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+@@ -705,7 +800,12 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
   *   +0x1000 ring bytes (offset of byte n = n % ring size)
   * The next shim boot copies its tail to UFS (tools/flame-log-pull.sh rescue).
   */
@@ -341,7 +353,7 @@ index 99a9c87..14de826 100644
  struct sweet_mirror_header {
  	char magic[8];
  	uint64_t total;
-@@ -834,56 +922,95 @@ struct sweet_log_header {
+@@ -834,56 +934,95 @@ struct sweet_log_header {
  	uint64_t total, seq;
  };
  
@@ -395,7 +407,7 @@ index 99a9c87..14de826 100644
 -	uint64_t flushed = 0, seq = 0;
 -	void *bounce = (void *)(su.dma + DMA_BOUNCE);
 +	uint32_t run = SWEET_LOG_BLOCKS;
-+	uint64_t base = ufs_map(su.nblocks - SWEET_LOG_BLOCKS, &run);
++	uint64_t base = ufs_map((ufs_log_end ? ufs_log_end : su.nblocks) - SWEET_LOG_BLOCKS, &run);
  
 +	if (run != SWEET_LOG_BLOCKS) {
 +		printf("SWEET LOG: the log area is not contiguous on the device, no log\n");
