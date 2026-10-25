@@ -3,10 +3,13 @@
  * SweetAccelerator's v1 user client (iokit/Kernel/arm/SweetAccelerator.cpp,
  * boot-arg sweetmtl=3 publishes it without a Metal plugin): buffers, an IB
  * with a CP_MEM_WRITE, a submit and its fence, the result read back.
- * Prints to stdout (the launchd job sends it to /dev/console, which lands in
- * XNU's on-disk console log). Built on Linux by build.sh: no SDK, the few
- * IOKit and libSystem calls are declared here.
+ * Prints to stdout (the launchd job sends it to /dev/console) and also looks
+ * every line up as an IORegistry path: the kernel's IOKit trace (boot-arg
+ * sweetiolog=a9ygputest) logs it as "IOK a9ygputest: path ...", which lands
+ * in XNU's on-disk console log whatever happens to stdout. Built on Linux by
+ * build.sh: no SDK, the few IOKit and libSystem calls are declared here.
  */
+#include <stdarg.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -18,7 +21,10 @@ typedef const void *CFDictionaryRef;
 
 extern mach_port_t mach_task_self_;
 extern int printf(const char *, ...);
+extern int vsnprintf(char *, size_t, const char *, va_list);
 extern CFDictionaryRef IOServiceMatching(const char *name);
+extern io_object_t IORegistryEntryFromPath(mach_port_t main_port, const char *path);
+extern kern_return_t IOObjectRelease(io_object_t object);
 extern io_service_t IOServiceGetMatchingService(mach_port_t main_port, CFDictionaryRef matching);
 extern kern_return_t IOServiceOpen(io_service_t service, task_t owning_task, uint32_t type, io_connect_t *connect);
 extern kern_return_t IOServiceClose(io_connect_t connect);
@@ -28,6 +34,21 @@ extern kern_return_t IOConnectMapMemory64(io_connect_t connect, uint32_t memory_
     mach_vm_address_t *at_address, mach_vm_size_t *of_size, uint32_t options);
 
 #define kIOMapAnywhere  1
+
+/* one line to stdout and, as a path lookup that matches nothing, to the IOKit trace */
+static void say(const char *fmt, ...)
+{
+	char line[200] = "IOService:/a9ygputest ";
+	size_t pre = sizeof("IOService:/a9ygputest ") - 1;
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(line + pre, sizeof(line) - pre, fmt, ap);
+	va_end(ap);
+	printf("%s\n", line + pre);
+	io_object_t o = IORegistryEntryFromPath(0, line);
+	if (o)
+		IOObjectRelease(o);
+}
 
 static uint32_t pm4_parity(uint32_t v)
 {
@@ -51,7 +72,7 @@ static int buf_new(io_connect_t c, uint64_t bytes, struct buf *b)
 	uint32_t n = 3;
 	kern_return_t kr = IOConnectCallScalarMethod(c, 1, in, 1, out, &n);
 	if (kr) {
-		printf("a9ygputest: alloc %llu: kr %x\n", (unsigned long long)bytes, kr);
+		say("alloc %llu: kr %x", (unsigned long long)bytes, kr);
 		return -1;
 	}
 	b->handle = out[0];
@@ -61,11 +82,11 @@ static int buf_new(io_connect_t c, uint64_t bytes, struct buf *b)
 	mach_vm_size_t sz = 0;
 	kr = IOConnectMapMemory64(c, (uint32_t)b->handle, mach_task_self_, &at, &sz, kIOMapAnywhere);
 	if (kr) {
-		printf("a9ygputest: map handle %llu: kr %x\n", (unsigned long long)b->handle, kr);
+		say("map handle %llu: kr %x", (unsigned long long)b->handle, kr);
 		return -1;
 	}
 	b->cpu = (volatile uint32_t *)at;
-	printf("a9ygputest: buffer %llu: %llu bytes, GPU 0x%llx, CPU 0x%llx\n", (unsigned long long)b->handle,
+	say("buffer %llu: %llu bytes, GPU 0x%llx, CPU 0x%llx", (unsigned long long)b->handle,
 	       (unsigned long long)b->size, (unsigned long long)b->gva, (unsigned long long)at);
 	return 0;
 }
@@ -80,21 +101,22 @@ static void buf_flush(io_connect_t c, const struct buf *b)
 
 int main(void)
 {
+	say("start");
 	io_service_t s = IOServiceGetMatchingService(0, IOServiceMatching("SweetAccelerator"));
 	if (!s) {
-		printf("a9ygputest: no SweetAccelerator (boot-arg sweetmtl=3?)\n");
+		say("no SweetAccelerator (boot-arg sweetmtl=3?)");
 		return 1;
 	}
 	io_connect_t c = 0;
 	kern_return_t kr = IOServiceOpen(s, mach_task_self_, 0, &c);
 	if (kr) {
-		printf("a9ygputest: IOServiceOpen: kr %x\n", kr);
+		say("IOServiceOpen: kr %x", kr);
 		return 1;
 	}
 	uint64_t info[3] = { 0 };
 	uint32_t n = 3;
 	kr = IOConnectCallScalarMethod(c, 0, NULL, 0, info, &n);
-	printf("a9ygputest: info kr %x: gpu %llu chip 0x%llx ready %llu\n", kr, (unsigned long long)info[0],
+	say("info kr %x: gpu %llu chip 0x%llx ready %llu", kr, (unsigned long long)info[0],
 	       (unsigned long long)info[1], (unsigned long long)info[2]);
 	if (kr || !info[2])
 		return 1;
@@ -116,13 +138,14 @@ int main(void)
 	buf_flush(c, &dst);
 
 	uint64_t in[3] = { ib.gva, w, 1000 }, fence = 0;
+	say("submit IB 0x%llx, %u dwords", (unsigned long long)ib.gva, w);
 	n = 1;
 	kr = IOConnectCallScalarMethod(c, 4, in, 3, &fence, &n);
 	buf_flush(c, &dst);
 	int ok = 1;
 	for (int i = 0; i < 4; i++)
 		ok &= dst.cpu[i] == (0xa9c00000u | (uint32_t)i);
-	printf("a9ygputest: submit kr %x fence %llu: %x %x %x %x, next %x: %s\n", kr, (unsigned long long)fence,
+	say("submit kr %x fence %llu: %x %x %x %x, next %x: %s", kr, (unsigned long long)fence,
 	       dst.cpu[0], dst.cpu[1], dst.cpu[2], dst.cpu[3], dst.cpu[4],
 	       ok && !kr ? "USERLAND DROVE THE GPU" : "FAILED");
 	IOServiceClose(c);

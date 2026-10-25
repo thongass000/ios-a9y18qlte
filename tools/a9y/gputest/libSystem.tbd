@@ -5,5 +5,5 @@ install-name:    '/usr/lib/libSystem.B.dylib'
 current-version: 1319
 exports:
   - targets:     [ arm64-ios ]
-    symbols:     [ _printf, _mach_task_self_, dyld_stub_binder ]
+    symbols:     [ _printf, _vsnprintf, _mach_task_self_, dyld_stub_binder ]
 ...
