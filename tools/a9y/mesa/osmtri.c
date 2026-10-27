@@ -1,31 +1,39 @@
 /*
- * osmtri: Mesa's GLES driver on the Adreno 512, on the phone. The same scene as glreplay/host/tri.c (a clear and
- * one RGB triangle into a 64x64 RGBA8 FBO), but compiled and submitted on the device: OSMesa (Bergamota's ES
- * profile and hardware target) -> Gallium freedreno fd5 + ir3 -> a9y_drm.c -> SweetAccelerator v2.
+ * osmtri: Mesa's GLES driver on the Adreno 512, on the phone. The scene of glreplay/host/tri.c (a clear and one
+ * RGB triangle into an RGBA8 FBO), compiled and submitted on the device: OSMesa (Bergamota's ES profile and
+ * hardware target) -> Gallium freedreno fd5 + ir3 -> a9y_drm.c -> SweetAccelerator v2.
  *
- * Installed as /usr/local/bin/a9ygputest so the boot-time launchd job runs it and sweetiolog=a9ygputest routes
- * its lines to SWEETLOG; Mesa's own stderr is forwarded the same way.
+ * 512x512 (1 MiB) is about four times the A512's 272 KiB of GMEM, so the default GMEM path renders it in several
+ * tiles; A9Y_SYSMEM=1 renders straight to memory instead (FD_MESA_DEBUG=sysmem, the path glreplay proved).
+ *
+ * Installed as /usr/local/bin/a9ytest (tools/a9y/drop: a9ydrop runs it at boot) and logged through sweetiolog;
+ * Mesa's own stderr is forwarded the same way.
  */
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
+#include <spawn.h>
+#include <stdint.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include <IOKit/IOKitLib.h>
 #include <GL/osmesa.h>
 #include <GLES2/gl2.h>
 
 #define OSMESA_ES_PROFILE 0x36  /* bergamota-mesa-25.0.7.patch */
-#define W 64
-#define H 64
+#define W 512
+#define H 512
 
 static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 static void say(const char *fmt, ...)
 {
-	char line[300] = "IOService:/a9ygputest ";
-	size_t pre = sizeof("IOService:/a9ygputest ") - 1;
+	char line[300] = "IOService:/a9ytest ";
+	size_t pre = sizeof("IOService:/a9ytest ") - 1;
 	va_list ap;
 	va_start(ap, fmt);
 	vsnprintf(line + pre, sizeof(line) - pre, fmt, ap);
@@ -134,53 +142,48 @@ static GLuint shader(GLenum type, const char *src)
 	return s;
 }
 
-/* one character per 2x4 pixel cell, as glreplay's a9yreplay: '.' clear colour, R/G/B strongest channel, '?' other */
-static void show(const unsigned char *px)
+/* 32 columns x 16 rows, one character per cell: '.' clear colour, R/G/B strongest channel, '?' other */
+static void show(const char *mode, const unsigned char *px)
 {
-	for (int y = H - 4; y >= 0; y -= 4) {
-		char row[W / 2 + 1];
-		for (int x = 0; x < W; x += 2) {
-			const unsigned char *p = px + (y * W + x) * 4;
+	for (int y = H - H / 32; y >= 0; y -= H / 16) {
+		char row[33];
+		for (int c = 0; c < 32; c++) {
+			const unsigned char *p = px + (y * W + c * (W / 32) + W / 64) * 4;
 			char ch = '?';
 			if (p[0] == 0x11 && p[1] == 0x22 && p[2] == 0x33)
 				ch = '.';
 			else if (p[3] == 0xff)
 				ch = p[0] >= p[1] && p[0] >= p[2] ? 'R' : p[1] >= p[2] ? 'G' : 'B';
-			row[x / 2] = ch;
+			row[c] = ch;
 		}
-		row[W / 2] = 0;
-		say("rt %2d |%s|", y, row);
+		row[32] = 0;
+		say("%s %3d |%s|", mode, y, row);
 	}
 }
 
-int main(void)
+static double now_ms(void)
 {
-	pthread_t pump;
-	say("=== a9yosmtri: Mesa GLES on the Adreno 512, compiled on the phone ===");
-	if (pipe(err_pipe) == 0 && dup2(err_pipe[1], 2) >= 0) {
-		setvbuf(stderr, NULL, _IOLBF, 0);
-		pthread_create(&pump, NULL, err_pump, NULL);
-	}
-	setenv("A9Y_DRM_TRACE", "1", 0);
-	setenv("SWEET_GPU_DEBUG", "1", 0);
-	setenv("FD_MESA_DEBUG", "sysmem", 0);   /* the path the replay proved; GMEM tiling next */
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
 
+/* the scene into px (RGBA, bottom row first); 1 when it was drawn on the GPU with no error and no pixel left over */
+static int render(const char *mode, unsigned char *px)
+{
 	static unsigned char fb[W * H * 4];
 	static const int attr[] = {
 		OSMESA_FORMAT, OSMESA_RGBA, OSMESA_DEPTH_BITS, 0, OSMESA_STENCIL_BITS, 0,
 		OSMESA_PROFILE, OSMESA_ES_PROFILE, OSMESA_CONTEXT_MAJOR_VERSION, 2, OSMESA_CONTEXT_MINOR_VERSION, 0, 0 };
 	OSMesaContext ctx = OSMesaCreateContextAttribs(attr, NULL);
 	if (!ctx || !OSMesaMakeCurrent(ctx, fb, GL_UNSIGNED_BYTE, W, H)) {
-		say("FAIL: OSMesa context %p", (void *)ctx);
-		sleep(1);
-		return 1;
+		say("%s: FAIL: OSMesa context %p", mode, (void *)ctx);
+		return 0;
 	}
-	if (load_gl()) {
-		sleep(1);
-		return 1;
-	}
+	if (load_gl())
+		return 0;
 	const char *renderer = (const char *)p_glGetString(GL_RENDERER);
-	say("GL_RENDERER %s, GL_VERSION %s", renderer, (const char *)p_glGetString(GL_VERSION));
+	say("%s: GL_RENDERER %s, GL_VERSION %s", mode, renderer, (const char *)p_glGetString(GL_VERSION));
 
 	GLuint rb, fbo;
 	p_glGenRenderbuffers(1, &rb);
@@ -212,15 +215,16 @@ int main(void)
 	p_glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 0, 0);
 	p_glEnableVertexAttribArray(1);
 
+	double t0 = now_ms();
 	p_glViewport(0, 0, W, H);
 	p_glClearColor(0.0667f, 0.1333f, 0.2f, 1.0f);
 	p_glClear(GL_COLOR_BUFFER_BIT);
 	p_glDrawArrays(GL_TRIANGLES, 0, 3);
 
-	static unsigned char px[W * H * 4];
-	memset(px, 0xde, sizeof(px));
+	memset(px, 0xde, W * H * 4);
 	p_glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px);
 	p_glFinish();
+	double t1 = now_ms();
 	GLenum err = p_glGetError();
 
 	unsigned clear = 0, untouched = 0, drawn = 0;
@@ -234,15 +238,83 @@ int main(void)
 			drawn++;
 	}
 	const unsigned char *c = px + (H / 2 * W + W / 2) * 4;
-	say("fbo status %#x, glError %#x; %u clear, %u untouched, %u drawn; centre %02x%02x%02x%02x",
-	    st, err, clear, untouched, drawn, c[0], c[1], c[2], c[3]);
-	show(px);
+	say("%s: fbo status %#x, glError %#x; %u clear, %u untouched, %u drawn; centre %02x%02x%02x%02x; "
+	    "clear+draw+readback %.1f ms", mode, st, err, clear, untouched, drawn, c[0], c[1], c[2], c[3], t1 - t0);
+	show(mode, px);
 	int hw = renderer && strstr(renderer, "FD512") != NULL;
-	int ok = hw && err == 0 && untouched == 0 && clear > 0 && drawn > 0;
-	say("=== a9yosmtri: %s ===", ok ? "PASS: MESA GLES DREW ON THE ADRENO 512, ON THE PHONE" :
-	    hw ? "FAIL" : "FAIL (not on the GPU: softpipe?)");
 	OSMesaDestroyContext(ctx);
+	if (!hw)
+		say("%s: not on the GPU (softpipe?)", mode);
+	return hw && err == 0 && untouched == 0 && clear > 0 && drawn > 0;
+}
+
+#define REF_FILE "/usr/local/.a9ytest-sysmem.rgba"
+extern char **environ;
+
+int main(int argc, char **argv)
+{
+	static unsigned char px[W * H * 4], ref[W * H * 4];
+
+	if (argc > 1 && !strcmp(argv[1], "--sysmem")) {
+		/* the reference, in its own process (FD_MESA_DEBUG is read once per process); stderr is the parent's pipe.
+		 * A spawned process has launchd's default memory limit again: raise it as a9ydrop does (cmd 7, not fatal) */
+		int (*msc)(uint32_t, int32_t, uint32_t, void *, size_t) =
+			(int (*)(uint32_t, int32_t, uint32_t, void *, size_t))dlsym(RTLD_DEFAULT, "memorystatus_control");
+		struct { int32_t active; uint32_t active_attr; int32_t inactive; uint32_t inactive_attr; } lim = { 1024, 0, 1024, 0 };
+		if (!msc || msc(7, getpid(), 0, &lim, sizeof(lim)))
+			say("sysmem: could not raise the memory limit");
+		int ok = render("sysmem", ref);
+		FILE *f = fopen(REF_FILE, "wb");
+		ok = ok && f && fwrite(ref, 1, sizeof(ref), f) == sizeof(ref);
+		if (f)
+			fclose(f);
+		fflush(stderr);
+		return ok ? 0 : 1;
+	}
+
+	pthread_t pump;
+	say("=== a9yosmtri: Mesa GLES on the Adreno 512, %dx%d, GMEM vs sysmem ===", W, H);
+	if (pipe(err_pipe) == 0 && dup2(err_pipe[1], 2) >= 0) {
+		setvbuf(stderr, NULL, _IOLBF, 0);
+		pthread_create(&pump, NULL, err_pump, NULL);
+	}
+	setenv("SWEET_GPU_DEBUG", "1", 0);
+
+	/* a fresh process of this binary (posix_spawn: no fork without exec, CoreFoundation forbids it) */
+	int ref_ok = 0, status = 0;
+	pid_t pid;
+	char *child_argv[] = { argv[0], "--sysmem", NULL };
+	unlink(REF_FILE);
+	setenv("FD_MESA_DEBUG", "sysmem", 1);
+	int sr = posix_spawn(&pid, argv[0], NULL, NULL, child_argv, environ);
+	unsetenv("FD_MESA_DEBUG");
+	if (sr == 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+		FILE *f = fopen(REF_FILE, "rb");
+		ref_ok = f && fread(ref, 1, sizeof(ref), f) == sizeof(ref);
+		if (f)
+			fclose(f);
+	}
+	if (!ref_ok)
+		say("no sysmem reference (spawn %d, status %#x)", sr, status);
+
+	int ok = render("gmem", px);
+	unsigned diff = 0, first = 0;
+	for (unsigned i = 0; ref_ok && i < W * H; i++) {
+		if (memcmp(px + i * 4, ref + i * 4, 4)) {
+			if (!diff++)
+				first = i;
+		}
+	}
+	if (ref_ok)
+		say("gmem vs sysmem: %u of %u pixels differ%s", diff, W * H, diff ? "" : " (identical)");
+	if (diff)
+		say("first difference at x %u y %u: gmem %02x%02x%02x%02x sysmem %02x%02x%02x%02x", first % W, first / W,
+		    px[first * 4], px[first * 4 + 1], px[first * 4 + 2], px[first * 4 + 3],
+		    ref[first * 4], ref[first * 4 + 1], ref[first * 4 + 2], ref[first * 4 + 3]);
+	int pass = ok && ref_ok && diff == 0;
+	say("=== a9yosmtri: %s ===", pass ? "PASS: GMEM (TILED) RENDERING MATCHES SYSMEM ON THE ADRENO 512" :
+	    !ref_ok ? "FAIL (sysmem reference)" : !ok ? "FAIL (gmem render)" : "FAIL (gmem differs from sysmem)");
 	fflush(stderr);
 	sleep(1);       /* let the stderr pump finish */
-	return ok ? 0 : 1;
+	return pass ? 0 : 1;
 }
