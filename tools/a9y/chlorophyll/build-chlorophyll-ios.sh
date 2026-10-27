@@ -23,6 +23,7 @@ if [ ! -d chl ]; then
 	git -C chl apply "$HERE/a9y-cb-delta-a6xx-only.patch" # A5xx: constant-buffer deltas broke render passes
 	git -C chl apply "$HERE/a9y-probe-t4-wait.patch"      # the probe's T4 assumed inline commits
 	git -C chl apply "$HERE/a9y-ios16-registration.patch" # iOS 16: no MTLCopyAllDevices; CA probe fixes
+	git -C chl apply "$HERE/a9y-ios16-xr10-srgb.patch"    # iOS 16: CA's deep-colour pipelines in format 551 too
 fi
 if [ ! -d mesa-air ]; then
 	mkdir -p air-src && tar -C air-src -xf mesa.tar.xz && mv air-src/mesa-* mesa-air && rmdir air-src

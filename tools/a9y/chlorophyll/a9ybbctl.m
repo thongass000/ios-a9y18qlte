@@ -32,6 +32,7 @@ extern int proc_name(int pid, void *buffer, uint32_t buffersize);
 #define BB_OFF "/private/var/tmp/bgmtl-bb.off"
 #define BB_STATE "/private/var/tmp/bgmtl-bb.state"
 #define BB_LOG "/private/var/tmp/bgmtl.log"
+#define TRIES "/private/var/tmp/a9ybb.tries"
 #define MOBILE 501
 
 static NSMutableDictionary *
@@ -153,6 +154,7 @@ main(int argc, char **argv)
          write_file(ARM, b, 0644, 0);
          write_file(BB_ARM, "on\n", 0644, 0);
          write_file(BB_LOG, "", 0666, MOBILE);
+         write_file(TRIES, "0", 0666, MOBILE);   // a9ybb counts armed launches here (backboardd runs as mobile)
          printf("armed for boot %s\n", b);
          return 0;
       }

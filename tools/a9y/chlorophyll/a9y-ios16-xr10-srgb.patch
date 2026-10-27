@@ -1,0 +1,22 @@
+a9y18qlte: Chlorophyll: MTLPixelFormatRGB10A8_2P_XR10_sRGB (551) as BGRA8 sRGB
+
+iOS 16's QuartzCore render server builds its deep-colour pipelines in format 551 as well as 550,
+whatever supportsExtendedXR10Formats answers. 551 was "not a value of MTLPixelFormat this library
+knows", the pipeline came back nil and backboardd aborted on its first frame, about ten times a boot.
+It stands in as BGRA8 sRGB, as 550 does as BGRA8 and 555 (BGR10_XR_sRGB) as BGRA8 sRGB.
+
+Assisted-by: LLM
+
+diff --git a/air/air_metal.c b/air/air_metal.c
+index e37f0f5..9c75b12 100644
+--- a/air/air_metal.c
++++ b/air/air_metal.c
+@@ -917,6 +917,8 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
+     * render server builds its deep-colour pipelines in these whatever the device answers, and a refusal aborts the server
+     * ("Metal failed to build render pipeline", the first live backboardd runs). */
+    { 550, "MTLPixelFormatRGB10A8_2P_XR10 (as BGRA8)",  PIPE_FORMAT_B8G8R8A8_UNORM },
++   /* a9y18qlte: iOS 16's render server builds them in the sRGB twin as well (refused: the server aborted) */
++   { 551, "MTLPixelFormatRGB10A8_2P_XR10_sRGB (as BGRA8 sRGB)", PIPE_FORMAT_B8G8R8A8_SRGB },
+    { 552, "MTLPixelFormatBGRA10_XR (as RGBA16Float)",   PIPE_FORMAT_R16G16B16A16_FLOAT },
+    { 553, "MTLPixelFormatBGRA10_XR_sRGB (as RGBA16Float)", PIPE_FORMAT_R16G16B16A16_FLOAT },
+    { 554, "MTLPixelFormatBGR10_XR (as BGRA8)",         PIPE_FORMAT_B8G8R8A8_UNORM },
