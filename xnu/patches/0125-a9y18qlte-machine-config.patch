@@ -32,10 +32,10 @@ index df7c863..87cd671 100644
  bsd/dev/sweet_files.c			standard
 diff --git a/bsd/dev/a9y_gpu.c b/bsd/dev/a9y_gpu.c
 new file mode 100644
-index 0000000..f4b5f94
+index 0000000..aca3760
 --- /dev/null
 +++ b/bsd/dev/a9y_gpu.c
-@@ -0,0 +1,652 @@
+@@ -0,0 +1,655 @@
 +/*
 + * a9y18qlte (Galaxy A9 2018, SDM660) Adreno 512 (kgsl-3d0@5000000, chip id
 + * 0x05010200): bring-up, first worked out in the probe shim (a9-ios shim.c
@@ -547,6 +547,9 @@ index 0000000..f4b5f94
 +	}
 +	static const uint32_t regs[][2] = {
 +		{ 0x860, 1 },                   /* CP_ADDR_MODE_CNTL: 64 bit */
++		/* VSC GRAS RB PC HLSQ VFD VPC UCHE SP TPL1 _ADDR_MODE_CNTL: 64 bit too, as kgsl's a5xx_start() */
++		{ 0xbc1, 1 }, { 0xc81, 1 }, { 0xcc5, 1 }, { 0xd01, 1 }, { 0xe05, 1 },
++		{ 0xe41, 1 }, { 0xe61, 1 }, { 0xe80, 1 }, { 0xec1, 1 }, { 0xf01, 1 },
 +		{ 0x838, (uint32_t)(CARVE_PA + C_PM4) }, { 0x839, 0 },   /* CP_PM4_INSTR_BASE */
 +		{ 0x835, (uint32_t)(CARVE_PA + C_PFP) }, { 0x836, 0 },   /* CP_PFP_INSTR_BASE */
 +		{ 0x800, (uint32_t)(CARVE_PA + C_RING) }, { 0x801, 0 },  /* CP_RB_BASE */
@@ -1359,10 +1362,10 @@ index 0000000..91746ca
 +#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
 diff --git a/bsd/dev/sweet_a5xx.c b/bsd/dev/sweet_a5xx.c
 new file mode 100644
-index 0000000..161126e
+index 0000000..14567ac
 --- /dev/null
 +++ b/bsd/dev/sweet_a5xx.c
-@@ -0,0 +1,719 @@
+@@ -0,0 +1,731 @@
 +/*
 + * Adreno 512 core for the a9y18qlte (SDM660): the sweet_a6xx.h core API
 + * (same a6_* names, so bsd/dev/sweet_gpu.c and the accelerator above it run
@@ -1997,6 +2000,18 @@ index 0000000..161126e
 +	const uint64_t pm4_va = a6_pool_va(OFF_PM4), pfp_va = a6_pool_va(OFF_PFP), rb = a6_pool_va(A6_OFF_RING);
 +	const uint32_t init[][2] = {
 +		{ 0x860, 1 },				/* CP_ADDR_MODE_CNTL: 64 bit */
++		/* and every block that fetches or writes memory, as kgsl's a5xx_start(); without them the RB
++		 * writes a render target at the low 32 bits of its address */
++		{ 0xbc1, 1 },				/* VSC_ADDR_MODE_CNTL */
++		{ 0xc81, 1 },				/* GRAS_ADDR_MODE_CNTL */
++		{ 0xcc5, 1 },				/* RB_ADDR_MODE_CNTL */
++		{ 0xd01, 1 },				/* PC_ADDR_MODE_CNTL */
++		{ 0xe05, 1 },				/* HLSQ_ADDR_MODE_CNTL */
++		{ 0xe41, 1 },				/* VFD_ADDR_MODE_CNTL */
++		{ 0xe61, 1 },				/* VPC_ADDR_MODE_CNTL */
++		{ 0xe80, 1 },				/* UCHE_ADDR_MODE_CNTL */
++		{ 0xec1, 1 },				/* SP_ADDR_MODE_CNTL */
++		{ 0xf01, 1 },				/* TPL1_ADDR_MODE_CNTL */
 +		{ CP_PM4_BASE, (uint32_t)pm4_va }, { CP_PM4_BASE + 1, (uint32_t)(pm4_va >> 32) },
 +		{ CP_PFP_BASE, (uint32_t)pfp_va }, { CP_PFP_BASE + 1, (uint32_t)(pfp_va >> 32) },
 +		{ CP_RB_BASE, (uint32_t)rb }, { CP_RB_BASE + 1, (uint32_t)(rb >> 32) },
