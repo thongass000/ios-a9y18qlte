@@ -19,6 +19,7 @@ cd "$WORK"
 if [ ! -d chl ]; then
 	git clone -q "$CHL_REPO" chl
 	git -C chl checkout -q "$CHL_SHA"
+	git -C chl apply "$HERE/a9y-vs-ssbo-to-ubo.patch"     # A5xx: no SSBOs in the vertex stage
 fi
 if [ ! -d mesa-air ]; then
 	mkdir -p air-src && tar -C air-src -xf mesa.tar.xz && mv air-src/mesa-* mesa-air && rmdir air-src

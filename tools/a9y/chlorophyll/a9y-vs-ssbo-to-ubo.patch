@@ -1,0 +1,101 @@
+a9y18qlte: vertex-function device buffers as constant buffers where the vertex stage has no SSBOs
+
+freedreno a5xx advertises SSBOs only for the fragment and compute stages, so a vertex function's device
+buffers were left unbound and every pulled vertex read zero: all render passes drew nothing on the Adreno 512
+(bgmtl_render_probe P4-P9, GMEM and sysmem alike). Read-only ones become constant buffers there.
+
+diff --git a/air/air_metal.c b/air/air_metal.c
+index 67912be..68f40c4 100644
+--- a/air/air_metal.c
++++ b/air/air_metal.c
+@@ -6400,6 +6400,81 @@ blend_state_from_metal(const struct rwa_render_shape *shape, struct pipe_screen
+    return true;
+ }
+ 
++/* a9y18qlte: a GPU with no buffers in the vertex stage -- freedreno's a5xx keeps SSBOs to the fragment and compute
++ * stages (one state block serves VS..FS; freedreno_screen.c MAX_SHADER_BUFFERS) -- would leave every `device` buffer of
++ * a vertex function unbound and every vertex pulled from it zero: render passes drew nothing on the Adreno 512. A
++ * vertex function only reads its vertex data, so there each read-only `device` buffer becomes a `constant` one: its
++ * loads become UBO loads at the same index and it is bound as a constant buffer, which every stage has. Run before
++ * size_unsized_constants and add_cb_deltas, so a buffer read at a computed offset (by vertex id) keeps size 0 and is
++ * bound in place, whole, with the shader adding a misaligned offset. A vertex function that writes a buffer, or asks
++ * its size, is refused by name. */
++static bool
++vs_has_ssbos(struct rwa_device *device)
++{
++   return device->screen->get_shader_param(device->screen, PIPE_SHADER_VERTEX,
++                                           PIPE_SHADER_CAP_MAX_SHADER_BUFFERS) > 0;
++}
++
++static int
++vs_ssbos_to_ubos(nir_shader *nir, struct air_shader_info *info, char *why, size_t why_size)
++{
++   const char *fn = info->entry_point ? info->entry_point : "the vertex function";
++   uint32_t convert = 0;
++   for (unsigned i = 0; i < info->num_resources; i++) {
++      const struct air_resource *r = &info->resources[i];
++      if (r->kind != AIR_RESOURCE_DEVICE_BUFFER)
++         continue;
++      if (r->write || r->index >= 15 /* CB_DELTA_SLOT, below: add_cb_deltas' own slot */) {
++         say(why, why_size, "%s %s the device buffer at index %u, and this GPU has no buffers in the "
++                            "vertex stage (only constant ones)", fn, r->write ? "writes" : "binds", r->index);
++         return -1;
++      }
++      convert |= 1u << r->index;
++   }
++   if (!convert)
++      return 0;
++   nir_foreach_function_impl(impl, nir) {
++      nir_builder b = nir_builder_create(impl);
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr_safe(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
++            if (in->intrinsic != nir_intrinsic_load_ssbo && in->intrinsic != nir_intrinsic_store_ssbo &&
++                in->intrinsic != nir_intrinsic_get_ssbo_size && in->intrinsic != nir_intrinsic_ssbo_atomic &&
++                in->intrinsic != nir_intrinsic_ssbo_atomic_swap)
++               continue;
++            unsigned src = in->intrinsic == nir_intrinsic_store_ssbo ? 1 : 0;
++            if (in->intrinsic != nir_intrinsic_load_ssbo || !nir_src_is_const(in->src[src])) {
++               say(why, why_size, "%s uses a device buffer in a way a constant buffer cannot serve (%s), and "
++                                  "this GPU has no buffers in the vertex stage", fn,
++                   nir_intrinsic_infos[in->intrinsic].name);
++               return -1;
++            }
++            unsigned idx = nir_src_as_uint(in->src[0]);
++            if (idx >= 32 || !(convert & (1u << idx)))
++               continue;
++            b.cursor = nir_before_instr(instr);
++            nir_def *v = nir_load_ubo(&b, in->def.num_components, in->def.bit_size, in->src[0].ssa, in->src[1].ssa,
++                                      .align_mul = nir_intrinsic_align_mul(in),
++                                      .align_offset = nir_intrinsic_align_offset(in),
++                                      .range_base = 0, .range = ~0);
++            nir_def_replace(&in->def, v);
++         }
++      }
++      nir_metadata_preserve(impl, nir_metadata_control_flow);
++   }
++   for (unsigned i = 0; i < info->num_resources; i++) {
++      struct air_resource *r = &info->resources[i];
++      if (r->kind == AIR_RESOURCE_DEVICE_BUFFER && (convert & (1u << r->index))) {
++         r->kind = AIR_RESOURCE_CONSTANT_BUFFER;
++         nir->info.num_ubos = MAX2(nir->info.num_ubos, r->index + 1);
++      }
++   }
++   nir->info.num_ssbos = 0;
++   return 0;
++}
++
+ /* Chlorophyll: an unsized constant pointer (no air.buffer_size) whose every read has a constant offset is given the exact
+  * size it reads, so the upload a misaligned binding needs copies those bytes and not a 4 KB cap (CoreAnimation's
+  * texture_matrix reads 16, lod_bias 4, and the copies were the largest cost left in the Metal compositor). A pointer read
+@@ -6869,6 +6944,8 @@ rwa_render_create(struct rwa_device *device,
+    size_unsized_constants(fs, &render->finfo);
+    add_cb_deltas(fs, &render->finfo);
+    if (!render->generated_vertex) {
++      if (!vs_has_ssbos(device) && vs_ssbos_to_ubos(vs, &render->vinfo, why, why_size))
++         goto fail;
+       size_unsized_constants(vs, &render->vinfo);
+       add_cb_deltas(vs, &render->vinfo);
+    }
