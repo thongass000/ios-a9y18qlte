@@ -2139,7 +2139,7 @@ index d9d7860..d4a079f 100644
  #define A6_FSR_FAULT		0xc00001feu
  #define A6_GMEM_LOG_OFF		0x91000ull
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index c87ed5d..59d4074 100644
+index c87ed5d..0d985d7 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -238,6 +238,7 @@ int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const
@@ -2158,38 +2158,6 @@ index c87ed5d..59d4074 100644
  }
  
  static void
-@@ -713,7 +715,11 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
- /* ---- buffers and submissions for Metal (iokit/Kernel/arm/SweetAccelerator.cpp) ---- */
- 
- #define USER_VA_BASE    0x200000000ULL  /* above the surface slots */
-+#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
-+#define USER_VA_END     0x400000000ULL  /* A5xx: everything below 32 GB (see WIN_BASE) */
-+#else
- #define USER_VA_END     0x1000000000ULL /* v1 clients; v2 windows above (sweet_gpu_window_alloc) */
-+#endif
- #define USER_VA_ALIGN   0x10000ULL
- 
- static uint64_t user_va_next = USER_VA_BASE;
-@@ -999,9 +1005,19 @@ sweet_gpu_pool_free(uint64_t pa, uint64_t bytes)
-  * The client picks its GPU addresses (Turnip's own VMA heap), so each connection gets a window of
-  * the one GPU address space to itself: 4 GB windows from 64 GB up, above the v1 range.
-  */
-+#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
-+/*
-+ * The A512's render backend drops address bit 36 and up (a fast clear of a target at 0x10_ffff5000
-+ * faulted at 0xffff5000), so its windows stay below 32 GB, where kgsl puts its own (0x5_0000_0000).
-+ */
-+#define WIN_BASE        0x400000000ULL
-+#define WIN_SIZE        0x100000000ULL
-+#define WIN_COUNT       4
-+#else
- #define WIN_BASE        0x1000000000ULL
- #define WIN_SIZE        0x100000000ULL
- #define WIN_COUNT       64
-+#endif
- static uint64_t win_used;               /* bit n: window n taken */
- 
- int
 diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
 index d405964..5d43ce3 100644
 --- a/bsd/dev/sweet_pmem.c
