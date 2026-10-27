@@ -884,7 +884,12 @@ sweet_drm_info(int fd, struct sweet_gpu_info_abi *out)
 	out->chip_id = g_dev.chip_id;
 	out->va_start = g_dev.va_start;
 	out->va_size = g_dev.va_size;
-	return 0;               /* abi_minor 0: no IOSurface import */
+	/* flags bit0 = ready (the user client is open and the GPU answered DeviceInfo), bit1 = lost: v2 has no lost
+	 * state to report, so never. Chlorophyll's injection stays stock unless ready. abi_minor 2: IOSurface import
+	 * (sweet_drm_surface_bo, over BoImport). */
+	out->flags = 1;
+	out->abi_minor = 2;
+	return 0;
 }
 
 /* sweet_hw.c's struct sweet_gpu_surface_bo (Bergamota xnu/gpu-abi/sweet_adreno_abi.h, minor 2 layout) */
