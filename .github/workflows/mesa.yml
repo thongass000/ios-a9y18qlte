@@ -1,0 +1,43 @@
+name: mesa
+
+# Mesa 25.0.7 for iOS 16 arm64 (OSMesa GLES over Gallium freedreno and tools/a9y/mesa/a9y_drm.c), see
+# tools/a9y/mesa/build-mesa-ios.sh. Only our own build outputs are uploaded, never SDK files.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "tools/a9y/mesa/**"
+      - ".github/workflows/mesa.yml"
+
+concurrency:
+  group: mesa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          brew list bison >/dev/null 2>&1 || brew install bison
+          brew list pkg-config >/dev/null 2>&1 || brew install pkg-config
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+      - name: Build
+        run: WORK="$RUNNER_TEMP/mesa-ios" tools/a9y/mesa/build-mesa-ios.sh
+      - name: Pack
+        if: always()
+        run: |
+          mkdir -p dist
+          cp -R "$RUNNER_TEMP/mesa-ios/out/." dist/ 2>/dev/null || true
+          cp "$RUNNER_TEMP/mesa-ios/build/meson-logs/meson-log.txt" dist/ 2>/dev/null || true
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mesa-ios
+          path: dist
+          retention-days: 7
