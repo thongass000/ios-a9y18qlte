@@ -8,6 +8,7 @@ on:
     branches: [main]
     paths:
       - "tools/a9y/mesa/**"
+      - "tools/a9y/chlorophyll/**"
       - ".github/workflows/mesa.yml"
 
 concurrency:
@@ -28,6 +29,8 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-path
       - name: Build
         run: WORK="$RUNNER_TEMP/mesa-ios" tools/a9y/mesa/build-mesa-ios.sh
+      - name: Chlorophyll
+        run: WORK="$RUNNER_TEMP/mesa-ios" tools/a9y/chlorophyll/build-chlorophyll-ios.sh
       - name: Pack
         if: always()
         run: |

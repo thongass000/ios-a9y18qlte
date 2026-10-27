@@ -7,5 +7,8 @@ exports:
   - targets:     [ arm64-ios ]
     symbols:     [ _printf, _vsnprintf, _snprintf, _open, _close, _pread, _write, _fsync, _rename, _unlink,
                    _mkdir, _execv, _access, _malloc, _free, ___error, _fcntl, _getpid, _memorystatus_control,
-                   dyld_stub_binder ]
+                   _read, _pipe, _chdir, _kill, _waitpid, _environ, _posix_spawn, _posix_spawnattr_init,
+                   _posix_spawnattr_setflags, _posix_spawnattr_destroy, _posix_spawn_file_actions_init,
+                   _posix_spawn_file_actions_adddup2, _posix_spawn_file_actions_addclose,
+                   _posix_spawn_file_actions_destroy, _memcpy, _memset, dyld_stub_binder ]
 ...
