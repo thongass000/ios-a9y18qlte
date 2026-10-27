@@ -214,6 +214,9 @@ fence_done(uint32_t fence)
 	return fence == 0 || na_call(NA_WAIT_FENCE, &w, sizeof(w), NULL, 0) == KERN_SUCCESS;
 }
 
+/* The last failed fence wait, for Chlorophyll's fence-timeout report (sweet_drm_take_wait_error) */
+static char g_wait_err[160];
+
 /* Wait for a fence until the absolute CLOCK_MONOTONIC time t (msm timeouts are absolute, the kernel's relative). */
 static int
 fence_wait_until(uint32_t fence, const struct drm_msm_timespec *t)
@@ -224,7 +227,24 @@ fence_wait_until(uint32_t fence, const struct drm_msm_timespec *t)
 	struct na_wait_fence w = { fence, ns < 0 ? 0 : (uint64_t)ns };
 	if (fence == 0)
 		return 0;
-	return -io_errno(na_call(NA_WAIT_FENCE, &w, sizeof(w), NULL, 0));
+	kern_return_t kr = na_call(NA_WAIT_FENCE, &w, sizeof(w), NULL, 0);
+	if (kr != KERN_SUCCESS) {
+		struct na_status st = { 0, 0 };
+		na_call(NA_GET_STATUS, NULL, 0, &st, sizeof(st));
+		snprintf(g_wait_err, sizeof(g_wait_err), "WAIT_FENCE fence %u: kr %#x after a %lld ms timeout; GPU faults %llu",
+		    fence, kr, (long long)(w.timeout_ns / 1000000), (unsigned long long)st.faults);
+	}
+	return -io_errno(kr);
+}
+
+/* Bergamota's stand-in API: the last failed fence wait into buf, then forgotten (empty: no wait failed) */
+EXPORT void
+sweet_drm_take_wait_error(char *buf, size_t size)
+{
+	if (size == 0)
+		return;
+	snprintf(buf, size, "%s", g_wait_err);
+	g_wait_err[0] = 0;
 }
 
 /* ---- GPU address ranges (g_lock held) ---- */
