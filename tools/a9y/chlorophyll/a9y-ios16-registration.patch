@@ -1,0 +1,172 @@
+a9y18qlte: Chlorophyll on iOS 16: device registration without MTLCopyAllDevices, CA probe fixes
+
+iOS 16's Metal.framework exports MTLAddDevice and MTLCreateSystemDefaultDevice but not MTLCopyAllDevices
+(dlsym NULL: bgmtl_adddev crashed calling it, the CARenderer probe and the injection refused to register).
+MTLAddDevice asserts `_deviceArray != NULL`; on iOS 16 MTLCreateSystemDefaultDevice's dispatch_once makes that
+array and the queue MTLAddDevice syncs on before it enumerates (Metal 0x181a34050 in 20H392's cache), and it
+answers the array's only device. src/a9y_devices.h lists devices through it when MTLCopyAllDevices is missing;
+the injection, bgmtl_adddev and bgmtl_carenderer_probe use it, and the injection logs whether the default device
+is ours after registering.
+
+bgmtl_ca_probe read [cb status] right after commit (asynchronous now: every function was "failed", in an unflushed
+file); it waits, writes line by line, and with BG_CA_HASH prints a hash and the first pixel instead of 8 KB of hex.
+
+Assisted-by: LLM
+
+diff --git a/inject/bgmtl_inject.m b/inject/bgmtl_inject.m
+index 943d9ac..56a4384 100644
+--- a/inject/bgmtl_inject.m
++++ b/inject/bgmtl_inject.m
+@@ -35,6 +35,7 @@
+ #include <sys/stat.h>
+ #include <sys/sysctl.h>
+ #include <unistd.h>
++#include "../src/a9y_devices.h"
+ 
+ extern id bgmtl_create_device(void);
+ extern int bgmtl_gpu_state(unsigned *abi_minor);
+@@ -338,14 +339,15 @@ bb_init(void)
+    id dev = bgmtl_create_device();
+    if (!dev) { ilog("backboardd: no device could be made: stock"); return; }
+    void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");
+-   NSArray *(*all)(void) = (NSArray * (*)(void))dlsym(RTLD_DEFAULT, "MTLCopyAllDevices");
+-   if (!add || !all) { ilog("backboardd: Metal registration entry points missing: stock"); return; }
+-   ilog("backboardd: devices before registration: %lu", (unsigned long)[all() count]);
++   if (!add) { ilog("backboardd: Metal registration entry points missing: stock"); return; }
++   ilog("backboardd: devices before registration: %lu", (unsigned long)[a9y_mtl_devices() count]);
+    install_diag();
+    bb_watch_exit();
+    add(dev);
+    g_registered = 1;
+-   ilog("backboardd: Chlorophyll device registered (kernel ABI minor %u)%s", minor, crashtest ? ", CRASHTEST armed" : "");
++   id def = ((id (*)(void))dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice"))();
++   ilog("backboardd: Chlorophyll device registered (kernel ABI minor %u)%s; default device now %s", minor,
++        crashtest ? ", CRASHTEST armed" : "", def == dev ? "ours" : def ? "another" : "nil");
+    pthread_t th;
+    pthread_create(&th, NULL, watchdog_bb, (void *)(intptr_t)crashtest);
+    pthread_detach(th);
+@@ -386,9 +388,8 @@ bgmtl_inject_init(void)
+       if (!add) { ilog("MTLAddDevice not found: staying stock"); write_state(unclean, 1); return; }
+       // MTLAddDevice asserts `_deviceArray != NULL` until Metal has enumerated once (found in the first live run: abort in the
+       // constructor, before main). MTLCopyAllDevices builds that array; in this process it answers without a GPU service.
+-      NSArray *(*all)(void) = (NSArray * (*)(void))dlsym(RTLD_DEFAULT, "MTLCopyAllDevices");
+-      if (!all) { ilog("MTLCopyAllDevices not found: staying stock"); write_state(unclean, 1); return; }
+-      NSArray *pre = all();
++      // (a9y18qlte: iOS 16 has no MTLCopyAllDevices; a9y_mtl_devices builds it through MTLCreateSystemDefaultDevice.)
++      NSArray *pre = a9y_mtl_devices();
+       ilog("devices before registration: %lu", (unsigned long)[pre count]);
+       install_diag();
+       add(dev);
+diff --git a/src/a9y_devices.h b/src/a9y_devices.h
+new file mode 100644
+index 0000000..eb59ccf
+--- /dev/null
++++ b/src/a9y_devices.h
+@@ -0,0 +1,17 @@
++// a9y18qlte: Metal's device list without MTLCopyAllDevices, which iOS 16's Metal.framework does not export (iOS 18's
++// does). MTLAddDevice asserts `_deviceArray != NULL`; on iOS 16 MTLCreateSystemDefaultDevice's dispatch_once makes
++// that array (and the queue MTLAddDevice syncs on) before it looks for devices, and answers the array's only device
++// (nil when it is empty or holds more than one). So there: call it once before MTLAddDevice, and read it back after.
++#import <Foundation/Foundation.h>
++#include <dlfcn.h>
++
++static inline NSArray *
++a9y_mtl_devices(void)
++{
++   NSArray *(*all)(void) = (NSArray * (*)(void))dlsym(RTLD_DEFAULT, "MTLCopyAllDevices");
++   if (all)
++      return all();
++   id (*def)(void) = (id (*)(void))dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice");
++   id d = def ? def() : nil;
++   return d ? @[ d ] : @[];
++}
+diff --git a/test/bgmtl_adddev.m b/test/bgmtl_adddev.m
+index 1b772ed..212e967 100644
+--- a/test/bgmtl_adddev.m
++++ b/test/bgmtl_adddev.m
+@@ -6,6 +6,7 @@
+ #import <Metal/Metal.h>
+ #import <objc/runtime.h>
+ #include <dlfcn.h>
++#include "../src/a9y_devices.h"
+ #include <stdio.h>
+ extern id bgmtl_create_device(void);
+ int
+@@ -15,7 +16,7 @@ main(int argc, char **argv)
+       setvbuf(stdout, NULL, _IONBF, 0);
+       void (*add)(id) = dlsym(RTLD_DEFAULT, "MTLAddDevice");
+       printf("MTLAddDevice symbol: %p\n", add);
+-      NSArray *before = ((NSArray * (*)(void))dlsym(RTLD_DEFAULT, "MTLCopyAllDevices"))();
++      NSArray *before = a9y_mtl_devices();
+       printf("devices before: %lu\n", (unsigned long)[before count]);
+       id dev = bgmtl_create_device();
+       printf("created %s\n", dev ? [[dev name] UTF8String] : "nil");
+@@ -23,7 +24,7 @@ main(int argc, char **argv)
+       printf("calling MTLAddDevice ...\n");
+       add(dev);
+       printf("MTLAddDevice returned\n");
+-      NSArray *after = ((NSArray * (*)(void))dlsym(RTLD_DEFAULT, "MTLCopyAllDevices"))();
++      NSArray *after = a9y_mtl_devices();
+       printf("devices after: %lu\n", (unsigned long)[after count]);
+       for (id d in after) printf("  %s (%s)\n", [[d name] UTF8String], class_getName([d class]));
+       id def = ((id (*)(void))dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice"))();
+diff --git a/test/bgmtl_ca_probe.m b/test/bgmtl_ca_probe.m
+index cee38d4..e4a0e0a 100644
+--- a/test/bgmtl_ca_probe.m
++++ b/test/bgmtl_ca_probe.m
+@@ -71,6 +71,8 @@ main(int argc, char **argv)
+       if (!lib) { printf("library: %s\n", e ? [[e localizedDescription] UTF8String] : "?"); return 3; }
+       NSArray *names = [[lib functionNames] sortedArrayUsingSelector:@selector(compare:)];
+       FILE *out = fopen(argv[2], only ? "a" : "w");   /* --only appends: ca-sweep.sh runs one function per process, so that an abort is one line, not the run */
++      setvbuf(out, NULL, _IOLBF, 0);   /* a9y18qlte: every line out as it is written, also when a timeout kills the run */
++      int hash_only = getenv("BG_CA_HASH") != NULL;   /* a9y18qlte: a hash and the first pixel instead of 8 KB of hex (the phone's log) */
+       unsigned total = 0, built = 0, drawn = 0, skipped = 0;
+       id rt = nil;
+       {
+@@ -166,6 +168,7 @@ main(int argc, char **argv)
+          [enc endEncoding];
+          double t0 = now_ms();
+          [cb commit];
++         [cb waitUntilCompleted];   /* a9y18qlte: commits are asynchronous */
+          double ms = now_ms() - t0;
+          if ([cb status] != 4) {
+             NSString *why2 = [cb error] ? [[[cb error] localizedDescription] stringByReplacingOccurrencesOfString:@"\n" withString:@" "] : @"?";
+@@ -181,7 +184,12 @@ main(int argc, char **argv)
+          }
+          uint8_t px[W * W * 4];
+          [rt getBytes:px bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, 0, W, W) mipmapLevel:0];
+-         fprintf(out, "%s\tdrawn\t%s\t%.1f\n", cn, [hexof(px, sizeof(px)) UTF8String], ms);
++         if (hash_only) {
++            uint32_t h = 2166136261u;
++            for (unsigned i = 0; i < sizeof(px); i++) h = (h ^ px[i]) * 16777619u;
++            fprintf(out, "%s\tdrawn\tfnv %08x px0 %02x%02x%02x%02x\t%.1f\n", cn, h, px[0], px[1], px[2], px[3], ms);
++         } else
++            fprintf(out, "%s\tdrawn\t%s\t%.1f\n", cn, [hexof(px, sizeof(px)) UTF8String], ms);
+          drawn++;
+          fflush(out);
+          for (unsigned i = 0; i < 16; i++) [texs[i] release];
+diff --git a/test/bgmtl_carenderer_probe.m b/test/bgmtl_carenderer_probe.m
+index c7b6b7e..cfdd0f4 100644
+--- a/test/bgmtl_carenderer_probe.m
++++ b/test/bgmtl_carenderer_probe.m
+@@ -10,6 +10,7 @@
+ #import <CoreGraphics/CoreGraphics.h>
+ #import <objc/runtime.h>
+ #include <dlfcn.h>
++#include "../src/a9y_devices.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -147,10 +148,9 @@ main(int argc, char **argv)
+       setvbuf(stdout, NULL, _IONBF, 0);
+       if (argc < 2) { printf("usage: bgmtl_carenderer_probe OUTDIR [scene]\n"); return 2; }
+       int only = argc > 2 ? atoi(argv[2]) : -1;
+-      NSArray *(*all)(void) = (NSArray * (*)(void))dlsym(RTLD_DEFAULT, "MTLCopyAllDevices");
+       void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");
+-      if (!all || !add) { printf("no Metal registration entry points\n"); return 2; }
+-      printf("devices before: %lu\n", (unsigned long)[all() count]);
++      if (!add) { printf("no Metal registration entry points\n"); return 2; }
++      printf("devices before: %lu\n", (unsigned long)[a9y_mtl_devices() count]);
+       if (getenv("BG_IMP_FIND")) {   // which ObjC methods live at these Metal.framework offsets (crash report frames)
+          char *list = strdup(getenv("BG_IMP_FIND"));
+          unsigned long want[16]; int nw = 0;

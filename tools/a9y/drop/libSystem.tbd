@@ -10,5 +10,5 @@ exports:
                    _read, _pipe, _chdir, _kill, _waitpid, _environ, _posix_spawn, _posix_spawnattr_init,
                    _posix_spawnattr_setflags, _posix_spawnattr_destroy, _posix_spawn_file_actions_init,
                    _posix_spawn_file_actions_adddup2, _posix_spawn_file_actions_addclose,
-                   _posix_spawn_file_actions_destroy, _memcpy, _memset, _time, _poll, dyld_stub_binder ]
+                   _posix_spawn_file_actions_destroy, _memcpy, _memset, _time, _poll, _execve, _sysctlbyname, dyld_stub_binder ]
 ...

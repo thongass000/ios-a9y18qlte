@@ -22,6 +22,7 @@ if [ ! -d chl ]; then
 	git -C chl apply "$HERE/a9y-vs-ssbo-to-ubo.patch"     # A5xx: no SSBOs in the vertex stage
 	git -C chl apply "$HERE/a9y-cb-delta-a6xx-only.patch" # A5xx: constant-buffer deltas broke render passes
 	git -C chl apply "$HERE/a9y-probe-t4-wait.patch"      # the probe's T4 assumed inline commits
+	git -C chl apply "$HERE/a9y-ios16-registration.patch" # iOS 16: no MTLCopyAllDevices; CA probe fixes
 fi
 if [ ! -d mesa-air ]; then
 	mkdir -p air-src && tar -C air-src -xf mesa.tar.xz && mv air-src/mesa-* mesa-air && rmdir air-src
@@ -69,12 +70,14 @@ done
 	-Wl,-rpath,@loader_path
 # does dyld take DYLD_INSERT_LIBRARIES into a platform binary on this kernel? (a constructor that says where it runs)
 "${CC[@]}" -O1 -dynamiclib -o "$O/a9yhello.dylib" "$HERE/a9yhello.c" -install_name /usr/local/chl/a9yhello.dylib
+# backboardd's side: edits launchd.plist on the phone, arms a boot, resprings (tools/a9y/drop/a9ybb.c is the launcher)
+"${CC[@]}" "${OBJC[@]}" -o "$O/a9ybbctl" "$HERE/a9ybbctl.m" -framework Foundation
 for k in bg_kernels bg_render; do
 	xcrun -sdk iphoneos metal -mios-version-min=$MIN -c "chl/test/$k.metal" -o "$O/$k.air"
 	xcrun -sdk iphoneos metallib "$O/$k.air" -o "$O/$k.metallib"
 done
 rm -f "$O"/*.o "$O"/*.air
-for f in "$O/libbgair.dylib" "$O/bgmtl-inject.dylib" "$O/a9yhello.dylib" $(for p in $PROBES; do echo "$O/$p"; done); do
+for f in "$O/libbgair.dylib" "$O/bgmtl-inject.dylib" "$O/a9yhello.dylib" "$O/a9ybbctl" $(for p in $PROBES; do echo "$O/$p"; done); do
 	codesign -f -s - "$f"
 	otool -L "$f"
 done
