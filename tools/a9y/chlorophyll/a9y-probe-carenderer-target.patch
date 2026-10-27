@@ -1,0 +1,79 @@
+a9y18qlte: bgmtl_carenderer_probe: target size and IOSurface switches
+
+backboardd's frames on Chlorophyll stay empty on the A512 (every sampled pixel of its 1125x2436
+IOSurface framebuffers (0,0,0,0)), while this probe's 256x256 scenes, through the same
+CoreAnimation renderer, come out right. BG_CAR_W / BG_CAR_H set the target size and
+BG_CAR_IOSURFACE=1 puts the texture over an IOSurface, so the two can be told apart; pictures are
+written only up to 256x256.
+
+Assisted-by: LLM
+
+diff --git a/test/bgmtl_carenderer_probe.m b/test/bgmtl_carenderer_probe.m
+index cfdd0f4..51740f3 100644
+--- a/test/bgmtl_carenderer_probe.m
++++ b/test/bgmtl_carenderer_probe.m
+@@ -9,6 +9,7 @@
+ #import <QuartzCore/QuartzCore.h>
+ #import <CoreGraphics/CoreGraphics.h>
+ #import <objc/runtime.h>
++#import <IOSurface/IOSurfaceRef.h>
+ #include <dlfcn.h>
+ #include "../src/a9y_devices.h"
+ #include <stdio.h>
+@@ -16,8 +17,10 @@
+ #include <string.h>
+ 
+ extern id bgmtl_create_device(void);
+-#define W 256
+-#define H 256
++/* a9y18qlte: the target backboardd draws into is 1125x2436 and an IOSurface's; BG_CAR_W / BG_CAR_H set the size and
++ * BG_CAR_IOSURFACE=1 makes the texture over an IOSurface (bytes per row aligned to 64), to tell which of the two
++ * leaves CoreAnimation's frames empty on the A512 */
++static int W = 256, H = 256;
+ 
+ static CALayer *
+ make_scene(int n)
+@@ -148,6 +151,10 @@ main(int argc, char **argv)
+       setvbuf(stdout, NULL, _IONBF, 0);
+       if (argc < 2) { printf("usage: bgmtl_carenderer_probe OUTDIR [scene]\n"); return 2; }
+       int only = argc > 2 ? atoi(argv[2]) : -1;
++      if (getenv("BG_CAR_W")) W = atoi(getenv("BG_CAR_W"));
++      if (getenv("BG_CAR_H")) H = atoi(getenv("BG_CAR_H"));
++      int use_surface = getenv("BG_CAR_IOSURFACE") != NULL;
++      printf("target %dx%d, %s\n", W, H, use_surface ? "IOSurface" : "own memory");
+       void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");
+       if (!add) { printf("no Metal registration entry points\n"); return 2; }
+       printf("devices before: %lu\n", (unsigned long)[a9y_mtl_devices() count]);
+@@ -196,7 +203,18 @@ main(int argc, char **argv)
+          // the subject: CARenderer over a texture of the BGMTL device
+          MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:W height:H mipmapped:NO];
+          td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+-         id<MTLTexture> tex = [d newTextureWithDescriptor:td];
++         id<MTLTexture> tex = nil;
++         if (use_surface) {
++            NSDictionary *props = @{ (id)kIOSurfaceWidth : @(W), (id)kIOSurfaceHeight : @(H), (id)kIOSurfaceBytesPerElement : @4,
++                                     (id)kIOSurfaceBytesPerRow : @((W * 4 + 63) & ~63), (id)kIOSurfacePixelFormat : @(0x42475241) };
++            IOSurfaceRef s = IOSurfaceCreate((CFDictionaryRef)props);
++            if (!s) { printf("scene %d: no IOSurface\n", n); bad++; continue; }
++            td.storageMode = MTLStorageModeShared;
++            tex = [d newTextureWithDescriptor:td iosurface:s plane:0];
++            CFRelease(s);
++         } else
++            tex = [d newTextureWithDescriptor:td];
++         if (!tex) { printf("scene %d: no texture\n", n); bad++; continue; }
+          id<MTLCommandQueue> q = [d newCommandQueue];
+          CARenderer *r = [CARenderer rendererWithMTLTexture:tex options:@{ kCARendererMetalCommandQueue : q }];
+          if (!r) { printf("scene %d: CARenderer refused the texture\n", n); bad++; continue; }
+@@ -223,8 +241,10 @@ main(int argc, char **argv)
+          for (int i = 0; i < W * H * 4; i++) { sum += abs((int)out[i] - (int)ref[i]); if (out[i]) nonzero++; }
+          printf("scene %d: mean abs diff %.2f over %d channels, %u non-zero bytes rendered\n", n, sum / (W * H * 4), W * H * 4, nonzero);
+          char p[600];
+-         snprintf(p, sizeof(p), "%s/scene%d.ppm", argv[1], n); write_ppm(p, out);
+-         snprintf(p, sizeof(p), "%s/ref%d.ppm", argv[1], n); write_ppm(p, ref);
++         if (W * H <= 256 * 256) {   // a9y18qlte: not 11 MB per picture at 1125x2436
++            snprintf(p, sizeof(p), "%s/scene%d.ppm", argv[1], n); write_ppm(p, out);
++            snprintf(p, sizeof(p), "%s/ref%d.ppm", argv[1], n); write_ppm(p, ref);
++         }
+          if (!nonzero) bad++;
+          done++;
+          free(out); free(ref);

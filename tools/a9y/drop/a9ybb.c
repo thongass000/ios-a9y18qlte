@@ -38,6 +38,7 @@ extern char **environ;
 #define STATE           "/private/var/tmp/bgmtl-bb.state"
 #define TRIES           "/private/var/tmp/a9ybb.tries"
 #define ENV_FILE        "/usr/local/etc/a9ybb.env"
+#define MAX_EXTRA       4
 #define MAX_TRIES       2
 #define MAX_ENV         256
 
@@ -113,19 +114,23 @@ int main(int argc, char **argv)
 	if (armed() && another_try()) {
 		static char insert[] = "DYLD_INSERT_LIBRARIES=" INJECT;
 		static char bb[] = "BGMTL_BB=1";
-		/* A/B switches that come with the drop file (/private/var/tmp is out of its reach): one line of
-		 * NAME=VALUE in /usr/local/etc/a9ybb.env, e.g. FD_MESA_DEBUG=sysmem */
-		static char extra[256];
-		char *envp[MAX_ENV + 4];
+		/* A/B switches that come with the drop file (/private/var/tmp is out of its reach): up to
+		 * MAX_EXTRA lines of NAME=VALUE in /usr/local/etc/a9ybb.env, e.g. FD_MESA_DEBUG=sysmem */
+		static char extra[512];
+		char *envp[MAX_ENV + 3 + MAX_EXTRA];
 		int n = 0;
 		envp[n++] = insert;
 		envp[n++] = bb;
-		if (slurp(ENV_FILE, extra, sizeof(extra)) > 2) {
-			for (char *p = extra; *p; p++)
-				if (*p == '\n' || *p == '\r')
-					*p = 0;
-			if (extra[0] && extra[0] != '#')
-				envp[n++] = extra;
+		int len = slurp(ENV_FILE, extra, sizeof(extra));
+		for (int i = 0, start = 0, lines = 0; len > 0 && i <= len && lines < MAX_EXTRA; i++) {
+			if (i < len && extra[i] != '\n' && extra[i] != '\r')
+				continue;
+			extra[i] = 0;
+			if (i - start > 2 && extra[start] != '#') {
+				envp[n++] = extra + start;
+				lines++;
+			}
+			start = i + 1;
 		}
 		for (char **e = environ; *e && n < MAX_ENV; e++)
 			envp[n++] = *e;
