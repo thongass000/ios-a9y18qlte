@@ -6,6 +6,6 @@ current-version: 275
 exports:
   - targets:     [ arm64-ios ]
     symbols:     [ _IOServiceMatching, _IOServiceGetMatchingService, _IOServiceOpen, _IOServiceClose,
-                   _IOConnectCallScalarMethod, _IOConnectMapMemory64, _IORegistryEntryFromPath,
+                   _IOConnectCallScalarMethod, _IOConnectCallStructMethod, _IOConnectMapMemory64, _IORegistryEntryFromPath,
                    _IOObjectRelease ]
 ...

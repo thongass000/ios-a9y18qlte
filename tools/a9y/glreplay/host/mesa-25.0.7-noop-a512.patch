@@ -1,0 +1,24 @@
+--- a/src/freedreno/drm-shim/freedreno_noop.c
++++ b/src/freedreno/drm-shim/freedreno_noop.c
+@@ -69,7 +69,8 @@
+       args->value = drm_shim_bo_get_mmap_offset(shim_fd, bo);
+       break;
+    case MSM_INFO_GET_IOVA:
+-      args->value = bo->mem_addr;
++      /* a9y18qlte: the first SweetAccelerator v2 window, so a replay maps 1:1 */
++      args->value = 0x400000000ull + bo->mem_addr;
+       break;
+    case MSM_INFO_SET_IOVA:
+    case MSM_INFO_SET_NAME:
+@@ -215,6 +216,11 @@
+       .gmem_size = 256 * 1024,
+    },
+    {
++      .gpu_id = 512,
++      .chip_id = CHIPID(5, 1, 2, 0),
++      .gmem_size = 256 * 1024,
++   },
++   {
+       .gpu_id = 530,
+       .chip_id = CHIPID(5, 3, 0, 2),
+       .gmem_size = 1024 * 1024,
