@@ -1,0 +1,20 @@
+a9y18qlte: bgmtl_probe T4 waits for each command buffer
+
+T4 read [cb status] straight after [cb commit], which only holds when commits run inline (BGMTL_SYNC=1). With
+the asynchronous commit it saw status 3 (scheduled) and stopped after one round; with BGMTL_SYNC=1 all 20 rounds
+were correct on the Adreno 512. Waiting with waitUntilCompleted, as a Metal app does, tests the asynchronous path.
+
+Assisted-by: LLM
+
+diff --git a/test/bgmtl_probe.m b/test/bgmtl_probe.m
+index 3c6572c..957983b 100644
+--- a/test/bgmtl_probe.m
++++ b/test/bgmtl_probe.m
+@@ -257,6 +257,7 @@ main(int argc, char **argv)
+                [enc dispatchThreadgroups:MTLSizeMake(n / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [enc endEncoding];
+                [cb commit];
++               [cb waitUntilCompleted];
+                if ([cb status] != 4) { printf("  round %u: status %ld\n", r, (long)[cb status]); break; }
+                done++;
+                for (unsigned i = 0; i < n; i++) if (fo[i] != fa[i] + 2.0f * fb[i]) total_bad++;

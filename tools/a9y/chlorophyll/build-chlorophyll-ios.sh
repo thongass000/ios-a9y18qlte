@@ -20,6 +20,8 @@ if [ ! -d chl ]; then
 	git clone -q "$CHL_REPO" chl
 	git -C chl checkout -q "$CHL_SHA"
 	git -C chl apply "$HERE/a9y-vs-ssbo-to-ubo.patch"     # A5xx: no SSBOs in the vertex stage
+	git -C chl apply "$HERE/a9y-cb-delta-a6xx-only.patch" # A5xx: constant-buffer deltas broke render passes
+	git -C chl apply "$HERE/a9y-probe-t4-wait.patch"      # the probe's T4 assumed inline commits
 fi
 if [ ! -d mesa-air ]; then
 	mkdir -p air-src && tar -C air-src -xf mesa.tar.xz && mv air-src/mesa-* mesa-air && rmdir air-src

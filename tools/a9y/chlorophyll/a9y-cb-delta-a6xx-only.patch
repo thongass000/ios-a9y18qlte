@@ -1,0 +1,59 @@
+a9y18qlte: constant-buffer deltas only from a6xx on
+
+add_cb_deltas keeps the offset deltas of misaligned constant buffers in slot 15, the last of the 16 slots a6xx
+has. Before a6xx ir3 reads constant buffers through a table of pointers in the constant file (ldg), and on the
+Adreno 512 the deltas turned bgmtl_render_probe's interpolated triangle black and left its RGBA32Float targets
+untouched (P4, P7, P8). With them off (RWA_CB_DELTA=0) all 18 checks pass, as on softpipe, so a pre-a6xx chip
+takes the copying path by default. RWA_CB_DELTA=1 or 0 still forces either.
+
+Assisted-by: LLM
+
+diff --git a/air/air_metal.c b/air/air_metal.c
+index 68f40c4..e37f0f5 100644
+--- a/air/air_metal.c
++++ b/air/air_metal.c
+@@ -6535,12 +6535,27 @@ size_unsized_constants(nir_shader *nir, struct air_shader_info *info)
+  * cb_delta_mask): every load from one becomes load(offset + delta[index]), the deltas living in the last of the 16 constant
+  * buffer slots a6xx has, when the shader leaves it free. RWA_CB_DELTA=0 turns it off. */
+ #define CB_DELTA_SLOT 15
++/* a9y18qlte: not before a6xx. There ir3 reads a constant buffer through a table of pointers in the constant file (ldg,
++ * ir3_emit_ubos), not ldc, and with the deltas in slot 15 the Adreno 512 drew the probes' interpolated triangle black
++ * and left RGBA32Float targets untouched (bgmtl_render_probe P4, P7, P8); without them all pass, so there the copying
++ * path stays. RWA_CB_DELTA=1 or 0 forces it either way. */
++static bool
++cb_deltas_fit(struct rwa_device *device)
++{
++   const char *env = getenv("RWA_CB_DELTA");
++   if (env && (env[0] == '0' || env[0] == '1'))
++      return env[0] == '1';
++   const char *name = device->screen->get_name(device->screen);
++   unsigned chip;
++   return !(name && sscanf(name, "FD%u", &chip) == 1 && chip < 600);
++}
++
+ static void
+-add_cb_deltas(nir_shader *nir, struct air_shader_info *info)
++add_cb_deltas(struct rwa_device *device, nir_shader *nir, struct air_shader_info *info)
+ {
+    static int on = -1;
+    if (on < 0)
+-      on = !(getenv("RWA_CB_DELTA") && getenv("RWA_CB_DELTA")[0] == '0');
++      on = cb_deltas_fit(device);
+    unsigned mask = 0;
+    for (unsigned i = 0; i < info->num_resources; i++) {
+       const struct air_resource *r = &info->resources[i];
+@@ -6942,12 +6957,12 @@ rwa_render_create(struct rwa_device *device,
+    }
+ 
+    size_unsized_constants(fs, &render->finfo);
+-   add_cb_deltas(fs, &render->finfo);
++   add_cb_deltas(device, fs, &render->finfo);
+    if (!render->generated_vertex) {
+       if (!vs_has_ssbos(device) && vs_ssbos_to_ubos(vs, &render->vinfo, why, why_size))
+          goto fail;
+       size_unsized_constants(vs, &render->vinfo);
+-      add_cb_deltas(vs, &render->vinfo);
++      add_cb_deltas(device, vs, &render->vinfo);
+    }
+ 
+    /* Compile both stages now. A failure here is a creation failure and says so; the
