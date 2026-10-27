@@ -1,0 +1,10 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-ios ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 1319
+exports:
+  - targets:     [ arm64-ios ]
+    symbols:     [ _printf, _vsnprintf, _snprintf, _open, _close, _pread, _write, _fsync, _rename, _unlink,
+                   _mkdir, _execv, _access, _malloc, _free, ___error, dyld_stub_binder ]
+...
