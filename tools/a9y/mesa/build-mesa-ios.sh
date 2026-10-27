@@ -98,7 +98,7 @@ done
 # every library lives in /usr/local/lib on the phone: absolute install names and references, then a fresh ad hoc signature
 for f in "$OUT"/*.dylib "$OUT/a9yosmtri"; do
 	case "$f" in *.dylib) install_name_tool -id "/usr/local/lib/$(basename "$f")" "$f" ;; esac
-	otool -L "$f" | awk 'NR > 1 { print $1 }' | grep '^@rpath/' | while read -r dep; do
+	otool -L "$f" | awk 'NR > 1 && $1 ~ /^@rpath\// { print $1 }' | while read -r dep; do
 		install_name_tool -change "$dep" "/usr/local/lib/${dep#@rpath/}" "$f"
 	done
 	codesign -f -s - "$f"
