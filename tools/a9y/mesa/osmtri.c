@@ -21,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <IOKit/IOKitLib.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <GL/osmesa.h>
 #include <GLES2/gl2.h>
 
@@ -168,6 +169,65 @@ static double now_ms(void)
 	return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
 }
 
+/*
+ * The GPU into an IOSurface: a 512x512 BGRA surface, filled with a marker by the CPU, gets the renderbuffer by
+ * OSMesaSweetBlit (Bergamota's GPU blit; a9y_drm.c imports the surface's pages as a BO), then the CPU reads it
+ * and compares it with glReadPixels' picture, in either row order. 1 when every pixel matches.
+ */
+static int g_surface_ok;
+
+static int surface_test(GLuint rb, const unsigned char *px)
+{
+	int (*blit)(GLuint, int, uint32_t, int, int) =
+		(int (*)(GLuint, int, uint32_t, int, int))dlsym(RTLD_DEFAULT, "OSMesaSweetBlit");
+	int w = W, h = H, bpe = 4, bpr = W * 4;
+	uint32_t fmt = 'BGRA';
+	const void *keys[] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfaceBytesPerRow,
+			       kIOSurfacePixelFormat, kIOSurfaceIsGlobal };
+	const void *vals[] = { CFNumberCreate(NULL, kCFNumberIntType, &w), CFNumberCreate(NULL, kCFNumberIntType, &h),
+			       CFNumberCreate(NULL, kCFNumberIntType, &bpe), CFNumberCreate(NULL, kCFNumberIntType, &bpr),
+			       CFNumberCreate(NULL, kCFNumberSInt32Type, &fmt), kCFBooleanTrue };
+	CFDictionaryRef props = CFDictionaryCreate(NULL, keys, vals, 6, &kCFTypeDictionaryKeyCallBacks,
+						   &kCFTypeDictionaryValueCallBacks);
+	IOSurfaceRef s = IOSurfaceCreate(props);
+	if (!blit || !s) {
+		say("surface: FAIL: %s", !blit ? "no OSMesaSweetBlit" : "IOSurfaceCreate failed");
+		return 0;
+	}
+	uint32_t id = IOSurfaceGetID(s);
+	unsigned stride = (unsigned)IOSurfaceGetBytesPerRow(s);
+	IOSurfaceLock(s, 0, NULL);
+	unsigned char *base = IOSurfaceGetBaseAddress(s);
+	for (int y = 0; y < H; y++)
+		for (int x = 0; x < W; x++)
+			memcpy(base + y * stride + x * 4, "\xef\xbe\xad\xde", 4);
+	IOSurfaceUnlock(s, 0, NULL);
+
+	double t0 = now_ms();
+	int r = blit(rb, 0, id, 0, 1);
+	p_glFinish();
+	double t1 = now_ms();
+
+	IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+	unsigned same = 0, flipped = 0, marker = 0;
+	for (int y = 0; y < H; y++) {
+		for (int x = 0; x < W; x++) {
+			const unsigned char *q = base + y * stride + x * 4;     /* B G R A */
+			const unsigned char *a = px + (y * W + x) * 4, *b = px + ((H - 1 - y) * W + x) * 4;
+			same += q[0] == a[2] && q[1] == a[1] && q[2] == a[0];
+			flipped += q[0] == b[2] && q[1] == b[1] && q[2] == b[0];
+			marker += !memcmp(q, "\xef\xbe\xad\xde", 4);
+		}
+	}
+	const unsigned char *c = base + H / 2 * stride + W / 2 * 4;
+	IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+	say("surface %u (stride %u): blit %d in %.1f ms; %u px match in GL row order, %u flipped, %u still marker; "
+	    "centre BGRA %02x%02x%02x%02x", id, stride, r, t1 - t0, same, flipped, marker, c[0], c[1], c[2], c[3]);
+	CFRelease(s);
+	CFRelease(props);
+	return r && (same == W * H || flipped == W * H);
+}
+
 /* the scene into px (RGBA, bottom row first); 1 when it was drawn on the GPU with no error and no pixel left over */
 static int render(const char *mode, unsigned char *px)
 {
@@ -241,6 +301,8 @@ static int render(const char *mode, unsigned char *px)
 	say("%s: fbo status %#x, glError %#x; %u clear, %u untouched, %u drawn; centre %02x%02x%02x%02x; "
 	    "clear+draw+readback %.1f ms", mode, st, err, clear, untouched, drawn, c[0], c[1], c[2], c[3], t1 - t0);
 	show(mode, px);
+	if (!strcmp(mode, "gmem"))
+		g_surface_ok = surface_test(rb, px);
 	int hw = renderer && strstr(renderer, "FD512") != NULL;
 	OSMesaDestroyContext(ctx);
 	if (!hw)
@@ -311,9 +373,10 @@ int main(int argc, char **argv)
 		say("first difference at x %u y %u: gmem %02x%02x%02x%02x sysmem %02x%02x%02x%02x", first % W, first / W,
 		    px[first * 4], px[first * 4 + 1], px[first * 4 + 2], px[first * 4 + 3],
 		    ref[first * 4], ref[first * 4 + 1], ref[first * 4 + 2], ref[first * 4 + 3]);
-	int pass = ok && ref_ok && diff == 0;
-	say("=== a9yosmtri: %s ===", pass ? "PASS: GMEM (TILED) RENDERING MATCHES SYSMEM ON THE ADRENO 512" :
-	    !ref_ok ? "FAIL (sysmem reference)" : !ok ? "FAIL (gmem render)" : "FAIL (gmem differs from sysmem)");
+	int pass = ok && ref_ok && diff == 0 && g_surface_ok;
+	say("=== a9yosmtri: %s ===", pass ? "PASS: GMEM MATCHES SYSMEM, AND THE GPU WROTE IT INTO AN IOSURFACE" :
+	    !ref_ok ? "FAIL (sysmem reference)" : !ok ? "FAIL (gmem render)" : diff ? "FAIL (gmem differs from sysmem)" :
+	    "FAIL (IOSurface blit)");
 	fflush(stderr);
 	sleep(1);       /* let the stderr pump finish */
 	return pass ? 0 : 1;

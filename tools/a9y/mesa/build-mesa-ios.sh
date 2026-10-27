@@ -35,7 +35,8 @@ mkdir -p "$OUT" drm pc
 # the stand-in, installed on the phone as /usr/local/lib/libdrm.2.dylib
 "${CC[@]}" -O2 -g -Wall -Wextra -fvisibility=hidden -dynamiclib \
 	-install_name /usr/local/lib/libdrm.2.dylib -current_version 2.4.124 -compatibility_version 2.0.0 \
-	-I"$WORK/mesa/include" "$HERE/a9y_drm.c" -o "$OUT/libdrm.2.dylib" -framework IOKit -framework CoreFoundation
+	-I"$WORK/mesa/include" "$HERE/a9y_drm.c" -o "$OUT/libdrm.2.dylib" -framework IOKit -framework IOSurface \
+	-framework CoreFoundation
 cp "$OUT/libdrm.2.dylib" drm/libdrm.2.dylib
 ln -sf libdrm.2.dylib drm/libdrm.dylib
 cat > pc/libdrm.pc << EOT
@@ -93,7 +94,7 @@ done
 
 # the test: GLES through OSMesa on the GPU
 "${CC[@]}" -O2 -Wall -Wextra -I"$WORK/mesa/include" "$HERE/osmtri.c" -o "$OUT/a9yosmtri" \
-	"$OUT/libOSMesa.8.dylib" -framework IOKit -framework CoreFoundation
+	"$OUT/libOSMesa.8.dylib" -framework IOKit -framework IOSurface -framework CoreFoundation
 
 # every library lives in /usr/local/lib on the phone: absolute install names and references, then a fresh ad hoc signature
 for f in "$OUT"/*.dylib "$OUT/a9yosmtri"; do

@@ -20,9 +20,15 @@
  *   - mmap of a BO is IOConnectMapMemory64 with the BO's CPU-map token (the buffers are write-combined for
  *     the CPU and uncached for the GPU, so there is no cache maintenance).
  *
+ * IOSurfaces become BOs too (sweet_drm_surface_bo, for Bergamota's sweet_hw.c): the kernel pins the surface's own
+ * pages (BoImport) and they get a GPU address like any BO; mmap answers the surface's base address. Those pages
+ * stay cacheable for the CPU while the GPU is not coherent, so sweet_drm_bo_sync cleans and invalidates them
+ * (dc civac from EL0: the kernel sets SCTLR_EL1.UCI).
+ *
  * Syncobjs, PRIME and fence fds are -ENOSYS (drmGetCap reports none of them; Gallium does not need them).
  */
 #include <IOKit/IOKitLib.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
@@ -54,6 +60,7 @@
 #define NA_GET_STATUS           8
 #define NA_BO_CPU_MAP           13
 #define NA_GET_DEVICE_INFO      15
+#define NA_BO_IMPORT            16
 #define NA_MAX_SUBMIT_BUFFERS   16
 
 struct na_device_info {
@@ -102,6 +109,8 @@ static struct bo {
 	uint64_t iova;
 	uint32_t fence;         /* last submit that used it */
 	uint32_t token;         /* CPU-map token (clientMemoryForType), 0 until mapped once */
+	void *cpu;              /* imported IOSurface: its base address (the BO's CPU mapping) */
+	IOSurfaceRef surf;      /* imported IOSurface, kept until GEM_CLOSE */
 } g_bo[MAX_BOS];
 
 /* ---- GPU address ranges of the window: free list, first fit, coalesced; closed ranges wait for a fence ---- */
@@ -287,18 +296,12 @@ range_alloc(uint64_t size, uint64_t align)
 
 /* ---- msm requests ---- */
 
+/* A kernel BO (allocated or imported) gets a GPU address in the window and its slot; on failure it is freed. */
 static int
-gem_new(struct drm_msm_gem_new *req)
+bo_place(uint64_t handle, uint64_t size, void *cpu, IOSurfaceRef surf)
 {
-	uint64_t size = (req->size + 4095) & ~4095ull, handle = 0;
-	struct na_bo_alloc a = { size, 12, 0 };
 	kern_return_t kr;
 
-	if (size == 0)
-		return -EINVAL;
-	kr = na_call(NA_BO_ALLOC, &a, sizeof(a), &handle, sizeof(handle));
-	if (kr != KERN_SUCCESS)
-		return -io_errno(kr);
 	if (handle == 0 || handle >= MAX_BOS) {
 		struct { uint64_t handle; } f = { handle };
 		na_call(NA_BO_FREE, &f, sizeof(f), NULL, 0);
@@ -322,12 +325,29 @@ gem_new(struct drm_msm_gem_new *req)
 		return -io_errno(kr);
 	}
 	pthread_mutex_lock(&g_lock);
-	g_bo[handle] = (struct bo){ size, iova, 0, 0 };
+	g_bo[handle] = (struct bo){ size, iova, 0, 0, cpu, surf };
 	pthread_mutex_unlock(&g_lock);
-	req->handle = (uint32_t)handle;
-	trace("new h=%llu size=%#llx iova=%#llx", (unsigned long long)handle, (unsigned long long)size,
-	    (unsigned long long)iova);
+	trace("%s h=%llu size=%#llx iova=%#llx", surf ? "import" : "new", (unsigned long long)handle,
+	    (unsigned long long)size, (unsigned long long)iova);
 	return 0;
+}
+
+static int
+gem_new(struct drm_msm_gem_new *req)
+{
+	uint64_t size = (req->size + 4095) & ~4095ull, handle = 0;
+	struct na_bo_alloc a = { size, 12, 0 };
+	kern_return_t kr;
+
+	if (size == 0)
+		return -EINVAL;
+	kr = na_call(NA_BO_ALLOC, &a, sizeof(a), &handle, sizeof(handle));
+	if (kr != KERN_SUCCESS)
+		return -io_errno(kr);
+	int r = bo_place(handle, size, NULL, NULL);
+	if (r == 0)
+		req->handle = (uint32_t)handle;
+	return r;
 }
 
 static int
@@ -347,7 +367,10 @@ gem_close(uint32_t handle)
 	else if (g_ndead < MAX_RANGES)
 		g_dead[g_ndead++] = (typeof(g_dead[0])){ b.iova, b.size, b.fence };
 	pthread_mutex_unlock(&g_lock);
-	return -io_errno(na_call(NA_BO_FREE, &f, sizeof(f), NULL, 0));
+	int r = -io_errno(na_call(NA_BO_FREE, &f, sizeof(f), NULL, 0));
+	if (b.surf)
+		CFRelease(b.surf);      /* the kernel unpinned its pages at BO_FREE */
+	return r;
 }
 
 static struct bo *
@@ -734,11 +757,22 @@ a9y_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
 
 	if (!is_ours(fd))
 		return mmap(addr, len, prot, flags, fd, off);
+	void *cpu = NULL;
 	pthread_mutex_lock(&g_lock);
 	struct bo *b = bo_get((uint32_t)off);
-	if (b)
+	if (b) {
 		token = b->token;
+		cpu = b->cpu;
+	}
+	if (cpu && g_nmaps < sizeof(g_maps) / sizeof(g_maps[0])) {
+		/* an imported IOSurface is already mapped: its own memory (token 0 = never unmapped here) */
+		g_maps[g_nmaps].addr = cpu;
+		g_maps[g_nmaps].token = 0;
+		g_nmaps++;
+	}
 	pthread_mutex_unlock(&g_lock);
+	if (cpu)
+		return cpu;
 	if (!b) {
 		errno = EINVAL;
 		return MAP_FAILED;
@@ -790,6 +824,8 @@ a9y_munmap(void *addr, size_t len)
 		}
 	}
 	pthread_mutex_unlock(&g_lock);
+	if (found && token == 0)
+		return 0;       /* an IOSurface's own memory */
 	if (found)
 		return IOConnectUnmapMemory64(g_conn, token, mach_task_self(), (mach_vm_address_t)(uintptr_t)addr) == KERN_SUCCESS ? 0 : -1;
 	return munmap(addr, len);
@@ -831,12 +867,65 @@ sweet_drm_info(int fd, struct sweet_gpu_info_abi *out)
 	return 0;               /* abi_minor 0: no IOSurface import */
 }
 
-/* IOSurface memory as a BO: not on the v2 client yet (BoImport pins a CPU range; IOSurfaces come later) */
+/* sweet_hw.c's struct sweet_gpu_surface_bo (Bergamota xnu/gpu-abi/sweet_adreno_abi.h, minor 2 layout) */
+struct sweet_gpu_surface_bo_abi {
+	uint32_t surface_id, handle;
+	uint64_t size, iova;
+	uint32_t offset, bytes_per_row, width, height, pixel_format, planes;
+	uint32_t flags, tiling, ubwc, reserved;
+	struct { uint32_t offset, stride, width, height; } plane[3];
+	uint64_t alias_addr, alias_size;
+};
+
+/* IOSurface `surface_id` as a BO: the kernel pins its pages, they get a GPU address; handle 0xffffffff only describes */
 EXPORT int
-sweet_drm_surface_bo(int fd, void *io)
+sweet_drm_surface_bo(int fd, struct sweet_gpu_surface_bo_abi *io)
 {
-	(void)fd; (void)io;
-	return -ENOSYS;
+	(void)fd;
+	if (!connect_once())
+		return -ENODEV;
+	IOSurfaceRef s = IOSurfaceLookup(io->surface_id);
+	if (!s)
+		return -ENOENT;
+	uintptr_t base = (uintptr_t)IOSurfaceGetBaseAddress(s);
+	size_t alloc = IOSurfaceGetAllocSize(s);
+	uint64_t bytes = (alloc + 4095) & ~4095ull;
+	io->offset = 0;
+	io->bytes_per_row = (uint32_t)IOSurfaceGetBytesPerRow(s);
+	io->width = (uint32_t)IOSurfaceGetWidth(s);
+	io->height = (uint32_t)IOSurfaceGetHeight(s);
+	io->pixel_format = IOSurfaceGetPixelFormat(s);
+	io->planes = (uint32_t)IOSurfaceGetPlaneCount(s);
+	io->flags = io->tiling = io->ubwc = 0;
+	io->size = bytes;
+	if (io->handle == 0xffffffffu) {
+		CFRelease(s);
+		return 0;
+	}
+	if ((base & 4095) || bytes == 0) {
+		trace("surface %u: base %#lx not page aligned", io->surface_id, (unsigned long)base);
+		CFRelease(s);
+		return -EINVAL;
+	}
+	struct { uint64_t address, bytes; } imp = { base, bytes };
+	uint64_t handle = 0;
+	kern_return_t kr = na_call(NA_BO_IMPORT, &imp, sizeof(imp), &handle, sizeof(handle));
+	if (kr != KERN_SUCCESS) {
+		CFRelease(s);
+		return -io_errno(kr);
+	}
+	int r = bo_place(handle, bytes, (void *)base, s);       /* keeps the reference on success */
+	if (r) {
+		CFRelease(s);
+		return r;
+	}
+	pthread_mutex_lock(&g_lock);
+	io->iova = g_bo[handle].iova;
+	pthread_mutex_unlock(&g_lock);
+	io->handle = (uint32_t)handle;
+	trace("surface %u: %ux%u bpr %u fmt %#x -> h=%u iova=%#llx", io->surface_id, io->width, io->height,
+	    io->bytes_per_row, io->pixel_format, io->handle, (unsigned long long)io->iova);
+	return 0;
 }
 
 EXPORT int
@@ -846,11 +935,29 @@ sweet_drm_gem_close(int fd, uint32_t handle)
 	return connect_once() ? gem_close(handle) : -ENODEV;
 }
 
-/* write-combined CPU mappings, uncached GPU mappings: nothing to clean or invalidate */
+/* Allocated BOs are write-combined for the CPU: nothing to do. An imported IOSurface is cacheable: clean and
+ * invalidate [offset, offset + size) (all of it for size 0), before the GPU reads it and after the GPU wrote it. */
 EXPORT int
 sweet_drm_bo_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size)
 {
-	(void)fd; (void)handle; (void)offset; (void)size;
+	(void)fd;
+	pthread_mutex_lock(&g_lock);
+	struct bo *b = bo_get(handle);
+	uintptr_t cpu = b ? (uintptr_t)b->cpu : 0;
+	uint64_t bytes = b ? b->size : 0;
+	pthread_mutex_unlock(&g_lock);
+	if (!b)
+		return -ENOENT;
+	if (!cpu)
+		return 0;
+	if (offset >= bytes)
+		return 0;
+	if (size == 0 || offset + size > bytes)
+		size = bytes - offset;
+	const uintptr_t line = 64;      /* Cortex-A53/A73 D-cache line (CTR_EL0 may trap: UCT is not known set) */
+	for (uintptr_t a = (cpu + offset) & ~(line - 1); a < cpu + offset + size; a += line)
+		__asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
+	__asm__ volatile("dsb sy" : : : "memory");
 	return 0;
 }
 
