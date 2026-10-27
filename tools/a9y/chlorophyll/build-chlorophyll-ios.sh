@@ -53,17 +53,28 @@ mkdir -p "$O"
 cp -f "$BLD/src/gallium/drivers/freedreno/libbgair.dylib" "$O/libbgair.dylib"
 xcrun strip -x "$O/libbgair.dylib"
 "${CC[@]}" "${OBJC[@]}" -I chl/air -c chl/src/bgmtl.m -o "$O/bgmtl.o"
-for probe in bgmtl_probe bgmtl_render_probe; do
+# the Metal probes, then CoreAnimation over the device in a test process (MTLAddDevice, CAMetalLayer drawables, CARenderer
+# against CA's CPU renderer, every fragment function of QuartzCore's own metallib): what backboardd will ask of it on iOS 16
+PROBES="bgmtl_probe bgmtl_render_probe bgmtl_adddev bgmtl_layer_probe bgmtl_carenderer_probe bgmtl_ca_probe"
+for probe in $PROBES; do
 	"${CC[@]}" "${OBJC[@]}" -I chl/air -c "chl/test/$probe.m" -o "$O/$probe.o"
 	"${CC[@]}" -o "$O/$probe" "$O/bgmtl.o" "$O/$probe.o" "$O/libbgair.dylib" "$WORK/out/libdrm.2.dylib" \
-		-framework Foundation -framework Metal -framework IOSurface -Wl,-rpath,@executable_path
+		-framework Foundation -framework Metal -framework IOSurface -framework QuartzCore -framework CoreGraphics \
+		-Wl,-rpath,@executable_path
 done
+# the injection dylib (inert unless armed, see chl/inject/bgmtl_inject.m), beside libbgair.dylib in /usr/local/chl
+"${CC[@]}" "${OBJC[@]}" -c chl/inject/bgmtl_inject.m -o "$O/bgmtl_inject.o"
+"${CC[@]}" -dynamiclib -o "$O/bgmtl-inject.dylib" "$O/bgmtl.o" "$O/bgmtl_inject.o" "$O/libbgair.dylib" "$WORK/out/libdrm.2.dylib" \
+	-framework Foundation -framework Metal -framework IOSurface -install_name /usr/local/chl/bgmtl-inject.dylib \
+	-Wl,-rpath,@loader_path
+# does dyld take DYLD_INSERT_LIBRARIES into a platform binary on this kernel? (a constructor that says where it runs)
+"${CC[@]}" -O1 -dynamiclib -o "$O/a9yhello.dylib" "$HERE/a9yhello.c" -install_name /usr/local/chl/a9yhello.dylib
 for k in bg_kernels bg_render; do
 	xcrun -sdk iphoneos metal -mios-version-min=$MIN -c "chl/test/$k.metal" -o "$O/$k.air"
 	xcrun -sdk iphoneos metallib "$O/$k.air" -o "$O/$k.metallib"
 done
 rm -f "$O"/*.o "$O"/*.air
-for f in "$O/libbgair.dylib" "$O/bgmtl_probe" "$O/bgmtl_render_probe"; do
+for f in "$O/libbgair.dylib" "$O/bgmtl-inject.dylib" "$O/a9yhello.dylib" $(for p in $PROBES; do echo "$O/$p"; done); do
 	codesign -f -s - "$f"
 	otool -L "$f"
 done

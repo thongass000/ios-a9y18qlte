@@ -4,6 +4,8 @@
  *
  *   cd DIR                  working directory for the next runs
  *   env NAME=VALUE          added to the environment of the next runs
+ *   clearenv                forget the env lines so far
+ *   timeout SECONDS         from the next run on, kill a run still going after that long (0: wait for ever)
  *   run PROGRAM [ARG...]    run it, wait for it (arguments split on spaces)
  *   # ...                   comment
  *
@@ -33,6 +35,9 @@ extern int pipe(int[2]);
 extern int chdir(const char *);
 extern int kill(pid_t, int);
 extern pid_t waitpid(pid_t, int *, int);
+extern long time(long *);
+struct pollfd { int fd; short events, revents; };
+extern int poll(struct pollfd *, unsigned int, int);
 extern int getpid(void);
 extern int *__error(void);
 extern char **environ;
@@ -49,6 +54,8 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, v
 
 #define O_RDONLY                        0
 #define SIGCONT                         19
+#define SIGKILL                         9
+#define POLLIN                          0x0001
 #define POSIX_SPAWN_START_SUSPENDED     0x0080
 #define MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES 7
 #define LIST                            "/usr/local/etc/a9yrun.txt"
@@ -69,6 +76,18 @@ static void say(const char *fmt, ...)
 		IOObjectRelease(o);
 }
 
+static int strncmp_(const char *a, const char *b, size_t n)
+{
+	for (; n && *a && *a == *b; n--, a++, b++)
+		;
+	return n ? *a - *b : 0;
+}
+
+static int strcmp_(const char *a, const char *b)
+{
+	return strncmp_(a, b, (size_t)-1);
+}
+
 static int limit(pid_t pid)
 {
 	struct { int32_t active; uint32_t active_attr; int32_t inactive; uint32_t inactive_attr; } lim = { 1024, 0, 1024, 0 };
@@ -77,6 +96,7 @@ static int limit(pid_t pid)
 
 static char *env[MAX_ENV + 1];
 static int nenv;
+static long timeout_s;
 
 static void run(char **argv)
 {
@@ -119,7 +139,19 @@ static void run(char **argv)
 	char buf[1024], line[280];
 	size_t len = 0;
 	ssize_t got;
-	while ((got = read(p[0], buf, sizeof(buf))) > 0) {
+	long deadline = timeout_s ? time(0) + timeout_s : 0;
+	for (;;) {
+		if (deadline) {
+			struct pollfd pf = { p[0], POLLIN, 0 };
+			long left = deadline - time(0);
+			if (left <= 0 || poll(&pf, 1, (int)left * 1000) == 0) {
+				say("run %s: still going after %ld s: killed", argv[0], timeout_s);
+				kill(pid, SIGKILL);
+				break;
+			}
+		}
+		if ((got = read(p[0], buf, sizeof(buf))) <= 0)
+			break;
 		for (ssize_t i = 0; i < got; i++) {
 			if (buf[i] == '\n' || len == sizeof(line) - 1) {
 				line[len] = 0;
@@ -172,6 +204,12 @@ int main(void)
 		} else if (l[0] == 'e' && l[1] == 'n' && l[2] == 'v' && l[3] == ' ') {
 			if (nenv < MAX_ENV)
 				env[nenv++] = l + 4;
+		} else if (!strcmp_(l, "clearenv")) {
+			nenv = 0;
+		} else if (!strncmp_(l, "timeout ", 8)) {
+			timeout_s = 0;
+			for (char *d = l + 8; *d >= '0' && *d <= '9'; d++)
+				timeout_s = timeout_s * 10 + (*d - '0');
 		} else if (l[0] == 'r' && l[1] == 'u' && l[2] == 'n' && l[3] == ' ') {
 			char *argv[MAX_ARGS + 1];
 			int argc = 0;
