@@ -1,11 +1,17 @@
 /*
  * a9ydrop: install files into the iOS root from inside iOS, so a test needs no HFS+ change from Linux.
  *
- * /usr/local/drop.bin is a file of fixed size and fixed blocks, made once (a9y-gputest-job.py --drop). Linux writes
- * an archive straight into its blocks on sda29 (tools/a9y/drop/push-drop.py); file size and place never change, so
- * that touches no HFS+ metadata. At boot launchd runs this program: if the archive's sequence number is new, every
- * file in it is written (temp file + rename) under /usr/local, then the sequence is kept in /usr/local/.a9ydrop-seq.
- * Then it runs /usr/local/bin/a9ygputest, if there is one, so the test always sees the files of this boot.
+ * /usr/local/drop.bin is a file of fixed size and fixed blocks. Linux writes an archive straight into its blocks on
+ * sda29 (tools/a9y/drop/push-drop.py); file size and place never change, so that touches no HFS+ metadata. At boot
+ * launchd runs this program: if the archive's sequence number is new, every file in it is written (temp file +
+ * rename) under /usr/local, then the sequence is kept in /usr/local/.a9ydrop-seq. Then it runs /usr/local/bin/a9ytest,
+ * if there is one, so the test always sees the files of this boot.
+ *
+ * It needs nothing from Linux but its own place: it is written over the data blocks of the boot job's binary
+ * (/usr/local/bin/a9ygputest, same size, padded: push-drop.py --raw). On the first boot it makes drop.bin itself
+ * (through HFS+, so the volume stays consistent) and logs drop.bin's blocks ("drop extent FILE_OFF DEV_OFF LEN",
+ * device offsets = offsets in the root image) for push-drop.py. It also raises its own jetsam limit, which the
+ * exec'd test keeps: launchd's default for this job killed Mesa (reason namespace 1, code 7).
  *
  * Archive (little endian, 8-byte aligned): "A9YDROP1", u64 seq, u32 nfiles, u32 0, u64 total bytes; per file
  * u32 path length, u32 mode, u64 size, the path (absolute, under /usr/local/, no "..") and the data, each padded to 8.
@@ -37,17 +43,30 @@ extern int access(const char *, int);
 extern void *malloc(size_t);
 extern void free(void *);
 extern int *__error(void);
+extern int fcntl(int, int, ...);
+extern int getpid(void);
+extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t buffersize);
 
 #define O_RDONLY        0x0000
 #define O_WRONLY        0x0001
+#define O_RDWR          0x0002
 #define O_CREAT         0x0200
 #define O_TRUNC         0x0400
+#define O_EXCL          0x0800
 #define X_OK            1
+#define F_PREALLOCATE   42
+#define F_LOG2PHYS_EXT  65
+#define F_ALLOCATECONTIG 0x2
+#define F_ALLOCATEALL   0x4
+#define F_PEOFPOSMODE   3
+#define MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES 7     /* what launchd uses; A9Y18QLTE has no CONFIG_JETSAM, so 6 is EINVAL */
 
 #define DROP            "/usr/local/drop.bin"
+#define DROP_SIZE       (64u << 20)
 #define SEQ_FILE        "/usr/local/.a9ydrop-seq"
-#define TEST            "/usr/local/bin/a9ygputest"
+#define TEST            "/usr/local/bin/a9ytest"
 #define PREFIX          "/usr/local/"
+#define JETSAM_MB       1024
 
 static void say(const char *fmt, ...)
 {
@@ -159,11 +178,70 @@ static int install(int fd, uint64_t total, uint32_t nfiles)
 	return bad ? -1 : 0;
 }
 
+/* where drop.bin's bytes are on the root device, for push-drop.py */
+static void log_extents(int fd)
+{
+	struct { uint32_t flags; off_t contig, devoff; } __attribute__((packed)) l2p;
+	uint64_t off = 0;
+	while (off < DROP_SIZE) {
+		l2p.flags = 0;
+		l2p.contig = (off_t)(DROP_SIZE - off);
+		l2p.devoff = (off_t)off;
+		if (fcntl(fd, F_LOG2PHYS_EXT, &l2p) || l2p.contig <= 0) {
+			say("drop extent lookup failed at %llu (errno %d)", (unsigned long long)off, *__error());
+			return;
+		}
+		say("drop extent 0x%llx 0x%llx 0x%llx", (unsigned long long)off, (unsigned long long)l2p.devoff,
+		    (unsigned long long)l2p.contig);
+		off += (uint64_t)l2p.contig;
+	}
+}
+
+/* drop.bin: 64 MiB of real zeros (every block allocated, contiguous if HFS+ can), then its extents */
+static void make_drop(void)
+{
+	struct { uint32_t flags; int posmode; off_t offset, length, bytesalloc; } fst = {
+		F_ALLOCATECONTIG | F_ALLOCATEALL, F_PEOFPOSMODE, 0, DROP_SIZE, 0 };
+	char *zero = malloc(1 << 20);
+	int fd = open(DROP, O_RDWR | O_CREAT | O_EXCL, 0644), ok = fd >= 0 && zero;
+
+	if (ok && fcntl(fd, F_PREALLOCATE, &fst)) {
+		fst.flags = F_ALLOCATEALL;      /* not in one piece: still all of it */
+		fcntl(fd, F_PREALLOCATE, &fst);
+	}
+	for (unsigned i = 0; i < 1 << 20 && zero; i++)
+		zero[i] = 0;
+	for (unsigned i = 0; ok && i < DROP_SIZE >> 20; i++)
+		ok = write(fd, zero, 1 << 20) == 1 << 20;
+	if (ok)
+		ok = fsync(fd) == 0;
+	if (ok) {
+		say("made %s (64 MiB)", DROP);
+		log_extents(fd);
+	} else {
+		say("could not make %s (errno %d)", DROP, *__error());
+		unlink(DROP);
+	}
+	if (fd >= 0)
+		close(fd);
+	free(zero);
+}
+
 int main(void)
 {
 	struct { char magic[8]; uint64_t seq; uint32_t nfiles, zero; uint64_t total; } hd;
 	uint64_t last = 0;
+
+	/* active and inactive limits, attributes 0: not fatal (going over only warns) */
+	struct { int32_t active; uint32_t active_attr; int32_t inactive; uint32_t inactive_attr; } lim = {
+		JETSAM_MB, 0, JETSAM_MB, 0 };
+	int r = memorystatus_control(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES, getpid(), 0, &lim, sizeof(lim));
+	say("memory limit %u MB, not fatal: %s (errno %d)", JETSAM_MB, r ? "refused" : "set", r ? *__error() : 0);
+	if (access(DROP, 0) != 0)
+		make_drop();
 	int fd = open(DROP, O_RDONLY);
+	if (fd >= 0)
+		log_extents(fd);
 
 	if (fd < 0 || rd(fd, &hd, sizeof(hd), 0)) {
 		say("no %s", DROP);

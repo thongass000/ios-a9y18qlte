@@ -3,6 +3,10 @@
 blocks of /usr/local/drop.bin on /dev/block/sda29. a9ydrop unpacks it at the next XNU boot (see a9ydrop.c).
 
   push-drop.py DROP_EXTENTS ROOT_EXTENTS /usr/local/PATH=LOCAL_FILE [...]
+  push-drop.py --raw FILE_EXTENTS ROOT_EXTENTS NEW_FILE OLD_FILE
+
+--raw puts NEW_FILE, zero-padded, over the blocks of an existing file of the same size whose contents are
+OLD_FILE (checked on the phone first): how a9ydrop takes the place of the boot job's binary (see a9ydrop.c).
 
 DROP_EXTENTS: drop.bin's blocks inside the root image, "0xOFFSET 0xLENGTH" per line in bytes, from
 `filefrag -v -b4096` on the mounted image (tools/a9y/drop/drop-extents.sh). ROOT_EXTENTS: tools/fiemap's
@@ -60,23 +64,35 @@ def archive(pairs):
 
 
 def main():
-    if len(sys.argv) < 4:
+    raw = sys.argv[1:2] == ['--raw']
+    args = sys.argv[2:] if raw else sys.argv[1:]
+    if len(args) < 3 or (raw and len(args) != 4):
         sys.exit(__doc__)
-    drop_ext, root_ext = sys.argv[1], sys.argv[2]
-    pairs = []
-    for a in sys.argv[3:]:
-        dest, _, src = a.partition('=')
-        if not dest.startswith('/usr/local/') or '..' in dest or not os.path.isfile(src):
-            sys.exit(f'bad file spec {a}: /usr/local/PATH=LOCAL_FILE')
-        pairs.append((dest, src))
-    data, seq = archive(pairs)
-    if len(data) > DROP_SIZE:
-        sys.exit(f'archive {len(data)} bytes is more than drop.bin ({DROP_SIZE})')
-    data += bytes(-len(data) % BLOCK)
-
+    drop_ext, root_ext = args[0], args[1]
     drop = [tuple(int(x, 16) for x in l.split()[:2]) for l in open(drop_ext) if l.startswith('0x')]
-    if sum(n for _, n in drop) != DROP_SIZE:
-        sys.exit('DROP_EXTENTS does not cover the 64 MiB of drop.bin')
+    room = sum(n for _, n in drop)
+    old = None
+    if raw:
+        data, old = open(args[2], 'rb').read(), open(args[3], 'rb').read()
+        if len(data) > len(old) or not len(old) <= room < len(old) + BLOCK:
+            sys.exit(f'new {len(data)} / old {len(old)} bytes do not fit the {room} bytes of FILE_EXTENTS')
+        data += bytes(len(old) - len(data))        # the file keeps its size: trailing zeros
+        old += bytes(-len(old) % BLOCK)
+        seq, what = None, f'{args[2]} over {args[3]}'
+    else:
+        pairs = []
+        for a in args[2:]:
+            dest, _, src = a.partition('=')
+            if not dest.startswith('/usr/local/') or '..' in dest or not os.path.isfile(src):
+                sys.exit(f'bad file spec {a}: /usr/local/PATH=LOCAL_FILE')
+            pairs.append((dest, src))
+        data, seq = archive(pairs)
+        if room != DROP_SIZE:
+            sys.exit('DROP_EXTENTS does not cover the 64 MiB of drop.bin')
+        if len(data) > DROP_SIZE:
+            sys.exit(f'archive {len(data)} bytes is more than drop.bin ({DROP_SIZE})')
+        what = f'archive seq {seq}: {len(pairs)} files'
+    data += bytes(-len(data) % BLOCK)
     want = runs_of(open(root_ext).read())
     if runs_of(shell(f'{FIEMAP} {ROOT_FILE}')) != want:
         sys.exit('the root file\'s extents changed since ROOT_EXTENTS')
@@ -98,11 +114,17 @@ def main():
                     break
             else:
                 sys.exit(f'image offset {a:#x} is outside the root file')
+    if old is not None:     # the blocks must hold OLD_FILE now, or the map is not that file's
+        for src, poff, n in work:
+            got = shell(f'dd if={PART} bs={BLOCK} skip={poff // BLOCK} count={n // BLOCK} 2>/dev/null | md5sum').split()[0]
+            if got != hashlib.md5(old[src:src + n]).hexdigest():
+                sys.exit(f'{PART} {poff:#x} does not hold the old file: refusing')
+        print('the phone holds the old file at those blocks', flush=True)
     with open(LOCAL_TMP, 'wb') as f:
         f.write(data)
     if subprocess.run(['adb', 'push', LOCAL_TMP, PHONE_TMP], capture_output=True).returncode:
         sys.exit('adb push failed')
-    print(f'archive seq {seq}: {len(pairs)} files, {len(data) >> 10} KiB in {len(work)} ranges', flush=True)
+    print(f'{what}, {len(data) >> 10} KiB in {len(work)} ranges', flush=True)
     for i, (src, poff, n) in enumerate(work):
         assert src % BLOCK == 0 and poff % BLOCK == 0 and n % BLOCK == 0
         shell(f'dd if={PHONE_TMP} of={PART} bs={BLOCK} skip={src // BLOCK} seek={poff // BLOCK} '
