@@ -6,7 +6,7 @@
     case MSM_INFO_GET_IOVA:
 -      args->value = bo->mem_addr;
 +      /* a9y18qlte: the first SweetAccelerator v2 window, so a replay maps 1:1 */
-+      args->value = 0x400000000ull + bo->mem_addr;
++      args->value = 0x1000000000ull + bo->mem_addr;
        break;
     case MSM_INFO_SET_IOVA:
     case MSM_INFO_SET_NAME:

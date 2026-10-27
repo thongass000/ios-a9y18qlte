@@ -3,7 +3,7 @@
  *
  * capture.h comes from a host run of Mesa's GLES driver as FD512 under the noop drm-shim (tri.c: clear + one RGB
  * triangle into a 64x64 RGBA8 FBO), dumped with FD_RD_DUMP=full and turned into C by rd2c.py. The shim hands out
- * GPU addresses inside the first v2 window (0x4_0000_0000 on a9y18qlte), so every buffer is mapped at its captured address and
+ * GPU addresses inside the first v2 window (0x10_0000_0000), so every buffer is mapped at its captured address and
  * the command stream runs unchanged. Afterwards the render target is read back: clear colour outside, the
  * interpolated triangle inside.
  */

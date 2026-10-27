@@ -2,7 +2,7 @@
 
 Mesa 25.0.7 (archive.mesa3d.org tarball) with `mesa-25.0.7-noop-a512.patch`: the noop drm-shim learns the
 A512 (chip 0x05010200) and hands out GPU addresses inside the phone's first SweetAccelerator v2 window
-(0x4_0000_0000), so the capture replays without relocation.
+(0x10_0000_0000), so the capture replays without relocation.
 
 ```sh
 meson setup build -Dgallium-drivers=freedreno -Dvulkan-drivers= -Dplatforms= -Degl=enabled -Dgbm=disabled \
