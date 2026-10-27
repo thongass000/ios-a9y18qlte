@@ -37,6 +37,7 @@ extern char **environ;
 #define INJECT          "/usr/local/chl/bgmtl-inject.dylib"
 #define STATE           "/private/var/tmp/bgmtl-bb.state"
 #define TRIES           "/private/var/tmp/a9ybb.tries"
+#define ENV_FILE        "/usr/local/etc/a9ybb.env"
 #define MAX_TRIES       2
 #define MAX_ENV         256
 
@@ -112,10 +113,20 @@ int main(int argc, char **argv)
 	if (armed() && another_try()) {
 		static char insert[] = "DYLD_INSERT_LIBRARIES=" INJECT;
 		static char bb[] = "BGMTL_BB=1";
-		char *envp[MAX_ENV + 3];
+		/* A/B switches that come with the drop file (/private/var/tmp is out of its reach): one line of
+		 * NAME=VALUE in /usr/local/etc/a9ybb.env, e.g. FD_MESA_DEBUG=sysmem */
+		static char extra[256];
+		char *envp[MAX_ENV + 4];
 		int n = 0;
 		envp[n++] = insert;
 		envp[n++] = bb;
+		if (slurp(ENV_FILE, extra, sizeof(extra)) > 2) {
+			for (char *p = extra; *p; p++)
+				if (*p == '\n' || *p == '\r')
+					*p = 0;
+			if (extra[0] && extra[0] != '#')
+				envp[n++] = extra;
+		}
 		for (char **e = environ; *e && n < MAX_ENV; e++)
 			envp[n++] = *e;
 		envp[n] = 0;

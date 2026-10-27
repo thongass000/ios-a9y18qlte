@@ -1,0 +1,87 @@
+a9y18qlte: Chlorophyll: 16-bit colour outputs as 32-bit before a6xx
+
+backboardd on Chlorophyll drew nothing into its framebuffers: after every frame the trace's samples
+of both colour attachments were (0,0,0,0), even under an opaque black quad. Its draws use
+CoreAnimation's half-colour fragment shaders (fixed_frag_lph_cph); the same scenes through CARenderer
+in a test process use the float-colour variant (fixed_frag_lph_cpf) and come out right. Mesa only
+makes 16-bit outputs on gen >= 6 (ir3_nir.c lowers mediump I/O there), so fd5's half-precision output
+registers are a path nothing else exercises. Before a6xx each 16-bit colour store_output is widened
+(f2f32 / i2i32 / u2u32) after nir_lower_io, and the variables with it.
+
+Assisted-by: LLM
+
+diff --git a/air/air_metal.c b/air/air_metal.c
+index 9c75b12..07c4dfc 100644
+--- a/air/air_metal.c
++++ b/air/air_metal.c
+@@ -5656,6 +5656,61 @@ struct rwa_render {
+  * it may or may not have taken it, and neither driver in this build reaches this (both
+  * return a state object and report a bad shader later, at the draw).
+  */
++/* a9y18qlte: an Adreno before a6xx (freedreno's name "FD5xx" and below). */
++static bool
++pre_a6xx(struct rwa_device *device)
++{
++   const char *name = device->screen->get_name(device->screen);
++   unsigned chip;
++   return name && sscanf(name, "FD%u", &chip) == 1 && chip < 600;
++}
++
++/* a9y18qlte: colour outputs written as 16-bit become 32-bit before a6xx. Mesa makes 16-bit outputs only for gen >= 6
++ * (ir3_nir.c lowers mediump I/O there), so fd5's half-precision output registers are a path nothing exercises, and
++ * through it CoreAnimation's half-colour shaders (fixed_frag_*_cph) drew nothing: backboardd's frames stayed (0,0,0,0)
++ * while the same scenes in the float-colour variant (_cpf, CARenderer in a test process) were right. After
++ * nir_lower_io: each store_output of a colour gets its value widened and its type 32-bit; so do the variables. */
++static void
++widen_fs_outputs(nir_shader *nir)
++{
++   nir_foreach_function_impl(impl, nir) {
++      nir_builder b = nir_builder_create(impl);
++      bool progress = false;
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr_safe(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
++            if (in->intrinsic != nir_intrinsic_store_output || in->src[0].ssa->bit_size != 16)
++               continue;
++            nir_io_semantics sem = nir_intrinsic_io_semantics(in);
++            if (sem.location < FRAG_RESULT_DATA0)
++               continue;
++            nir_alu_type base = nir_alu_type_get_base_type(nir_intrinsic_src_type(in));
++            b.cursor = nir_before_instr(instr);
++            nir_def *v = in->src[0].ssa;
++            nir_def *w = base == nir_type_float ? nir_f2f32(&b, v) : base == nir_type_int ? nir_i2i32(&b, v)
++                                                                                         : nir_u2u32(&b, v);
++            nir_src_rewrite(&in->src[0], w);
++            nir_intrinsic_set_src_type(in, (nir_alu_type)(base | 32));
++            sem.medium_precision = 0;
++            nir_intrinsic_set_io_semantics(in, sem);
++            progress = true;
++         }
++      }
++      nir_metadata_preserve(impl, progress ? nir_metadata_control_flow : nir_metadata_all);
++   }
++   nir_foreach_shader_out_variable(var, nir) {
++      if (var->data.location < FRAG_RESULT_DATA0 || !glsl_type_is_vector_or_scalar(var->type))
++         continue;
++      enum glsl_base_type t = glsl_get_base_type(var->type);
++      enum glsl_base_type w = t == GLSL_TYPE_FLOAT16 ? GLSL_TYPE_FLOAT : t == GLSL_TYPE_INT16 ? GLSL_TYPE_INT
++                              : t == GLSL_TYPE_UINT16 ? GLSL_TYPE_UINT : t;
++      if (w != t)
++         var->type = glsl_vector_type(w, glsl_get_vector_elements(var->type));
++   }
++}
++
+ static void *
+ make_stage_cso(struct rwa_device *device, nir_shader *nir, char *why, size_t why_size)
+ {
+@@ -5665,6 +5720,8 @@ make_stage_cso(struct rwa_device *device, nir_shader *nir, char *why, size_t why
+       return NULL;
+    }
+    finalize_for_gallium(clone, device->screen);
++   if (clone->info.stage == MESA_SHADER_FRAGMENT && pre_a6xx(device))
++      widen_fs_outputs(clone);
+ 
+    struct pipe_shader_state templ = { .type = PIPE_SHADER_IR_NIR, .ir.nir = clone };
+    struct pipe_context *pipe = device->pipe;
