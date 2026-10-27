@@ -26,7 +26,7 @@ if [ ! -d chl ]; then
 	git -C chl apply "$HERE/a9y-ios16-xr10-srgb.patch"    # iOS 16: CA's deep-colour pipelines in format 551 too
 	git -C chl apply "$HERE/a9y-fs-half-outputs.patch"    # A5xx: 16-bit colour outputs drew nothing
 	git -C chl apply "$HERE/a9y-probe-carenderer-target.patch" # CARenderer probe: target size / IOSurface
-	git -C chl apply "$HERE/a9y-no-16bit-alu.patch"       # A5xx: half-precision shaders came out wrong
+	git -C chl apply "$HERE/a9y-fbfetch-pre-a6xx.patch"   # A5xx: no framebuffer fetch in freedreno (luma_boost: black)
 fi
 if [ ! -d mesa-air ]; then
 	mkdir -p air-src && tar -C air-src -xf mesa.tar.xz && mv air-src/mesa-* mesa-air && rmdir air-src

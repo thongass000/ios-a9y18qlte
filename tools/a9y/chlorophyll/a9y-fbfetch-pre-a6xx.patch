@@ -1,0 +1,168 @@
+a9y18qlte: Chlorophyll: framebuffer fetch before a6xx, as a texelFetch of the attachment
+
+freedreno advertises fbfetch only on a6xx: ir3 compiles a [[color(n)]] read into a read of a texture
+slot that only fd6 fills with the render target (patch_fb_read_sysmem in fd6_gmem.cc). On the A512
+nothing is bound there and every fetch read zero. CoreAnimation's luma_boost_lph is a full-screen pass
+that rewrites the frame from what it fetches, so every frame of backboardd's came out (0,0,0,0)
+(214 of 214 traced frames with it; frames without it had content; the kernel showed the GPU writing
+the very pages the panel copies). The rounded-corner clips fetch too.
+
+Before a6xx each fetch (load_output with fb_fetch_output, after nir_lower_io) becomes a texelFetch at
+the fragment's pixel from texture slot 15 - n, and rwa_render_draw binds colour attachment n there
+(bind_stage). Such draws already render in sysmem behind a texture barrier, so the texture path reads
+what the draws before them wrote.
+
+Assisted-by: LLM
+
+diff --git a/air/air_metal.c b/air/air_metal.c
+index 07c4dfc..3e60677 100644
+--- a/air/air_metal.c
++++ b/air/air_metal.c
+@@ -133,8 +133,17 @@ struct rwa_device {
+    struct pipe_sampler_view *bound_views[PIPE_SHADER_TYPES][RWA_MAX_TEXTURES];
+    void *bound_samplers[PIPE_SHADER_TYPES][RWA_MAX_TEXTURES];
+    unsigned n_bound_views[PIPE_SHADER_TYPES], n_bound_samplers[PIPE_SHADER_TYPES];
++
++   /* a9y18qlte: framebuffer fetch before a6xx (lower_fbfetch_pre_a6xx): the colour attachments the next fragment
++    * stage fetches, set by rwa_render_draw for bind_stage to put at A9Y_FETCH_SLOT(n) */
++   unsigned fetch_mask;
++   struct pipe_sampler_view *fetch_view[8];
+ };
+ 
++/* a9y18qlte: the texture slot a fetch of colour attachment n reads before a6xx (from the top: QuartzCore's shaders use
++ * at most 10 of the 16) */
++#define A9Y_FETCH_SLOT(n) (RWA_MAX_TEXTURES - 1 - (n))
++
+ /* Unbind every stage's views and samplers if `p` (a sampler view or a sampler state) is among them, before it is freed. */
+ static void
+ unbind_tex_state(struct rwa_device *device, const void *p)
+@@ -4227,6 +4236,22 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
+       }
+    }
+ 
++   /* a9y18qlte: the colour attachments a fragment stage fetches, as textures (lower_fbfetch_pre_a6xx) */
++   if (stage == PIPE_SHADER_FRAGMENT && device->fetch_mask) {
++      for (unsigned n = 0; n < 8; n++) {
++         if (!(device->fetch_mask & (1u << n)))
++            continue;
++         unsigned slot = A9Y_FETCH_SLOT(n);
++         if (views[slot] && views[slot] != device->fetch_view[n]) {
++            say(why, why_size, "%s fetches colour attachment %u, read through texture %u, which it also binds",
++                name, n, slot);
++            return -1;
++         }
++         views[slot] = device->fetch_view[n];
++         num_views = MAX2(num_views, slot + 1);
++      }
++   }
++
+    /* softpipe: one unit for a texture and its sampler (see lower_tex_unit_cb): the sampler a texture is sampled with goes at the texture's index */
+    if (device->software) {
+       void *orig[RWA_MAX_TEXTURES];
+@@ -5711,6 +5736,63 @@ widen_fs_outputs(nir_shader *nir)
+    }
+ }
+ 
++/* a9y18qlte: framebuffer fetch before a6xx. freedreno advertises fbfetch only on a6xx: ir3 turns a fetch into a read
++ * of a texture slot that only fd6 fills with the render target (patch_fb_read_sysmem), so on the A512 every
++ * [[color(n)]] read was zero -- and CoreAnimation's luma_boost, a full-screen pass that rewrites the frame from what
++ * it fetches, left every frame of backboardd's (0,0,0,0). Here each fetch (load_output with fb_fetch_output, after
++ * nir_lower_io) becomes a texelFetch of colour attachment n at the fragment's own pixel, from A9Y_FETCH_SLOT(n),
++ * where rwa_render_draw binds that attachment; the draw is in sysmem behind a texture barrier already. */
++static void
++lower_fbfetch_pre_a6xx(nir_shader *nir)
++{
++   if (!nir->info.fs.uses_fbfetch_output)
++      return;
++   nir_foreach_function_impl(impl, nir) {
++      nir_builder b = nir_builder_create(impl);
++      bool progress = false;
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr_safe(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
++            if (in->intrinsic != nir_intrinsic_load_output)
++               continue;
++            nir_io_semantics sem = nir_intrinsic_io_semantics(in);
++            if (!sem.fb_fetch_output || sem.location < FRAG_RESULT_DATA0 || sem.location >= FRAG_RESULT_DATA0 + 8)
++               continue;
++            unsigned slot = A9Y_FETCH_SLOT(sem.location - FRAG_RESULT_DATA0);
++            nir_alu_type base = nir_alu_type_get_base_type(nir_intrinsic_dest_type(in));
++            b.cursor = nir_before_instr(instr);
++            nir_def *xy = nir_f2i32(&b, nir_channels(&b, nir_load_frag_coord(&b), 0x3));
++            nir_tex_instr *tex = nir_tex_instr_create(b.shader, 2);
++            tex->op = nir_texop_txf;
++            tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
++            tex->dest_type = (nir_alu_type)(base | 32);
++            tex->coord_components = 2;
++            tex->texture_index = slot;
++            tex->sampler_index = slot;
++            tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, xy);
++            tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(&b, 0));
++            nir_def_init(&tex->instr, &tex->def, 4, 32);
++            nir_builder_instr_insert(&b, &tex->instr);
++            unsigned comp = nir_intrinsic_component(in), n = in->def.num_components;
++            nir_def *v = nir_channels(&b, &tex->def, BITFIELD_MASK(n) << comp);
++            if (in->def.bit_size == 16)
++               v = base == nir_type_float ? nir_f2f16(&b, v) : base == nir_type_int ? nir_i2i16(&b, v) : nir_u2u16(&b, v);
++            nir_def_rewrite_uses(&in->def, v);
++            nir_instr_remove(instr);
++            BITSET_SET(nir->info.textures_used, slot);
++            BITSET_SET(nir->info.textures_used_by_txf, slot);
++            nir->info.num_textures = MAX2(nir->info.num_textures, slot + 1);
++            progress = true;
++         }
++      }
++      nir_metadata_preserve(impl, progress ? nir_metadata_control_flow : nir_metadata_all);
++   }
++   BITSET_SET(nir->info.system_values_read, SYSTEM_VALUE_FRAG_COORD);
++   nir->info.fs.uses_fbfetch_output = false;
++}
++
+ static void *
+ make_stage_cso(struct rwa_device *device, nir_shader *nir, char *why, size_t why_size)
+ {
+@@ -5720,8 +5802,10 @@ make_stage_cso(struct rwa_device *device, nir_shader *nir, char *why, size_t why
+       return NULL;
+    }
+    finalize_for_gallium(clone, device->screen);
+-   if (clone->info.stage == MESA_SHADER_FRAGMENT && pre_a6xx(device))
++   if (clone->info.stage == MESA_SHADER_FRAGMENT && pre_a6xx(device)) {
++      lower_fbfetch_pre_a6xx(clone);
+       widen_fs_outputs(clone);
++   }
+ 
+    struct pipe_shader_state templ = { .type = PIPE_SHADER_IR_NIR, .ir.nir = clone };
+    struct pipe_context *pipe = device->pipe;
+@@ -7731,6 +7815,30 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+    if (render->finfo.fbfetch_targets && &fd_mesa_debug)
+       fd_mesa_debug |= (1 << 9);
+ 
++   /* a9y18qlte: before a6xx freedreno has no framebuffer fetch (fbfetch is is_a6xx only: ir3 reads a slot only
++    * fd6_gmem patches), so lower_fbfetch_pre_a6xx made each fetch a texelFetch of A9Y_FETCH_SLOT(n); the attachments go
++    * there (bind_stage), read through the texture path after the sysmem switch above and the barrier below. */
++   device->fetch_mask = 0;
++   if (render->finfo.fbfetch_targets && pre_a6xx(device)) {
++      for (unsigned n = 0; n < 8 && n < draw->color_count; n++) {
++         struct rwa_texture *t = draw->color[n];
++         if (!(render->finfo.fbfetch_targets & (1u << n)) || !t)
++            continue;
++         if (!t->view) {
++            struct pipe_sampler_view tmpl = { 0 };
++            u_sampler_view_default_template(&tmpl, t->res, t->res->format);
++            t->view = pipe->create_sampler_view(pipe, t->res, &tmpl);
++         }
++         if (!t->view) {
++            say(why, why_size, "%s would not make a sampler view of colour attachment %u to fetch from",
++                rwa_device_name(device), n);
++            return -1;
++         }
++         device->fetch_view[n] = t->view;
++         device->fetch_mask |= 1u << n;
++      }
++   }
++
+    fb_bind(device, &fb, draw->color, draw->color_count, draw->depth);
+ 
+    /* Chlorophyll: Metal's framebuffer fetch is coherent -- a fetching draw sees what the draws before it in the pass wrote.
