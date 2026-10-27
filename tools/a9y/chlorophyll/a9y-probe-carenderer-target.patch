@@ -9,7 +9,7 @@ written only up to 256x256.
 Assisted-by: LLM
 
 diff --git a/test/bgmtl_carenderer_probe.m b/test/bgmtl_carenderer_probe.m
-index cfdd0f4..51740f3 100644
+index cfdd0f4..9f9abc5 100644
 --- a/test/bgmtl_carenderer_probe.m
 +++ b/test/bgmtl_carenderer_probe.m
 @@ -9,6 +9,7 @@
@@ -20,20 +20,21 @@ index cfdd0f4..51740f3 100644
  #include <dlfcn.h>
  #include "../src/a9y_devices.h"
  #include <stdio.h>
-@@ -16,8 +17,10 @@
+@@ -16,8 +17,11 @@
  #include <string.h>
  
  extern id bgmtl_create_device(void);
 -#define W 256
 -#define H 256
 +/* a9y18qlte: the target backboardd draws into is 1125x2436 and an IOSurface's; BG_CAR_W / BG_CAR_H set the size and
-+ * BG_CAR_IOSURFACE=1 makes the texture over an IOSurface (bytes per row aligned to 64), to tell which of the two
++ * BG_CAR_IOSURFACE=1 makes the texture over an IOSurface (rows of 256-byte multiples: 4608 for 1125 px, as
++ * backboardd's framebuffers, the pitch freedreno lays out; 4544 was refused), to tell which of the two
 + * leaves CoreAnimation's frames empty on the A512 */
 +static int W = 256, H = 256;
  
  static CALayer *
  make_scene(int n)
-@@ -148,6 +151,10 @@ main(int argc, char **argv)
+@@ -148,6 +152,10 @@ main(int argc, char **argv)
        setvbuf(stdout, NULL, _IONBF, 0);
        if (argc < 2) { printf("usage: bgmtl_carenderer_probe OUTDIR [scene]\n"); return 2; }
        int only = argc > 2 ? atoi(argv[2]) : -1;
@@ -44,7 +45,7 @@ index cfdd0f4..51740f3 100644
        void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");
        if (!add) { printf("no Metal registration entry points\n"); return 2; }
        printf("devices before: %lu\n", (unsigned long)[a9y_mtl_devices() count]);
-@@ -196,7 +203,18 @@ main(int argc, char **argv)
+@@ -196,7 +204,18 @@ main(int argc, char **argv)
           // the subject: CARenderer over a texture of the BGMTL device
           MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:W height:H mipmapped:NO];
           td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
@@ -52,7 +53,7 @@ index cfdd0f4..51740f3 100644
 +         id<MTLTexture> tex = nil;
 +         if (use_surface) {
 +            NSDictionary *props = @{ (id)kIOSurfaceWidth : @(W), (id)kIOSurfaceHeight : @(H), (id)kIOSurfaceBytesPerElement : @4,
-+                                     (id)kIOSurfaceBytesPerRow : @((W * 4 + 63) & ~63), (id)kIOSurfacePixelFormat : @(0x42475241) };
++                                     (id)kIOSurfaceBytesPerRow : @((W * 4 + 255) & ~255), (id)kIOSurfacePixelFormat : @(0x42475241) };
 +            IOSurfaceRef s = IOSurfaceCreate((CFDictionaryRef)props);
 +            if (!s) { printf("scene %d: no IOSurface\n", n); bad++; continue; }
 +            td.storageMode = MTLStorageModeShared;
@@ -64,7 +65,7 @@ index cfdd0f4..51740f3 100644
           id<MTLCommandQueue> q = [d newCommandQueue];
           CARenderer *r = [CARenderer rendererWithMTLTexture:tex options:@{ kCARendererMetalCommandQueue : q }];
           if (!r) { printf("scene %d: CARenderer refused the texture\n", n); bad++; continue; }
-@@ -223,8 +241,10 @@ main(int argc, char **argv)
+@@ -223,8 +242,10 @@ main(int argc, char **argv)
           for (int i = 0; i < W * H * 4; i++) { sum += abs((int)out[i] - (int)ref[i]); if (out[i]) nonzero++; }
           printf("scene %d: mean abs diff %.2f over %d channels, %u non-zero bytes rendered\n", n, sum / (W * H * 4), W * H * 4, nonzero);
           char p[600];
