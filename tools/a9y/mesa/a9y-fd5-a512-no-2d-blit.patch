@@ -1,0 +1,14 @@
+a9y18qlte: no fd5 2D blitter on the A512
+
+CP_BLIT copies and fills run but write nothing on the A512 (seen under
+kgsl during bring-up, and again for a linear RGBA -> BGRX IOSurface blit
+on the phone), so blits go through u_blitter's draws there, as with
+FD_MESA_DEBUG=noblit.
+
+--- a/src/gallium/drivers/freedreno/a5xx/fd5_context.c
++++ b/src/gallium/drivers/freedreno/a5xx/fd5_context.c
+@@ -73,3 +73,3 @@
+
+-   if (!FD_DBG(NOBLIT))
++   if (!FD_DBG(NOBLIT) && screen->gpu_id != 512)
+       fd5_ctx->base.blit = fd5_blitter_blit;

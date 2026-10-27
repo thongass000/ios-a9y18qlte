@@ -342,17 +342,16 @@ int main(int argc, char **argv)
 	}
 	setenv("SWEET_GPU_DEBUG", "1", 0);
 	setenv("A9Y_DRM_TRACE", "1", 0);
-	/* fd5's 2D blitter (CP_BLIT) writes nothing on the A512 (seen under kgsl too): blits go through the 3D pipe */
-	setenv("FD_MESA_DEBUG", "noblit", 0);
+	/* no FD_MESA_DEBUG=noblit any more: a9y-fd5-a512-no-2d-blit.patch keeps fd5's 2D blitter off the A512 */
 
 	/* a fresh process of this binary (posix_spawn: no fork without exec, CoreFoundation forbids it) */
 	int ref_ok = 0, status = 0;
 	pid_t pid;
 	char *child_argv[] = { argv[0], "--sysmem", NULL };
 	unlink(REF_FILE);
-	setenv("FD_MESA_DEBUG", "sysmem,noblit", 1);
+	setenv("FD_MESA_DEBUG", "sysmem", 1);
 	int sr = posix_spawn(&pid, argv[0], NULL, NULL, child_argv, environ);
-	setenv("FD_MESA_DEBUG", "noblit", 1);
+	unsetenv("FD_MESA_DEBUG");
 	if (sr == 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
 		FILE *f = fopen(REF_FILE, "rb");
 		ref_ok = f && fread(ref, 1, sizeof(ref), f) == sizeof(ref);

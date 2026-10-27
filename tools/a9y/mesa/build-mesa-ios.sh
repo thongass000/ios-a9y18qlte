@@ -22,6 +22,7 @@ if [ ! -d mesa ]; then
 	curl -sSfL -o mesa.tar.xz "https://archive.mesa3d.org/mesa-$MESA_VER.tar.xz"
 	tar xf mesa.tar.xz && mv "mesa-$MESA_VER" mesa
 	patch -p1 -d mesa < "$HERE/bergamota-mesa-$MESA_VER.patch"
+	patch -p1 -d mesa < "$HERE/a9y-fd5-a512-no-2d-blit.patch"
 fi
 if [ ! -d libdrm ]; then    # headers only (xf86drm.h for the msm backend); the library is the stand-in
 	curl -sSfL -o libdrm.tar.xz "https://dri.freedesktop.org/libdrm/libdrm-$DRM_VER.tar.xz"
