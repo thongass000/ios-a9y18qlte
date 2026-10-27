@@ -2798,7 +2798,7 @@ index 0000000..7c82491
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
-index 0254860..248e80f 100644
+index 0254860..8a741d6 100644
 --- a/iokit/Kernel/arm/SweetAccelerator.cpp
 +++ b/iokit/Kernel/arm/SweetAccelerator.cpp
 @@ -115,6 +115,18 @@ SweetAccelerator::start(IOService *provider)
@@ -2862,10 +2862,30 @@ index 0254860..248e80f 100644
  		rp->flags = NativeAdrenoDeviceClientIova;
  		return kIOReturnSuccess;
  	}
-@@ -743,6 +774,16 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+@@ -732,8 +763,10 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 			return kIOReturnBadArgument;
+ 		}
+ 		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(rq->address, rq->bytes, kIODirectionInOut, fTask);
++		bool ro = false;
+ 		if (md != NULL && md->prepare() != kIOReturnSuccess) {
+ 			md->release();  /* read-only pages: pinned for reading */
++			ro = true;
+ 			md = IOMemoryDescriptor::withAddressRange(rq->address, rq->bytes, kIODirectionOut, fTask);
+ 			if (md != NULL && md->prepare() != kIOReturnSuccess) {
+ 				md->release();
+@@ -743,6 +776,25 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
  		if (md == NULL) {
  			return kIOReturnBadArgument;
  		}
++		/* which pages an import pins, against the ones the panel copy reads (SweetFramebuffer "surface ... pa"):
++		 * backboardd's frames on Chlorophyll came out empty while the same renders into test IOSurfaces were right */
++		static uint32_t sweet_import_logged;
++		if (sweet_import_logged < 48) {
++			sweet_import_logged++;
++			IOByteCount seg = 0;
++			IOLog("SWEET MTL: import %s va %llx bytes %llx pa0 %llx%s\n", fName, rq->address, rq->bytes,
++			    (unsigned long long)md->getPhysicalSegment(0, &seg, kIOMemoryMapperNone), ro ? " (read-only pin)" : "");
++		}
 +		/*
 +		 * Clean the CPU's view to memory (the GPU does not snoop), as the v1 path does: lines the CPU
 +		 * left dirty (an IOSurface's zero fill) would otherwise be written back over what the GPU
@@ -3002,7 +3022,7 @@ index 2545cf9..6d3c7e9 100644
  		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
  		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index bc98b59..9085dde 100644
+index bc98b59..08633e9 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -49,6 +49,7 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
@@ -3023,7 +3043,7 @@ index bc98b59..9085dde 100644
  	void copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n);
  };
  
-@@ -443,6 +447,79 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
+@@ -443,6 +447,97 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
   * first time, the panel switches to the GPU's row stride and is cleared, so
   * the bars stay black. False: use the CPU copy.
   */
@@ -3088,6 +3108,24 @@ index bc98b59..9085dde 100644
 +	 * stayed black at 19 fps). A frame the CPU drew only gets its dirty lines written back.
 +	 */
 +	flush_dcache64((addr64_t)base, (unsigned)((uint64_t)s->bytesPerRow * s->height), FALSE);
++	/* the pages read here, once per surface, against the ones a GPU import pins (SweetAccelerator "import") */
++	static uint32_t fit_logged_ids[16];
++	bool seen = false;
++	for (uint32_t i = 0; i < 16 && fit_logged_ids[i]; i++) {
++		seen = seen || fit_logged_ids[i] == id;
++	}
++	if (!seen) {
++		for (uint32_t i = 0; i < 16; i++) {
++			if (!fit_logged_ids[i]) {
++				fit_logged_ids[i] = id;
++				break;
++			}
++		}
++		IOByteCount seg = 0;
++		IOLog("SWEET FB: surface %u kva %lx pa %llx bpr %u, centre px %08x\n", id, (unsigned long)base,
++		    (unsigned long long)s->memory->getPhysicalSegment(s->offset, &seg, kIOMemoryMapperNone),
++		    s->bytesPerRow, *(volatile uint32_t *)(base + (uint64_t)(s->height / 2) * s->bytesPerRow + (s->width / 2) * 4));
++	}
 +	for (uint32_t y = 0; y < fh; y++) {
 +		const uint32_t *src = (const uint32_t *)(base + (uint64_t)sweet_fit_row[y] * s->bytesPerRow);
 +		for (uint32_t x = 0; x < fw; x++) {
@@ -3103,7 +3141,7 @@ index bc98b59..9085dde 100644
  bool
  AppleCLCD::presentGPU(const uint8_t *rec)
  {
-@@ -535,9 +612,16 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -535,9 +630,16 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
@@ -3120,7 +3158,7 @@ index bc98b59..9085dde 100644
  	if (sweet_display_fit_w) {
  		sweet_display_fit_w = 0;        /* touch back to the crop mapping */
  		sweet_display_fit_x = sweet_display_fit_y = sweet_display_fit_h = 0;
-@@ -568,6 +652,8 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -568,6 +670,8 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
