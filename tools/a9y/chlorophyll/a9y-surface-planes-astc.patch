@@ -69,7 +69,7 @@ index ee2b232..f710a3b 100644
  /*
   * The same texture, over memory somebody else allocated: an IOSurface of CoreAnimation's.
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index 7243a7d..022e578 100644
+index 7243a7d..74ec4f8 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
 @@ -345,6 +345,10 @@ bg_install_fallback(Class c)
@@ -83,7 +83,28 @@ index 7243a7d..022e578 100644
  }
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
-@@ -1650,8 +1654,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1564,6 +1568,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+    w->t_sslice = ss; w->t_slevel = sl; w->t_dslice = ds; w->t_dlevel = dl;
+    w->t_sorg[0] = so.x; w->t_sorg[1] = so.y; w->t_sorg[2] = so.z; w->t_dorg[0] = dorg.x; w->t_dorg[1] = dorg.y; w->t_dorg[2] = dorg.z;
+    w->t_size[0] = size.width; w->t_size[1] = size.height; w->t_size[2] = size.depth;
++   BG_TRACE("blit copy texture %p (fmt %lu level %lu) %lu,%lu %lux%lu -> %p (fmt %lu level %lu) %lu,%lu\n", src,
++            (unsigned long)[(id<MTLTexture>)src pixelFormat], (unsigned long)sl, (unsigned long)so.x, (unsigned long)so.y,
++            (unsigned long)size.width, (unsigned long)size.height, dst, (unsigned long)[(id<MTLTexture>)dst pixelFormat],
++            (unsigned long)dl, (unsigned long)dorg.x, (unsigned long)dorg.y);
+    [_cb bgRecord:w];
+ }
+ - (void)copyFromTexture:(id)src toTexture:(id)dst
+@@ -1612,6 +1620,9 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+ - (void)synchronizeTexture:(id)t slice:(NSUInteger)s level:(NSUInteger)l { (void)t; (void)s; (void)l; }
+ - (void)generateMipmapsForTexture:(id)t
+ {
++   BG_TRACE("blit generate mipmaps %p %lux%lu fmt %lu, %lu levels\n", t, (unsigned long)[(id<MTLTexture>)t width],
++            (unsigned long)[(id<MTLTexture>)t height], (unsigned long)[(id<MTLTexture>)t pixelFormat],
++            (unsigned long)[(id<MTLTexture>)t mipmapLevelCount]);
+    BGWork *w = [[[BGWork alloc] init] autorelease];
+    w->kind = BG_WORK_MIPMAPS; w->dst = [t retain];
+    [_cb bgRecord:w];
+@@ -1650,8 +1661,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     if (surface) {
        _shape.usage |= 5;   /* a drawable is rendered into and may be sampled whatever CA asked for (MTLTextureUsageRenderTarget | ShaderRead) */
        /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
@@ -101,7 +122,7 @@ index 7243a7d..022e578 100644
        bg_unlock();
        _surface = CFRetain(surface);
        _plane = plane;
-@@ -1660,7 +1672,27 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1660,7 +1679,27 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
        _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
        bg_unlock();
     }
@@ -130,7 +151,7 @@ index 7243a7d..022e578 100644
     _owner = device;
     return self;
  }
-@@ -1691,6 +1723,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1691,6 +1730,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
     // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
     // (one kernel clean per surface, ever) left those layers stale or missing until this.
@@ -150,7 +171,7 @@ index 7243a7d..022e578 100644
     if (_surface && _tex) {
        static NSMutableDictionary *seeds;
        static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
-@@ -1710,13 +1755,42 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1710,13 +1762,29 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  - (struct rwa_texture *)rwaTexture
  {
@@ -177,24 +198,34 @@ index 7243a7d..022e578 100644
 +                   _shape.width, _shape.height, _shape.pixel_format, _shape.mip_levels, (unsigned long)_ncLength, _ncBytes, rows,
 +                   b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
 +                   b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]);
-+            /* the GPU's copy read back: if it is the caller's bytes, a wrong picture is the sampler's and not the upload's */
-+            size_t row = (size_t)((_shape.width + 3) / 4) * 16, n = row * rows;
-+            uint8_t *back = n <= _ncLength ? malloc(n) : NULL;
-+            char why2[256] = { 0 };
-+            if (back && rwa_texture_read(_tex, 0, 0, o, sz, back, 0, why2, sizeof(why2)) == 0) {
-+               size_t first = n;
-+               for (size_t i = 0; i < n; i++) if (back[i] != b[i]) { first = i; break; }
-+               BG_LOG("no-copy compressed read back: %s (first difference at byte %zu of %zu, row of blocks %zu)\n",
-+                      first == n ? "identical" : "DIFFERENT", first, n, first / row);
-+            } else if (back) {
-+               BG_LOG("no-copy compressed read back refused: %s\n", why2);
-+            }
-+            free(back);
 +         }
 +      }
        bg_unlock();
     }
     if (_linSrc && _tex) {
+@@ -1940,7 +2008,13 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+    id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
+    if (b) { [_scratch addObject:b]; [self setFragmentBuffer:b offset:0 atIndex:i]; }
+ }
+-- (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _tex[i] = t; if (i + 1 > _thigh) _thigh = (unsigned)i + 1; } }
++- (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i
++{
++   if (t) BG_TRACE("setFragmentTexture %p %lux%lu fmt %lu mips %lu index %lu\n", t, (unsigned long)[(id<MTLTexture>)t width],
++                   (unsigned long)[(id<MTLTexture>)t height], (unsigned long)[(id<MTLTexture>)t pixelFormat],
++                   (unsigned long)[(id<MTLTexture>)t mipmapLevelCount], (unsigned long)i);
++   if (i < BG_MAX_TEX) { _tex[i] = t; if (i + 1 > _thigh) _thigh = (unsigned)i + 1; }
++}
+ - (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _smp[i] = s; if (i + 1 > _shigh) _shigh = (unsigned)i + 1; } }
+ - (void)setViewport:(MTLViewport)v
+ {
+@@ -1961,6 +2035,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+         indexBuffer:(id)ib indexType:(NSUInteger)it indexOffset:(NSUInteger)io baseVertex:(NSInteger)bv baseInstance:(NSUInteger)bi
+ {
+    if (!_pipeline) { BG_LOG("draw with no pipeline\n"); return; }
++   BG_TRACE("draw prim %lu count %lu instances %lu%s\n", (unsigned long)prim, (unsigned long)count, (unsigned long)inst, ib ? " indexed" : "");
+    if (bg_trace()) {
+       BG_LOG("draw: prim %lu start %lu count %lu inst %lu index %s type %lu off %lu\n", (unsigned long)prim, (unsigned long)start,
+              (unsigned long)count, (unsigned long)inst, ib ? "yes" : "no", (unsigned long)it, (unsigned long)io);
 diff --git a/test/bgmtl_carenderer_probe.m b/test/bgmtl_carenderer_probe.m
 index bab10f8..47c9269 100644
 --- a/test/bgmtl_carenderer_probe.m
