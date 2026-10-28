@@ -1,0 +1,59 @@
+diff --git a/src/bgmtl.m b/src/bgmtl.m
+index dd8b407..7243a7d 100644
+--- a/src/bgmtl.m
++++ b/src/bgmtl.m
+@@ -296,8 +296,10 @@ bg_install_fallback(Class c)
+ 
+ @interface BGMTLCommandQueue : _MTLCommandQueue {
+    BGMTLDevice *_owner;
++   dispatch_queue_t _completionQueue;   // a9y18qlte: where completed handlers run (-setCompletionQueue:), NULL: inline
+ }
+ - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(id)descriptor;
++- (dispatch_queue_t)bgCompletionQueue;
+ @end
+ 
+ @interface BGMTLCommandBuffer : _MTLCommandBuffer {
+@@ -960,6 +962,23 @@ bg_air_slice(NSData *d)
+    return self;
+ }
+ - (id)device { return _owner; }
++/* a9y18qlte: CoreAnimation hands its command queue a serial queue of its own and expects completed handlers there,
++ * serialized with the rest of its bookkeeping (its framebuffer and buffer recycling). Unimplemented, the handlers ran
++ * on Chlorophyll's completion queue, concurrently with CoreAnimation's: with asynchronous commits the screen flickered
++ * in motion while still frames were right (synchronous commits hid it, the handler had run before commit returned). */
++- (void)setCompletionQueue:(dispatch_queue_t)q
++{
++   if (q) dispatch_retain(q);
++   if (_completionQueue) dispatch_release(_completionQueue);
++   _completionQueue = q;
++}
++- (dispatch_queue_t)completionQueue { return _completionQueue; }
++- (dispatch_queue_t)bgCompletionQueue { return _completionQueue; }
++- (void)dealloc
++{
++   if (_completionQueue) dispatch_release(_completionQueue);
++   [super dealloc];
++}
+ - (id)commandBuffer { return [[[BGMTLCommandBuffer alloc] initWithBGQueue:self] autorelease]; }
+ - (id)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
+ // CoreAnimation asks with a descriptor; _MTLCommandQueue's default would hand back a generic command buffer that never reaches the GPU
+@@ -1418,7 +1437,18 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+       }
+    }
+    [_presents removeAllObjects];
+-   for (void (^h)(id) in _completed) h(self);
++   dispatch_queue_t cq = [_queue bgCompletionQueue];
++   if (cq && [_completed count]) {   // on the client's completion queue, in order (it is serial), as Metal runs them
++      NSArray *handlers = [_completed copy];
++      [self retain];
++      dispatch_async(cq, ^{
++         for (void (^h)(id) in handlers) h(self);
++         [handlers release];
++         [self release];
++      });
++   } else {
++      for (void (^h)(id) in _completed) h(self);
++   }
+    [_completed removeAllObjects];
+ }
+ 
