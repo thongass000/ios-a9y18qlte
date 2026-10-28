@@ -2154,7 +2154,7 @@ index d9d7860..d4a079f 100644
  #define A6_FSR_FAULT		0xc00001feu
  #define A6_GMEM_LOG_OFF		0x91000ull
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index c87ed5d..0d985d7 100644
+index c87ed5d..b16d3c9 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -238,6 +238,7 @@ int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const
@@ -2173,6 +2173,30 @@ index c87ed5d..0d985d7 100644
  }
  
  static void
+@@ -1118,6 +1120,23 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
+ 	}
+ }
+ 
++/*
++ * Wait up to timeout_ns for everything submitted so far: 0 done (or no GPU), 1 timeout. For a reader of memory the
++ * GPU may still be writing: the panel copy of a swapped frame (a9y18qlte's CPU present), since commits are
++ * asynchronous and the swap can come before the frame is drawn (flicker and half-drawn frames in motion).
++ */
++int
++sweet_gpu_wait_idle_ns(uint64_t timeout_ns)
++{
++	if (!gpu_ready) {
++		return 0;
++	}
++	lck_mtx_lock(&sweet_gpu_lock);
++	uint32_t fence = gpu.fence;
++	lck_mtx_unlock(&sweet_gpu_lock);
++	return fence ? sweet_gpu_wait_fence_ns(fence, timeout_ns) : 0;
++}
++
+ /*
+  * Did a reset since *epoch lose work of a client whose last fence is last_fence? Moves *epoch to now.
+  * (Fences are global and in submission order: the client lost work if its last one was in a lost range.)
 diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
 index d405964..5d43ce3 100644
 --- a/bsd/dev/sweet_pmem.c
@@ -3022,18 +3046,22 @@ index 2545cf9..6d3c7e9 100644
  		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
  		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index bc98b59..08633e9 100644
+index bc98b59..0b9718b 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -49,6 +49,7 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
+@@ -49,7 +49,11 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
  	uint32_t *out_dw, uint32_t *out_dh);
  void sweet_gpu_panel_stride(uint32_t stride);
  extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
 +void flush_dcache64(addr64_t addr, unsigned count, int phys);
++int sweet_gpu_wait_idle_ns(uint64_t timeout_ns);
  }
++/* a swapped frame may still be drawing (asynchronous commits): the copy waits this long for the GPU at most */
++#define SWEET_FB_GPU_WAIT_NS            50000000ULL
  #define SWEET_FB_GPU_ROWBYTES           4352    /* the 2D engine writes 64-byte multiples */
  
-@@ -144,6 +145,9 @@ public:
+ #if defined(SWEET)
+@@ -144,6 +148,9 @@ public:
  	void swap(const uint8_t *rec);
  	void present(const uint8_t *rec);
  	bool presentGPU(const uint8_t *rec);
@@ -3043,7 +3071,7 @@ index bc98b59..08633e9 100644
  	void copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n);
  };
  
-@@ -443,6 +447,97 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
+@@ -443,6 +450,100 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
   * first time, the panel switches to the GPU's row stride and is cleared, so
   * the bars stay black. False: use the CPU copy.
   */
@@ -3105,8 +3133,11 @@ index bc98b59..08633e9 100644
 +	/*
 +	 * The frame may come from the GPU (backboardd on Chlorophyll), which writes memory and does not
 +	 * snoop: clean and invalidate the CPU's lines of it first, or this reads stale ones (the screen
-+	 * stayed black at 19 fps). A frame the CPU drew only gets its dirty lines written back.
++	 * stayed black at 19 fps). A frame the CPU drew only gets its dirty lines written back. And first the GPU
++	 * finishes: the swap comes right after the commit, not after the frame is drawn (flicker in motion, gone
++	 * with synchronous commits, which were far slower).
 +	 */
++	sweet_gpu_wait_idle_ns(SWEET_FB_GPU_WAIT_NS);
 +	flush_dcache64((addr64_t)base, (unsigned)((uint64_t)s->bytesPerRow * s->height), FALSE);
 +	/* the pages read here, once per surface, against the ones a GPU import pins (SweetAccelerator "import") */
 +	static uint32_t fit_logged_ids[16];
@@ -3141,7 +3172,7 @@ index bc98b59..08633e9 100644
  bool
  AppleCLCD::presentGPU(const uint8_t *rec)
  {
-@@ -535,9 +630,16 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -535,9 +636,16 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
@@ -3158,11 +3189,12 @@ index bc98b59..08633e9 100644
  	if (sweet_display_fit_w) {
  		sweet_display_fit_w = 0;        /* touch back to the crop mapping */
  		sweet_display_fit_x = sweet_display_fit_y = sweet_display_fit_h = 0;
-@@ -568,6 +670,8 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -568,6 +676,9 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
 +		/* a GPU-drawn layer: see presentFitCPU */
++		sweet_gpu_wait_idle_ns(SWEET_FB_GPU_WAIT_NS);
 +		flush_dcache64((addr64_t)(src + s->offset), (unsigned)((uint64_t)s->bytesPerRow * s->height), FALSE);
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
