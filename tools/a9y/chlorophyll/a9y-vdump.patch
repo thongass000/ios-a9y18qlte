@@ -1,0 +1,57 @@
+diff --git a/air/air_metal.c b/air/air_metal.c
+index 88088ca..1d62624 100644
+--- a/air/air_metal.c
++++ b/air/air_metal.c
+@@ -8040,6 +8040,52 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+     */
+    pipe->bind_vertex_elements_state(pipe, render->velem);
+    pipe->set_vertex_buffers(pipe, nvb, vbs);
++   /* a9y18qlte: A9Y_VDUMP=N prints the first N draws' vertex layout, indices and fetched bytes (stderr), to read
++    * which vertices of CoreAnimation's rounded-rect meshes come out wrong on the A512 */
++   static int vdump = -1;
++   if (vdump < 0)
++      vdump = getenv("A9Y_VDUMP") ? atoi(getenv("A9Y_VDUMP")) : 0;
++   if (vdump > 0 && vst->count) {
++      vdump--;
++      fprintf(stderr, "vdump draw prim %u start %u count %u indexed %d type %u ioff %zu base %d\n", draw->primitive,
++              draw->vertex_start, draw->vertex_count, draw->index_buffer != NULL, draw->index_type,
++              draw->index_buffer_offset, draw->base_vertex);
++      for (unsigned l = 0; l < vst->count; l++)
++         fprintf(stderr, "vdump elem %u attr %u fmt %s off %u stride %u buf %u\n", l, vst->attribute[l],
++                 util_format_name(vst->element[l].src_format), vst->element[l].src_offset,
++                 vst->element[l].src_stride, vst->element[l].vertex_buffer_index);
++      unsigned maxv = draw->vertex_start + draw->vertex_count;
++      if (draw->index_buffer && draw->index_buffer->map) {
++         const uint8_t *ib = (const uint8_t *)draw->index_buffer->map + draw->index_buffer_offset;
++         maxv = 0;
++         for (unsigned i = 0; i < draw->vertex_count && i < 4096; i += 24) {
++            char line[24 * 6 + 1], *e = line;
++            for (unsigned j = i; j < i + 24 && j < draw->vertex_count; j++) {
++               unsigned x = draw->index_type ? ((const uint32_t *)ib)[j] : ((const uint16_t *)ib)[j];
++               maxv = MAX2(maxv, x + 1);
++               e += sprintf(e, " %u", x);
++            }
++            fprintf(stderr, "vdump idx %u:%s\n", i, line);
++         }
++         maxv += draw->base_vertex > 0 ? (unsigned)draw->base_vertex : 0;
++      }
++      for (unsigned k = 0; k < RWA_MAX_VERTEX_BUFFERS && k < draw->vertex_stream_count; k++) {
++         const struct rwa_vertex_stream *s = &draw->vertex_streams[k];
++         if (!(vst->stream_mask & (1u << k)) || !s->buffer || !s->buffer->map)
++            continue;
++         unsigned stride = vst->stride[k], bytes = MIN2(vst->bytes[k], 48u);
++         fprintf(stderr, "vdump stream %u offset %zu size %zu stride %u\n", k, s->offset, s->buffer->size, stride);
++         for (unsigned v = 0; v < maxv && v < 1024; v++) {
++            size_t at = s->offset + (size_t)v * stride;
++            if (at + bytes > s->buffer->size)
++               break;
++            char line[48 * 2 + 1];
++            for (unsigned b = 0; b < bytes; b++)
++               sprintf(line + 2 * b, "%02x", ((const uint8_t *)s->buffer->map)[at + b]);
++            fprintf(stderr, "vdump v %u %u %s\n", k, v, line);
++         }
++      }
++   }
+ 
+    struct rwa_bound fbound = { 0 }, vbound = { 0 };
+    int rc = -1;
