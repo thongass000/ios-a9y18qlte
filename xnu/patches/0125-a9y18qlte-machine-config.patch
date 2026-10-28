@@ -3743,7 +3743,7 @@ index 2545cf9..6d3c7e9 100644
  		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
  		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index bc98b59..52958c1 100644
+index bc98b59..83fabbf 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -48,8 +48,16 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
@@ -3797,7 +3797,7 @@ index bc98b59..52958c1 100644
 +			IOLockUnlock(fb->fLock);
 +			if (blank) {
 +				int b = (sweet_gpu_panel_shown() + 1) % 3;
-+				uint8_t *kva = b == 0 ? fb->fPixels : (uint8_t *)fb->fBufMap[b]->getVirtualAddress();
++				uint8_t *kva = (uint8_t *)(b == 0 ? fb->fPixels : (uintptr_t)fb->fBufMap[b]->getVirtualAddress());
 +				bzero(kva, (size_t)fb->fRowBytes * fb->fHeight);
 +				sweet_gpu_panel_show(b);
 +			}
