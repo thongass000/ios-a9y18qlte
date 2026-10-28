@@ -12,6 +12,7 @@
 //   a9ybbctl threads NAME S  where NAME's CPU time goes over S seconds, per thread
 //   a9ybbctl hex FILE        a file as hex lines (a binary back through the log)
 //   a9ybbctl bench           the cores' clocks (dependent adds), one thread and one per core
+//   a9ybbctl top S           every process's CPU time over S seconds, the busiest first
 //   a9ybbctl cat FILE [MAX]  print a file (the injection logs to /private/var/tmp/bgmtl.log), at most MAX lines
 // The plist is changed on the phone, by CoreFoundation's own writer and the phone's own file system, never from Linux.
 #import <Foundation/Foundation.h>
@@ -96,6 +97,13 @@ extern int proc_name(int pid, void *buffer, uint32_t buffersize);
 extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
 #define PROC_PIDTHREADINFO 5
 #define PROC_PIDLISTTHREADS 6
+#define PROC_PIDTASKINFO 4
+struct proc_taskinfo {   // sys/proc_info.h
+   uint64_t pti_virtual_size, pti_resident_size, pti_total_user, pti_total_system, pti_threads_user,
+      pti_threads_system;
+   int32_t pti_policy, pti_faults, pti_pageins, pti_cow_faults, pti_messages_sent, pti_messages_received,
+      pti_syscalls_mach, pti_syscalls_unix, pti_csw, pti_threadnum, pti_numrunning, pti_priority;
+};
 struct proc_threadinfo {   // sys/proc_info.h
    uint64_t pth_user_time, pth_system_time;   // ns
    int32_t pth_cpu_usage, pth_policy, pth_run_state, pth_flags, pth_sleep_time, pth_curpri, pth_priority, pth_maxpriority;
@@ -253,6 +261,42 @@ main(int argc, char **argv)
          sleep((unsigned)atoi(argv[2]));
          return 0;
       }
+      if (!strcmp(cmd, "top") && argc > 2) {   // every process's CPU time over SECONDS, the busiest first
+         enum { MAXP = 1024 };
+         static pid_t pid[MAXP];
+         static uint64_t t0[MAXP], d[MAXP];
+         int n = proc_listallpids(pid, sizeof(pid));
+         if (n > MAXP) n = MAXP;
+         for (int i = 0; i < n; i++) {
+            struct proc_taskinfo ti;
+            t0[i] = proc_pidinfo(pid[i], PROC_PIDTASKINFO, 0, &ti, sizeof(ti)) == sizeof(ti)
+                       ? ti.pti_total_user + ti.pti_total_system : 0;
+         }
+         unsigned secs = (unsigned)atoi(argv[2]);
+         sleep(secs);
+         uint64_t total = 0;
+         mach_timebase_info_data_t tb;   /* task times are mach absolute time */
+         mach_timebase_info(&tb);
+         for (int i = 0; i < n; i++) {
+            struct proc_taskinfo ti;
+            d[i] = proc_pidinfo(pid[i], PROC_PIDTASKINFO, 0, &ti, sizeof(ti)) == sizeof(ti) &&
+                   ti.pti_total_user + ti.pti_total_system >= t0[i] ? ti.pti_total_user + ti.pti_total_system - t0[i] : 0;
+            d[i] = d[i] * tb.numer / tb.denom;
+            total += d[i];
+         }
+         printf("top: %llu ms CPU in %u s over %d processes (%u%% of one core)\n", (unsigned long long)(total / 1000000),
+                secs, n, secs ? (unsigned)(total / 10000000 / secs) : 0);
+         for (int k = 0; k < 15; k++) {
+            int best = -1;
+            for (int i = 0; i < n; i++) if (d[i] && (best < 0 || d[i] > d[best])) best = i;
+            if (best < 0) break;
+            char nm[64] = "?";
+            proc_name(pid[best], nm, sizeof(nm));
+            printf("  %6llu ms  %s (%d)\n", (unsigned long long)(d[best] / 1000000), pid[best] ? nm : "kernel_task", pid[best]);
+            d[best] = 0;
+         }
+         return 0;
+      }
       if (!strcmp(cmd, "bench")) {   // the cores' clocks: one thread alone, then one per core at once
          bench(1);
          bench(4);
@@ -331,7 +375,7 @@ main(int argc, char **argv)
          fclose(f);
          return 0;
       }
-      printf("usage: a9ybbctl status|install|restore|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE|threads NAME S|bench\n");
+      printf("usage: a9ybbctl status|install|restore|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE|threads NAME S|bench|top S\n");
       return 2;
    }
 }
