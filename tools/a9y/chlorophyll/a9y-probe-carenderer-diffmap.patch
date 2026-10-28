@@ -1,5 +1,5 @@
 diff --git a/test/bgmtl_carenderer_probe.m b/test/bgmtl_carenderer_probe.m
-index 9f9abc5..0cfd187 100644
+index 9f9abc5..c9f07c3 100644
 --- a/test/bgmtl_carenderer_probe.m
 +++ b/test/bgmtl_carenderer_probe.m
 @@ -131,6 +131,30 @@ make_scene(int n)
@@ -42,7 +42,7 @@ index 9f9abc5..0cfd187 100644
           if (only >= 0 && n != only) continue;
           CALayer *scene = make_scene(n);
           // the reference: CoreAnimation's CPU path into a bitmap
-@@ -241,6 +265,26 @@ main(int argc, char **argv)
+@@ -241,6 +265,36 @@ main(int argc, char **argv)
           double sum = 0; unsigned nonzero = 0;
           for (int i = 0; i < W * H * 4; i++) { sum += abs((int)out[i] - (int)ref[i]); if (out[i]) nonzero++; }
           printf("scene %d: mean abs diff %.2f over %d channels, %u non-zero bytes rendered\n", n, sum / (W * H * 4), W * H * 4, nonzero);
@@ -65,6 +65,16 @@ index 9f9abc5..0cfd187 100644
 +            }
 +            line[cx / 4] = 0;
 +            printf("map %3d %s\n", cy, line);
++         }
++         if (getenv("BG_CAR_DUMP")) {   // BG_CAR_DUMP=x,y,w,h: green of Metal/CPU per pixel there (w up to 16)
++            int dx = 0, dy = 0, dw = 0, dh = 0;
++            sscanf(getenv("BG_CAR_DUMP"), "%d,%d,%d,%d", &dx, &dy, &dw, &dh);
++            for (int y = dy; y < dy + dh && y < H; y++) {
++               char line[16 * 8 + 1] = "", *e = line;
++               for (int x = dx; x < dx + dw && x < dx + 16 && x < W; x++)
++                  e += sprintf(e, " %3d/%-3d", out[(y * W + x) * 4 + 1], ref[(y * W + x) * 4 + 1]);
++               printf("px %3d %d:%s\n", y, dx, line);
++            }
 +         }
           char p[600];
           if (W * H <= 256 * 256) {   // a9y18qlte: not 11 MB per picture at 1125x2436
