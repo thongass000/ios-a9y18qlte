@@ -1,0 +1,71 @@
+diff --git a/test/bgmtl_carenderer_probe.m b/test/bgmtl_carenderer_probe.m
+index 9f9abc5..0cfd187 100644
+--- a/test/bgmtl_carenderer_probe.m
++++ b/test/bgmtl_carenderer_probe.m
+@@ -131,6 +131,30 @@ make_scene(int n)
+       }
+       break;
+    }
++   case 7:     // a9y18qlte: a plain layer with continuous corners (an app folder's shape)
++   case 8: {   // ... and as an iOS platter: a rounded, clipped backdrop with blur and a tint over stripes
++      for (int i = 0; n == 8 && i < 8; i++) {
++         CALayer *l = [CALayer layer];
++         l.frame = CGRectMake(i * 32, 0, 16, H);
++         l.backgroundColor = CGColorCreateGenericRGB(i & 1 ? 1 : 0.1, i & 2 ? 0.8 : 0.2, i & 4 ? 0.9 : 0.1, 1);
++         [root addSublayer:l];
++      }
++      Class bd = NSClassFromString(@"CABackdropLayer"), cf = NSClassFromString(@"CAFilter");
++      CALayer *b = n == 8 && bd ? [bd layer] : [CALayer layer];
++      b.frame = CGRectMake(40, 40, 176, 176);
++      b.cornerRadius = 36;
++      if ([b respondsToSelector:NSSelectorFromString(@"setCornerCurve:")])
++         [b setValue:@"continuous" forKey:@"cornerCurve"];
++      b.masksToBounds = YES;
++      if (n == 8 && cf) {
++         id blur = [cf performSelector:NSSelectorFromString(@"filterWithType:") withObject:@"gaussianBlur"];
++         [blur setValue:@12 forKey:@"inputRadius"];
++         b.filters = @[ blur ];
++      }
++      b.backgroundColor = CGColorCreateGenericRGB(0.6, 0.6, 0.65, n == 8 ? 0.4 : 1);
++      [root addSublayer:b];
++      break;
++   }
+    }
+    return root;
+ }
+@@ -192,7 +216,7 @@ main(int argc, char **argv)
+       printf("default device: %s\n", d ? [[d name] UTF8String] : "nil");
+       if (!d) return 2;
+       int bad = 0, done = 0;
+-      for (int n = 0; n < 7; n++) {
++      for (int n = 0; n < 9; n++) {
+          if (only >= 0 && n != only) continue;
+          CALayer *scene = make_scene(n);
+          // the reference: CoreAnimation's CPU path into a bitmap
+@@ -241,6 +265,26 @@ main(int argc, char **argv)
+          double sum = 0; unsigned nonzero = 0;
+          for (int i = 0; i < W * H * 4; i++) { sum += abs((int)out[i] - (int)ref[i]); if (out[i]) nonzero++; }
+          printf("scene %d: mean abs diff %.2f over %d channels, %u non-zero bytes rendered\n", n, sum / (W * H * 4), W * H * 4, nonzero);
++         // a9y18qlte: where they differ (thin wrong lines vanish in a mean): the worst channel per pixel, a map of 4x4 cells
++         int maxd = 0, bad32 = 0, x0 = W, y0 = H, x1 = -1, y1 = -1;
++         for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
++            int dm = 0;
++            for (int k = 0; k < 4; k++) { int dd = abs((int)out[(y * W + x) * 4 + k] - (int)ref[(y * W + x) * 4 + k]); if (dd > dm) dm = dd; }
++            if (dm > maxd) maxd = dm;
++            if (dm > 32) { bad32++; if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
++         }
++         printf("scene %d: max channel diff %d, %d pixels off by more than 32, within x %d..%d y %d..%d\n", n, maxd, bad32, x0, x1, y0, y1);
++         for (int cy = 0; bad32 && W <= 256 && cy < H; cy += 4) {   // '.': within 32, 'o': within 96, '#': worse
++            char line[80]; int cx;
++            for (cx = 0; cx < W && cx / 4 < 79; cx += 4) {
++               int dm = 0;
++               for (int y = cy; y < cy + 4 && y < H; y++) for (int x = cx; x < cx + 4 && x < W; x++)
++                  for (int k = 0; k < 4; k++) { int dd = abs((int)out[(y * W + x) * 4 + k] - (int)ref[(y * W + x) * 4 + k]); if (dd > dm) dm = dd; }
++               line[cx / 4] = dm <= 32 ? '.' : dm <= 96 ? 'o' : '#';
++            }
++            line[cx / 4] = 0;
++            printf("map %3d %s\n", cy, line);
++         }
+          char p[600];
+          if (W * H <= 256 * 256) {   // a9y18qlte: not 11 MB per picture at 1125x2436
+             snprintf(p, sizeof(p), "%s/scene%d.ppm", argv[1], n); write_ppm(p, out);
