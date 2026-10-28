@@ -28,6 +28,7 @@ if [ ! -d chl ]; then
 	git -C chl apply "$HERE/a9y-probe-carenderer-target.patch" # CARenderer probe: target size / IOSurface
 	git -C chl apply "$HERE/a9y-fbfetch-pre-a6xx.patch"   # A5xx: no framebuffer fetch in freedreno (luma_boost: black)
 	git -C chl apply "$HERE/a9y-probe-carenderer-diffmap.patch" # CARenderer probe: platter scenes, where pixels differ
+	git -C chl apply "$HERE/a9y-half-varyings-pre-a6xx.patch"  # A5xx: fp16 interpolation dashed every rounded edge
 fi
 if [ ! -d mesa-air ]; then
 	mkdir -p air-src && tar -C air-src -xf mesa.tar.xz && mv air-src/mesa-* mesa-air && rmdir air-src
