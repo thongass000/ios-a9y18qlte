@@ -1,5 +1,5 @@
 diff --git a/air/air_metal.c b/air/air_metal.c
-index de181b4..25ed4c0 100644
+index de181b4..214b508 100644
 --- a/air/air_metal.c
 +++ b/air/air_metal.c
 @@ -257,6 +257,11 @@ struct rwa_texture {
@@ -195,7 +195,35 @@ index de181b4..25ed4c0 100644
     };
     /* transparent black, which is both Metal's default border colour and what
      * clamp_to_zero reads by definition. Written out rather than left to the zeroing
-@@ -7440,6 +7562,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char
+@@ -4132,6 +4254,27 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
+             cb.user_buffer = (const char *)b->map + boffset;
+             cb.buffer_offset = 0;
+             cb.buffer_size = (unsigned)want;
++            /* a9y18qlte: fd5 copies a user buffer into the ring for the shader's whole pushed UBO range
++             * (ir3_emit_user_consts reads range.start..end, not buffer_size), so a binding near the end of the
++             * buffer read past its mapping (backboardd sig 11 in fd5_emit_const_user). There it is a zero-padded
++             * copy, one per stage and slot: freedreno keeps the pointer until the slot is bound again. */
++            enum { RWA_CB_PAD = 16384 };
++            if (left < want + RWA_CB_PAD) {
++               static struct { uint8_t *p; size_t cap; } pad[PIPE_SHADER_TYPES][PIPE_MAX_CONSTANT_BUFFERS];
++               size_t need = want + RWA_CB_PAD;
++               if (pad[stage][r->index].cap < need) {
++                  uint8_t *p = realloc(pad[stage][r->index].p, need);
++                  if (!p) {
++                     say(why, why_size, "%s: no memory for a padded constant buffer copy", name);
++                     return -1;
++                  }
++                  pad[stage][r->index].p = p;
++                  pad[stage][r->index].cap = need;
++               }
++               memcpy(pad[stage][r->index].p, cb.user_buffer, want);
++               memset(pad[stage][r->index].p + want, 0, need - want);
++               cb.user_buffer = pad[stage][r->index].p;
++            }
+          }
+          pipe->set_constant_buffer(pipe, stage, r->index, false, &cb);
+          break;
+@@ -7440,6 +7583,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char
           goto fail;
        }
        if (present++ == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
@@ -203,7 +231,7 @@ index de181b4..25ed4c0 100644
        surf[i] = texture_surface(t);
        if (!surf[i]) { say(why, why_size, "no render surface for colour attachment %u", i); goto fail; }
        fb.cbufs[i] = surf[i];
-@@ -7716,13 +7839,15 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+@@ -7716,13 +7860,15 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        }
        unsigned tw = t->shape.width;
        unsigned th = t->shape.height ? t->shape.height : 1;
