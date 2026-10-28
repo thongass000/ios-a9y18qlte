@@ -1,0 +1,14 @@
+--- a/src/gallium/drivers/freedreno/a5xx/fd5_format.c	2026-10-28 18:47:46.797925437 +0700
++++ b/src/gallium/drivers/freedreno/a5xx/fd5_format.c	2026-10-28 18:47:58.918797144 +0700
+@@ -118,6 +118,11 @@
+    _T(B5G5R5A1_UNORM, 5_5_5_1_UNORM, R5G5B5A1_UNORM, WXYZ),
+    _T(B5G5R5X1_UNORM, 5_5_5_1_UNORM, R5G5B5A1_UNORM, WXYZ),
+    _T(B4G4R4A4_UNORM, 4_4_4_4_UNORM, R4G4B4A4_UNORM, WXYZ),
++   /* a9y18qlte: red and blue the other way round, as fd6 has them: Metal's packed 16-bit formats map to these
++    * (Chlorophyll, air_metal.c), and CoreAnimation's BGR5A1Unorm render target was refused on the A512 */
++   _T(R5G6B5_UNORM,   5_6_5_UNORM,   R5G6B5_UNORM,   WZYX),
++   _T(R5G5B5A1_UNORM, 5_5_5_1_UNORM, R5G5B5A1_UNORM, WZYX),
++   _T(R4G4B4A4_UNORM, 4_4_4_4_UNORM, R4G4B4A4_UNORM, WZYX),
+ 
+    /* 24-bit */
+    V_(R8G8B8_UNORM,   8_8_8_UNORM, NONE, WZYX),

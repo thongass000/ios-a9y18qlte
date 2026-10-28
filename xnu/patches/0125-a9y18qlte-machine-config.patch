@@ -3889,10 +3889,18 @@ index 2514af3..b1d6c1b 100644
  	uint8_t ctrl = 0;
  	if (sweet_rtc_read(&rtc) == 0 && sweet_spmi_read(0, PM8150_RTC_CTRL, &ctrl) == 0) {
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index 423042f..feff979 100644
+index 423042f..2c8fad2 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -269,11 +269,37 @@ sweet_div_up(uint32_t a, uint32_t b)
+@@ -35,6 +35,7 @@
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/system.h>
+ #include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+@@ -269,11 +270,37 @@ sweet_div_up(uint32_t a, uint32_t b)
  	return b > 1 ? (a + b - 1) / b : a;
  }
  
@@ -3932,7 +3940,7 @@ index 423042f..feff979 100644
  }
  
  /* Geometry from the creation properties (IOSurface.h keys). */
-@@ -328,6 +354,9 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -328,6 +355,9 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
  	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
  		return kIOReturnBadArgument;
  	}
@@ -3942,7 +3950,7 @@ index 423042f..feff979 100644
  	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
  
  	OSArray *planes = one_plane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
-@@ -354,9 +383,18 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -354,9 +384,18 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
  			}
  			p->bytesPerRow = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
  			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement));
@@ -3963,7 +3971,32 @@ index 423042f..feff979 100644
  			next = round_page((uint64_t)p->offset + p->size);
  			if ((uint64_t)p->offset + p->size > end) {
  				end = (uint64_t)p->offset + p->size;
-@@ -784,7 +822,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -759,9 +798,22 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+ 		sweet_surface_creates_logged++;
+-		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
++		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u (asked %u) planes %u size %u keys %u -> 0x%x\n",
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+-		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
++		    s->bytesPerRow, sweet_dict_u32(props, "IOSurfaceBytesPerRow", 0), s->planeCount, s->allocSize,
++		    props->getCount(), ret);
++		/* which keys a creator sends tells whether it lays out the memory itself (a9y18qlte: padded pitches) */
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(props);
++		if (it != NULL) {
++			char keys[192] = "";
++			OSSymbol *k;
++			while ((k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++				strlcat(keys, k->getCStringNoCopy() + (strncmp(k->getCStringNoCopy(), "IOSurface", 9) == 0 ? 9 : 0), sizeof(keys));
++				strlcat(keys, " ", sizeof(keys));
++			}
++			it->release();
++			IOLog("SWEET SURF: id %u keys %s\n", s->id, keys);
++		}
+ 	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+@@ -784,7 +836,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
  	case kSweetSurfaceLimits: {
  		uint8_t limits[0x18] = { 0 };
  		put32(limits, 0x0, SWEET_SURFACE_ROW_ALIGN - 1);

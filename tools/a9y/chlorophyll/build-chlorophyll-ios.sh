@@ -39,6 +39,7 @@ if [ ! -d mesa-air ]; then
 	mkdir -p air-src && tar -C air-src -xf mesa.tar.xz && mv air-src/mesa-* mesa-air && rmdir air-src
 	patch -p1 -d mesa-air < "$MESA/bergamota-mesa-25.0.7.patch"
 	patch -p1 -d mesa-air < "$MESA/a9y-fd5-a512-no-2d-blit.patch"
+	patch -p1 -d mesa-air < "$MESA/a9y-fd5-packed16-swapped.patch"   # Metal's 16-bit formats: CA's BGR5A1 render target
 	for p in air-frontend air-ir3 ir3-round-default ir3-shift-split ir3-ssbo-subdword fd-bo-cache-keep fd-bo-cache-skip-busy \
 		fd-bo-new-purge-retry; do
 		patch -p1 -d mesa-air < "chl/patches/$p.patch"

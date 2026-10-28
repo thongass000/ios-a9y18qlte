@@ -69,7 +69,7 @@ index ee2b232..f710a3b 100644
  /*
   * The same texture, over memory somebody else allocated: an IOSurface of CoreAnimation's.
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index 7243a7d..0af4bed 100644
+index 7243a7d..ebc708e 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
 @@ -345,6 +345,7 @@ bg_install_fallback(Class c)
@@ -98,7 +98,21 @@ index 7243a7d..0af4bed 100644
        bg_unlock();
        _surface = CFRetain(surface);
        _plane = plane;
-@@ -1710,13 +1719,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1660,7 +1669,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+       _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
+       bg_unlock();
+    }
+-   if (!_tex) { BG_LOG("texture refused: %s\n", why); [self release]; return nil; }
++   if (!_tex && surface)
++      BG_LOG("texture refused: %s (plane %lu of %lu: offset %ld, %lu bytes a row)\n", why, (unsigned long)plane,
++             (unsigned long)IOSurfaceGetPlaneCount((IOSurfaceRef)surface),
++             (long)((intptr_t)IOSurfaceGetBaseAddressOfPlane((IOSurfaceRef)surface, plane) - (intptr_t)IOSurfaceGetBaseAddress((IOSurfaceRef)surface)),
++             (unsigned long)IOSurfaceGetBytesPerRowOfPlane((IOSurfaceRef)surface, plane));
++   if (!_tex) { if (!surface) BG_LOG("texture refused: %s\n", why); [self release]; return nil; }
+    _owner = device;
+    return self;
+ }
+@@ -1710,13 +1724,29 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  - (struct rwa_texture *)rwaTexture
  {
@@ -115,8 +129,18 @@ index 7243a7d..0af4bed 100644
 +                            rows != _shape.height ? 0 : (unsigned)(_ncLength / (_shape.height ? _shape.height : 1)),
                              why, sizeof(why)) != 0)
           BG_LOG("no-copy texture refresh: %s\n", why);
-+      else if (rows != _shape.height)
++      else if (rows != _shape.height) {
 +         _ncLoaded = YES;
++         static int told;
++         if (told++ < 24) {
++            const uint8_t *b = (const uint8_t *)_ncBytes;
++            BG_LOG("no-copy compressed: %ux%u fmt %u mips %u, %lu bytes at %p (%u rows of blocks): "
++                   "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x | %02x%02x%02x%02x %02x%02x%02x%02x\n",
++                   _shape.width, _shape.height, _shape.pixel_format, _shape.mip_levels, (unsigned long)_ncLength, _ncBytes, rows,
++                   b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
++                   b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]);
++         }
++      }
        bg_unlock();
     }
     if (_linSrc && _tex) {
