@@ -230,7 +230,7 @@ index ee2b232..4f80de8 100644
  /*
   * The same texture, over memory somebody else allocated: an IOSurface of CoreAnimation's.
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index 7243a7d..f2e809d 100644
+index 7243a7d..f96865b 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
 @@ -24,6 +24,7 @@
@@ -374,7 +374,7 @@ index 7243a7d..f2e809d 100644
     if (_surface && _tex) {
        static NSMutableDictionary *seeds;
        static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
-@@ -1710,13 +1788,64 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1710,13 +1788,67 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  - (struct rwa_texture *)rwaTexture
  {
@@ -406,7 +406,10 @@ index 7243a7d..f2e809d 100644
 +      /* a9y18qlte: ASTC is decoded on the CPU into an RGBA8 texture that is sampled instead (the A512 drew it as one colour) */
 +      struct rwa_texture *dec = NULL;
 +      uint64_t t0 = mach_absolute_time();
-+      if (rows != _shape.height) dec = rwa_texture_astc_decoded(_tex, _ncBytes, _ncLength, why, sizeof(why));
++      /* off unless A9Y_ASTC_CPU=1: 30-107 ms per snapshot on the render thread, and the purple cards were not the decoder's */
++      static int cpuAstc = -1;
++      if (cpuAstc < 0) cpuAstc = getenv("A9Y_ASTC_CPU") && atoi(getenv("A9Y_ASTC_CPU")) > 0;
++      if (cpuAstc && rows != _shape.height) dec = rwa_texture_astc_decoded(_tex, _ncBytes, _ncLength, why, sizeof(why));
 +      if (dec) {
 +         if (_astcTex) rwa_texture_destroy(_astcTex);
 +         _astcTex = dec;
@@ -441,7 +444,7 @@ index 7243a7d..f2e809d 100644
        bg_unlock();
     }
     if (_linSrc && _tex) {
-@@ -1728,7 +1857,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1728,7 +1860,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
           BG_LOG("linear texture refresh: %s\n", why);
        bg_unlock();
     }
@@ -450,7 +453,7 @@ index 7243a7d..f2e809d 100644
  }
  - (id)device { return _owner; }
  - (NSUInteger)width { return _shape.width; }
-@@ -1872,7 +2001,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1872,7 +2004,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     for (unsigned i = 0; i < 8; i++) {
        MTLRenderPassColorAttachmentDescriptor *a = [[d colorAttachments] objectAtIndexedSubscript:i];
        if (!a || ![a texture]) continue;
@@ -462,7 +465,7 @@ index 7243a7d..f2e809d 100644
        _ncolor = i + 1;
        if ([a loadAction] == MTLLoadActionClear) {
           MTLClearColor c = [a clearColor];
-@@ -1940,7 +2072,13 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1940,7 +2075,13 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
     if (b) { [_scratch addObject:b]; [self setFragmentBuffer:b offset:0 atIndex:i]; }
  }
@@ -477,7 +480,7 @@ index 7243a7d..f2e809d 100644
  - (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _smp[i] = s; if (i + 1 > _shigh) _shigh = (unsigned)i + 1; } }
  - (void)setViewport:(MTLViewport)v
  {
-@@ -1961,6 +2099,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1961,6 +2102,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
          indexBuffer:(id)ib indexType:(NSUInteger)it indexOffset:(NSUInteger)io baseVertex:(NSInteger)bv baseInstance:(NSUInteger)bi
  {
     if (!_pipeline) { BG_LOG("draw with no pipeline\n"); return; }

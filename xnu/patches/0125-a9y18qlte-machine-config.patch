@@ -1362,7 +1362,7 @@ index 0000000..91746ca
 +#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
 diff --git a/bsd/dev/sweet_a5xx.c b/bsd/dev/sweet_a5xx.c
 new file mode 100644
-index 0000000..ead84c3
+index 0000000..81823b4
 --- /dev/null
 +++ b/bsd/dev/sweet_a5xx.c
 @@ -0,0 +1,903 @@
@@ -2262,8 +2262,8 @@ index 0000000..ead84c3
 +			a6_write(a6_pool_pa(g, off) + 4ull * a5fit_runs[i].dword, &a5fit_data[a5fit_runs[i].data],
 +				 4ull * a5fit_runs[i].count);
 +		fit_reloc(g, off, A5FIT_SELF, a6_pool_va(off));
-+		fit_reloc(g, off, A5FIT_DST, dst_iova);
 +	}
++	fit_reloc(g, off, A5FIT_DST, dst_iova);   /* every time: the present flips between panel buffers */
 +	fit_reloc(g, off, A5FIT_SRC, src_iova);
 +	*ib_iova = a6_pool_va(off + A5FIT_IB_OFF);
 +	return A5FIT_IB_DWORDS;
@@ -2481,17 +2481,19 @@ index 0155304..fb56a32 100644
  #include <sys/param.h>
  #include <sys/systm.h>
 diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
-index d9d7860..2556e9c 100644
+index d9d7860..6e73b17 100644
 --- a/bsd/dev/sweet_a6xx.h
 +++ b/bsd/dev/sweet_a6xx.h
-@@ -48,11 +48,19 @@
+@@ -48,11 +48,21 @@
  #define A6_RING_SIZE		0x8000u
  #define A6_RING_DW		(A6_RING_SIZE / 4)
  
 +#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
 +/* the a9y18qlte's Adreno 512 (bsd/dev/sweet_a5xx.c implements this core) */
 +#define A6_FB_PA		0x9d400000ull
-+#define A6_FB_SIZE		0xa00000ull	/* mapped for the GPU: 5 x 2 MB */
++#define A6_FB_SIZE		0x1e00000ull	/* mapped for the GPU: three 10 MB panel buffers in ABL's 36 MB splash carve-out
++						 * (0x9d400000-0x9f7ff000, below XNU's RAM), flipped at vsync (sweet_gpu_present) */
++#define A6_FB_BUF		0xa00000ull
 +#define A6_GPU_ID		512
 +#define A6_CHIP_ID		0x05010200ull
 +#else
@@ -2504,7 +2506,7 @@ index d9d7860..2556e9c 100644
  
  struct a6_gpu {
  	uint64_t pool_pa;
-@@ -61,7 +69,8 @@ struct a6_gpu {
+@@ -61,7 +71,8 @@ struct a6_gpu {
  	uint32_t fence;			/* last fence value submitted */
  	uint32_t hfi_seq;
  	uint32_t pt_next;		/* next free table in the arena */
@@ -2514,7 +2516,7 @@ index d9d7860..2556e9c 100644
  };
  
  /* ---- environment ---- */
-@@ -146,6 +155,28 @@ struct a6_blit {
+@@ -146,6 +157,28 @@ struct a6_blit {
  #define A6_BLIT_MAX_DW	256
  uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *dw);
  
@@ -2543,7 +2545,7 @@ index d9d7860..2556e9c 100644
  #define A6_CP_NOP		0x10
  #define A6_CP_WAIT_FOR_IDLE	0x26
  #define A6_CP_BLIT		0x2c
-@@ -157,10 +188,16 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
+@@ -157,10 +190,16 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
  #define A6_CP_MEMCPY		0x75
  
  /* Register/state access for status and dumps */
@@ -2562,10 +2564,18 @@ index d9d7860..2556e9c 100644
  #define A6_FSR_FAULT		0xc00001feu
  #define A6_GMEM_LOG_OFF		0x91000ull
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index c87ed5d..5dd6099 100644
+index c87ed5d..119fb56 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -238,6 +238,7 @@ int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const
+@@ -51,6 +51,7 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
+ 	uint32_t fb_pitch, uint32_t corner_radius, uint32_t *out_dx, uint32_t *out_dy,
+ 	uint32_t *out_dw, uint32_t *out_dh);
+ void sweet_gpu_panel_stride(uint32_t stride);
++void sweet_gpu_panel_home(void);
+ int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
+ int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out);
+ 
+@@ -238,6 +239,7 @@ int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const
  static void
  gpu_bus_vote(void)
  {
@@ -2573,7 +2583,7 @@ index c87ed5d..5dd6099 100644
  	uint32_t on = 1;
  	PE_parse_boot_argn("sweetddr", &on, sizeof(on));
  	if (!on) {
-@@ -249,6 +250,7 @@ gpu_bus_vote(void)
+@@ -249,6 +251,7 @@ gpu_bus_vote(void)
  		int rc = sweet_rpmh_write(bcm[i], 1, &off, &val);
  		a6_log("bus vote %s top -> %d\n", bcm[i], rc);
  	}
@@ -2581,7 +2591,7 @@ index c87ed5d..5dd6099 100644
  }
  
  static void
-@@ -286,8 +288,20 @@ sweet_gpu_init(void)
+@@ -286,8 +289,20 @@ sweet_gpu_init(void)
  	}
  	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
  	a6_init_state(&gpu, ptoa_64(pn));
@@ -2602,7 +2612,7 @@ index c87ed5d..5dd6099 100644
  	gpu.perf_level = lvl;
  	pool_kva = va;
  	vm_offset_t pva = 0;
-@@ -449,11 +463,36 @@ gpu_recover_locked(const char *why)
+@@ -449,11 +464,74 @@ gpu_recover_locked(const char *why)
  
  /* ---- the panel ---- */
  
@@ -2616,10 +2626,48 @@ index c87ed5d..5dd6099 100644
  #define CTL0_FLUSH      (MDP + 0x2000 + 0x18)
  
 +#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++#define SSPP_SRC0_ADDR  0x14
++
++/*
++ * Tear-free present: the panel is a video-mode one (INTF1's timing engine on, scanning at 60 Hz), and a frame drawn into
++ * the buffer it scans shows the line between old and new (fades and icon presses sweeping top to bottom). Frames are drawn
++ * into one of three buffers in ABL's splash carve-out and shown by moving VIG0's address, which a CTL flush applies at
++ * the next vsync. Boot-arg sweetfb_flip=0 draws into the scanned buffer as before.
++ */
++static int panel_flip = -1;     /* -1 until the boot-arg is read (sweet_gpu_panel_stride) */
++static int panel_shown;         /* the buffer VIG0 points at */
++static int panel_last = -1;     /* drawn last, not on screen yet */
++static uint32_t panel_last_fence;
++
++static void
++panel_show_locked(int b)
++{
++	a6_wr(SSPP_VIG(0) + SSPP_SRC0_ADDR, (uint32_t)(A6_FB_PA + A6_FB_BUF * (uint64_t)b));
++	a6_wr(CTL0_FLUSH, 0x1);
++	panel_shown = b;
++}
++
++/* SweetFramebuffer's CPU copy writes the first buffer: put it back on screen before one. */
++void
++sweet_gpu_panel_home(void)
++{
++	lck_mtx_lock(&sweet_gpu_lock);
++	if (panel_shown != 0) {
++		panel_show_locked(0);
++	}
++	panel_last = -1;
++	lck_mtx_unlock(&sweet_gpu_lock);
++}
++
 +/* ABL scans the 1080 columns out through VIG0 alone (the shim's console found it there). */
 +void
 +sweet_gpu_panel_stride(uint32_t stride)
 +{
++	if (panel_flip < 0) {
++		panel_flip = 1;
++		PE_parse_boot_argn("sweetfb_flip", &panel_flip, sizeof(panel_flip));
++		a6_log("panel: %s\n", panel_flip ? "three buffers, flipped at vsync" : "drawn into the scanned buffer");
++	}
 +	a6_wr(SSPP_VIG(0) + SSPP_YSTRIDE0, stride);
 +	a6_wr(CTL0_FLUSH, 0x1);
 +	a6_log("panel stride %u\n", stride);
@@ -2639,7 +2687,7 @@ index c87ed5d..5dd6099 100644
  /* ABL scans out through VIG0 + VIG1 (540 columns each); autorefresh picks a flushed change up. */
  void
  sweet_gpu_panel_stride(uint32_t stride)
-@@ -463,6 +502,7 @@ sweet_gpu_panel_stride(uint32_t stride)
+@@ -463,6 +541,7 @@ sweet_gpu_panel_stride(uint32_t stride)
  	a6_wr(CTL0_FLUSH, 0x3);
  	a6_log("panel stride %u\n", stride);
  }
@@ -2647,7 +2695,7 @@ index c87ed5d..5dd6099 100644
  
  /* ---- surfaces ---- */
  
-@@ -526,6 +566,11 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
+@@ -526,6 +605,11 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
  
  #define IB_OFF          A6_OFF_FREE     /* the present IBs in the pool (two, PRESENT_IB) */
  #define PRESENT_IB(k)   (IB_OFF + 0x4000ULL * (k))
@@ -2659,7 +2707,7 @@ index c87ed5d..5dd6099 100644
  
  static uint32_t present_fence[2];      /* of the present last queued from each IB slot */
  static uint32_t present_next;
-@@ -546,7 +591,11 @@ present_wait_locked(uint32_t k, const char *why)
+@@ -546,7 +630,11 @@ present_wait_locked(uint32_t k, const char *why)
  	return 0;
  }
  #define PANEL_W         1080
@@ -2671,7 +2719,7 @@ index c87ed5d..5dd6099 100644
  #define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
  #define DISPLAY_MASK_SIDE       256u
  #define DISPLAY_MASK_DIM        (DISPLAY_MASK_SIDE * 2)
-@@ -557,6 +606,38 @@ static uint32_t display_mask_radius;
+@@ -557,6 +645,38 @@ static uint32_t display_mask_radius;
  
  static uint64_t stat_frames, stat_clean_abs, stat_gpu_abs;
  
@@ -2710,7 +2758,7 @@ index c87ed5d..5dd6099 100644
  /* The four corner mattes: black, alpha = 1 - coverage of the image (SweetDisplayMask.h). */
  static void
  display_mask_build(uint32_t r, uint32_t ext)
-@@ -598,6 +679,14 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -598,6 +718,14 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	    DISPLAY_STAGE_OFF + (uint64_t)fb_pitch * PANEL_H > A6_POOL_SIZE) {
  		return -1;
  	}
@@ -2725,7 +2773,7 @@ index c87ed5d..5dd6099 100644
  	uint64_t t0 = mach_absolute_time();
  	if (kva) {
  		clean_dcache64((addr64_t)kva, (unsigned)((uint64_t)pitch * h + offset), FALSE);
-@@ -618,6 +707,12 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -618,6 +746,12 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	}
  	frame.dx = (PANEL_W - frame.dw) / 2;
  	frame.dy = (PANEL_H - frame.dh) / 2;
@@ -2738,13 +2786,25 @@ index c87ed5d..5dd6099 100644
  	uint32_t ext = corner_radius ? sweet_display_corner_extent(corner_radius) : 0;
  	if (ext > DISPLAY_MASK_SIDE || 2 * ext >= frame.dw || 2 * ext >= frame.dh) {
  		ext = 0;
-@@ -684,9 +779,16 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -684,12 +818,48 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	uint32_t k = present_next & 1;
  	int rc = present_wait_locked(k, "present");
  	if (rc == 0) {
 +#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++		/* the frame drawn last time goes on screen once the GPU has finished it, and this one is drawn into a buffer
++		 * that is neither on screen, nor leaving it at the next vsync, nor that last frame */
++		int prev_shown = panel_shown;
++		if (panel_flip > 0 && panel_last >= 0 && a6_fence_done(&gpu, panel_last_fence)) {
++			panel_show_locked(panel_last);
++			panel_last = -1;
++		}
++		int b = 0;
++		while (panel_flip > 0 && (b == panel_shown || b == prev_shown || b == panel_last)) {
++			b++;
++		}
 +		uint64_t ib_va = 0;
-+		n = a5_fit_ib(&gpu, PRESENT_FIT(k), !present_fit_built[k], frame.src_iova, A6_GVA_FB, &ib_va);
++		n = a5_fit_ib(&gpu, PRESENT_FIT(k), !present_fit_built[k], frame.src_iova, A6_GVA_FB + A6_FB_BUF * (uint64_t)b,
++		    &ib_va);
 +		present_fit_built[k] = true;
 +#else
 +		uint64_t ib_va = a6_pool_va(PRESENT_IB(k));
@@ -2756,7 +2816,27 @@ index c87ed5d..5dd6099 100644
  		gpu_owner_locked(present_fence[k], 0);
  		rc = present_fence[k] ? 0 : -1;
  		present_next++;
-@@ -1118,6 +1220,23 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++		if (panel_flip > 0 && present_fence[k]) {
++			panel_last = b;
++			panel_last_fence = present_fence[k];
++			/* a short wait for this frame (about 3 ms of GPU) so it is shown at the next vsync and not a present later;
++			 * a frame still queued behind clients' work after that is shown by the next present */
++			for (int i = 0; i < 250 && !a6_fence_done(&gpu, panel_last_fence); i++) {
++				lck_mtx_unlock(&sweet_gpu_lock);
++				delay(20);
++				lck_mtx_lock(&sweet_gpu_lock);
++			}
++			if (panel_last >= 0 && a6_fence_done(&gpu, panel_last_fence)) {
++				panel_show_locked(panel_last);
++				panel_last = -1;
++			}
++		}
++#endif
+ 	}
+ 	lck_mtx_unlock(&sweet_gpu_lock);
+ 	uint64_t t2 = mach_absolute_time();
+@@ -1118,6 +1288,23 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
  	}
  }
  
@@ -3642,12 +3722,14 @@ index 2545cf9..6d3c7e9 100644
  		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
  		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index bc98b59..f3678f2 100644
+index bc98b59..2605e5a 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -49,7 +49,12 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
+@@ -48,8 +48,14 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
+ 	uint32_t fb_pitch, uint32_t corner_radius, uint32_t *out_dx, uint32_t *out_dy,
  	uint32_t *out_dw, uint32_t *out_dh);
  void sweet_gpu_panel_stride(uint32_t stride);
++void sweet_gpu_panel_home(void);        /* a9y18qlte: first panel buffer back on screen (sweet_gpu.c flips three) */
  extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
 +void flush_dcache64(addr64_t addr, unsigned count, int phys);
 +int sweet_gpu_wait_idle_ns(uint64_t timeout_ns);
@@ -3658,7 +3740,7 @@ index bc98b59..f3678f2 100644
  #define SWEET_FB_GPU_ROWBYTES           4352    /* the 2D engine writes 64-byte multiples */
  
  #if defined(SWEET)
-@@ -144,6 +149,9 @@ public:
+@@ -144,6 +150,9 @@ public:
  	void swap(const uint8_t *rec);
  	void present(const uint8_t *rec);
  	bool presentGPU(const uint8_t *rec);
@@ -3668,7 +3750,7 @@ index bc98b59..f3678f2 100644
  	void copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n);
  };
  
-@@ -443,6 +451,100 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
+@@ -443,6 +452,100 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
   * first time, the panel switches to the GPU's row stride and is cleared, so
   * the bars stay black. False: use the CPU copy.
   */
@@ -3769,7 +3851,27 @@ index bc98b59..f3678f2 100644
  bool
  AppleCLCD::presentGPU(const uint8_t *rec)
  {
-@@ -506,8 +608,24 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+@@ -501,13 +604,44 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		sweet_gpu_panel_stride(SWEET_FB_GPU_ROWBYTES);
+ 		fRowBytes = SWEET_FB_GPU_ROWBYTES;
+ 		bzero((void *)fPixels, (size_t)fRowBytes * fHeight);
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++		/* the two other panel buffers the present flips to (sweet_gpu.c): black too, as the fit leaves side bars */
++		for (uint32_t b = 1; b < 3; b++) {
++			IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fPhys + 0xa00000ull * b,
++			    round_page((size_t)fRowBytes * fHeight), kIODirectionInOut);
++			IOMemoryMap *mm = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++			if (mm != NULL && mm->getVirtualAddress() != 0) {
++				bzero((void *)mm->getVirtualAddress(), (size_t)fRowBytes * fHeight);
++			} else {
++				IOLog("SWEET FB: panel buffer %u not mapped\n", b);
++			}
++			OSSafeReleaseNULL(mm);
++			OSSafeReleaseNULL(md);
++		}
++#endif
+ 		fGPU = true;
+ 		IOLockUnlock(fLock);
  		IOLog("SWEET FB: frames now scaled to fit by the GPU (panel stride %u)\n", fRowBytes);
  	}
  	uint32_t dx = 0, dy = 0, dw = 0, dh = 0;
@@ -3796,7 +3898,7 @@ index bc98b59..f3678f2 100644
  	s->release();
  	if (rc) {
  		return gpu_fallback(7, "GPU blit failed");
-@@ -535,9 +653,27 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -535,9 +669,28 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
@@ -3817,6 +3919,7 @@ index bc98b59..f3678f2 100644
 +	if (fit_gpu && sweet_gpu_ready() && presentGPU(rec)) {
 +		return;
 +	}
++	sweet_gpu_panel_home();         /* the CPU copy writes the first buffer, which a GPU present may have flipped away from */
 +	if (presentFitCPU(rec)) {
 +		return;
 +	}
@@ -3824,7 +3927,7 @@ index bc98b59..f3678f2 100644
  	if (sweet_display_fit_w) {
  		sweet_display_fit_w = 0;        /* touch back to the crop mapping */
  		sweet_display_fit_x = sweet_display_fit_y = sweet_display_fit_h = 0;
-@@ -568,6 +704,9 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -568,6 +721,9 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
