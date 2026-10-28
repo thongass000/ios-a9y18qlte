@@ -1362,10 +1362,10 @@ index 0000000..91746ca
 +#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
 diff --git a/bsd/dev/sweet_a5xx.c b/bsd/dev/sweet_a5xx.c
 new file mode 100644
-index 0000000..89191a3
+index 0000000..284a746
 --- /dev/null
 +++ b/bsd/dev/sweet_a5xx.c
-@@ -0,0 +1,771 @@
+@@ -0,0 +1,816 @@
 +/*
 + * Adreno 512 core for the a9y18qlte (SDM660): the sweet_a6xx.h core API
 + * (same a6_* names, so bsd/dev/sweet_gpu.c and the accelerator above it run
@@ -1443,6 +1443,10 @@ index 0000000..89191a3
 +#define GCC_GPU_AHB	(GCC + 0x71004)
 +#define GCC_GPU_BIMC	(GCC + 0x71010)
 +#define GCC_BIMC_GFX	(GCC + 0x7106c)
++#define GCC_GPU_GPLL0	(GCC + 0x5200c)		/* bit 4: GPLL0 to GPUCC (vote) */
++#define GFX_LDO_PWRSWITCH	0x0506e01cull	/* msm_gfx_ldo.c PWRSWITCH_CTRL */
++#define GFX_LDO_STATUS	0x0506e028ull		/* PWRSWITCH_STATUS */
++#define GFX_MEM_ACC	0x01fcf004ull		/* gfx mem-acc, bit 0 */
 +#define GPUCC		A6_GPUCC
 +#define GPUCC_CXO	(GPUCC + 0x1020)
 +#define GPUCC_GFX3D_RCG	(GPUCC + 0x1070)
@@ -1571,6 +1575,44 @@ index 0000000..89191a3
 +	uint32_t b = rd32(GREG(RBBM_ALWAYSON));
 +	a6_log("gx: rc %x, gx gdsc %x, alwayson %x -> %x\n", rc, rd32(GPUCC_GX_GDSCR), a, b);
 +	return a6_gx_up() && a != b ? 0 : -1;
++}
++
++/*
++ * The core clock. Bring-up leaves gfx3d on XO (19.2 MHz). With mhz (struct a6_gpu perf_level on this board),
++ * GPLL0 (600 MHz, from GCC) divided by the RCG's half-integer divider instead: 240 MHz stays below Linux's
++ * lowest corner (266 MHz at CX LOW_SVS), and the core runs from VDD_CX through the gfx LDO's bypass switch,
++ * which the display already holds at SVS or above. Back on XO if the RCG does not latch.
++ */
++#include "sweet_spmi.h"
++
++static void gfx_clock(unsigned mhz)
++{
++	uint8_t s3[2][4];
++	for (unsigned sid = 2; sid <= 3; sid++) {
++		static const unsigned reg[4] = { 0x1a04, 0x1a05, 0x1a40, 0x1a41 };	/* PM660L S3 (CX) */
++		for (unsigned i = 0; i < 4; i++)
++			if (sweet_spmi_init() || sweet_spmi_read(sid, reg[i], &s3[sid - 2][i]))
++				s3[sid - 2][i] = 0xee;
++	}
++	a6_log("rail: gfx ldo pwrswitch %x status %x, mem-acc %x; PM660L S3 type/subtype/range/code sid2 "
++	       "%02x %02x %02x %02x, sid3 %02x %02x %02x %02x\n", rd32(GFX_LDO_PWRSWITCH), rd32(GFX_LDO_STATUS),
++	       rd32(GFX_MEM_ACC), s3[0][0], s3[0][1], s3[0][2], s3[0][3], s3[1][0], s3[1][1], s3[1][2], s3[1][3]);
++	if (mhz == 0)
++		return;
++	uint32_t hid = (1200 + mhz / 2) / mhz - 1;	/* divider 2 * d - 1, d in halves */
++	if (hid < 1)
++		hid = 1;
++	if (hid > 31)
++		hid = 31;
++	wr32(GCC_GPU_GPLL0, rd32(GCC_GPU_GPLL0) | 1u << 4);
++	a6_delay_us(10);
++	wr32(GPUCC_GFX3D_RCG + 4, 5u << 8 | hid);		/* source 5: GPLL0_OUT_MAIN */
++	wr32(GPUCC_GFX3D_RCG, rd32(GPUCC_GFX3D_RCG) | 1);
++	int rc = wait_bit(GPUCC_GFX3D_RCG, 1, 0, 1000);
++	if (rc)
++		(void)rcg_xo(GPUCC_GFX3D_RCG, true);
++	a6_log("gfx3d: GPLL0 / %u%s = %u MHz: %s (cfg %x)\n", (hid + 1) / 2, (hid & 1) ? "" : ".5", 1200 / (hid + 1),
++	       rc ? "did not latch, back on XO" : "ok", rd32(GPUCC_GFX3D_RCG + 4));
 +}
 +
 +/* ---- SMMU ---- */
@@ -2073,7 +2115,10 @@ index 0000000..89191a3
 +	if (power_cx() || smmu_reset())
 +		return -1;
 +	map_gpu_low(g);
-+	if (smmu_banks(a6_pool_pa(g, A6_OFF_GT_L1)) || power_gx() || gpu_cp_init(g, false))
++	if (smmu_banks(a6_pool_pa(g, A6_OFF_GT_L1)) || power_gx())
++		return -1;
++	gfx_clock(g->perf_level);
++	if (gpu_cp_init(g, false))
 +		return -1;
 +	/* self test: an IB (scratch + 0x200) whose CP_MEM_WRITE lands at scratch + 0x100 */
 +	uint64_t ib = a6_pool_va(A6_OFF_SCRATCH + 0x200), dst = a6_pool_va(A6_OFF_SCRATCH + 0x100);
@@ -2349,7 +2394,7 @@ index 0155304..fb56a32 100644
  #include <sys/param.h>
  #include <sys/systm.h>
 diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
-index d9d7860..3071be4 100644
+index d9d7860..24e8990 100644
 --- a/bsd/dev/sweet_a6xx.h
 +++ b/bsd/dev/sweet_a6xx.h
 @@ -48,11 +48,19 @@
@@ -2372,6 +2417,15 @@ index d9d7860..3071be4 100644
  
  struct a6_gpu {
  	uint64_t pool_pa;
+@@ -61,7 +69,7 @@ struct a6_gpu {
+ 	uint32_t fence;			/* last fence value submitted */
+ 	uint32_t hfi_seq;
+ 	uint32_t pt_next;		/* next free table in the arena */
+-	uint32_t perf_level;		/* GMU perf vote: 1 (257 MHz) .. 5 (585 MHz); 0 = 1 */
++	uint32_t perf_level;		/* GMU perf vote: 1 (257 MHz) .. 5 (585 MHz); 0 = 1. A512: MHz, 0 = XO */
+ };
+ 
+ /* ---- environment ---- */
 @@ -146,6 +154,28 @@ struct a6_blit {
  #define A6_BLIT_MAX_DW	256
  uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *dw);
@@ -2420,7 +2474,7 @@ index d9d7860..3071be4 100644
  #define A6_FSR_FAULT		0xc00001feu
  #define A6_GMEM_LOG_OFF		0x91000ull
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index c87ed5d..ad50096 100644
+index c87ed5d..d642148 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -238,6 +238,7 @@ int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const
@@ -2439,7 +2493,21 @@ index c87ed5d..ad50096 100644
  }
  
  static void
-@@ -449,11 +451,25 @@ gpu_recover_locked(const char *why)
+@@ -286,8 +288,13 @@ sweet_gpu_init(void)
+ 	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
+ 	a6_init_state(&gpu, ptoa_64(pn));
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	uint32_t lvl = 0;	/* the a512's core clock in MHz from GPLL0 (sweet_a5xx.c); 0: XO */
++	PE_parse_boot_argn("sweetgpumhz", &lvl, sizeof(lvl));
++#else
+ 	uint32_t lvl = 4;	/* 499 MHz; boot-arg sweetgpufreq=1 (257) .. 5 (585) */
+ 	PE_parse_boot_argn("sweetgpufreq", &lvl, sizeof(lvl));
++#endif
+ 	gpu.perf_level = lvl;
+ 	pool_kva = va;
+ 	vm_offset_t pva = 0;
+@@ -449,11 +456,25 @@ gpu_recover_locked(const char *why)
  
  /* ---- the panel ---- */
  
@@ -2465,7 +2533,7 @@ index c87ed5d..ad50096 100644
  /* ABL scans out through VIG0 + VIG1 (540 columns each); autorefresh picks a flushed change up. */
  void
  sweet_gpu_panel_stride(uint32_t stride)
-@@ -463,6 +479,7 @@ sweet_gpu_panel_stride(uint32_t stride)
+@@ -463,6 +484,7 @@ sweet_gpu_panel_stride(uint32_t stride)
  	a6_wr(CTL0_FLUSH, 0x3);
  	a6_log("panel stride %u\n", stride);
  }
@@ -2473,7 +2541,7 @@ index c87ed5d..ad50096 100644
  
  /* ---- surfaces ---- */
  
-@@ -526,6 +543,11 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
+@@ -526,6 +548,11 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
  
  #define IB_OFF          A6_OFF_FREE     /* the present IBs in the pool (two, PRESENT_IB) */
  #define PRESENT_IB(k)   (IB_OFF + 0x4000ULL * (k))
@@ -2485,7 +2553,7 @@ index c87ed5d..ad50096 100644
  
  static uint32_t present_fence[2];      /* of the present last queued from each IB slot */
  static uint32_t present_next;
-@@ -546,7 +568,11 @@ present_wait_locked(uint32_t k, const char *why)
+@@ -546,7 +573,11 @@ present_wait_locked(uint32_t k, const char *why)
  	return 0;
  }
  #define PANEL_W         1080
@@ -2497,7 +2565,7 @@ index c87ed5d..ad50096 100644
  #define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
  #define DISPLAY_MASK_SIDE       256u
  #define DISPLAY_MASK_DIM        (DISPLAY_MASK_SIDE * 2)
-@@ -598,6 +624,14 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -598,6 +629,14 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	    DISPLAY_STAGE_OFF + (uint64_t)fb_pitch * PANEL_H > A6_POOL_SIZE) {
  		return -1;
  	}
@@ -2512,7 +2580,7 @@ index c87ed5d..ad50096 100644
  	uint64_t t0 = mach_absolute_time();
  	if (kva) {
  		clean_dcache64((addr64_t)kva, (unsigned)((uint64_t)pitch * h + offset), FALSE);
-@@ -618,6 +652,12 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -618,6 +657,12 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	}
  	frame.dx = (PANEL_W - frame.dw) / 2;
  	frame.dy = (PANEL_H - frame.dh) / 2;
@@ -2525,7 +2593,7 @@ index c87ed5d..ad50096 100644
  	uint32_t ext = corner_radius ? sweet_display_corner_extent(corner_radius) : 0;
  	if (ext > DISPLAY_MASK_SIDE || 2 * ext >= frame.dw || 2 * ext >= frame.dh) {
  		ext = 0;
-@@ -684,9 +724,16 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -684,9 +729,16 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	uint32_t k = present_next & 1;
  	int rc = present_wait_locked(k, "present");
  	if (rc == 0) {
@@ -2543,7 +2611,7 @@ index c87ed5d..ad50096 100644
  		gpu_owner_locked(present_fence[k], 0);
  		rc = present_fence[k] ? 0 : -1;
  		present_next++;
-@@ -1118,6 +1165,23 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
+@@ -1118,6 +1170,23 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
  	}
  }
  
@@ -2582,7 +2650,7 @@ index d405964..5d43ce3 100644
  static LCK_GRP_DECLARE(sweet_pmem_grp, "sweet_pmem");
  static LCK_MTX_DECLARE(sweet_pmem_lock, &sweet_pmem_grp);
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
-index 6a121c5..bbf7129 100644
+index 6a121c5..2fc87aa 100644
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
 @@ -15,17 +15,56 @@
@@ -2685,7 +2753,7 @@ index 6a121c5..bbf7129 100644
  		printf("SWEET BATTERY: unsupported SPMI arb=%#x APIDs=%u\n",
  		    arb_version, sp_count);
  		return -1;
-@@ -89,9 +140,17 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+@@ -89,9 +140,18 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
  {
  	/* Restrict access to the battery blocks and the RTC (0x60); keys retain their own lanes. */
  	unsigned peripheral = addr >> 8;
@@ -2697,16 +2765,17 @@ index 6a121c5..bbf7129 100644
 +#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
 +	/*
 +	 * PM660 PON: power and volume down (a9y_keys.c), cable power (SweetBattery);
-+	 * PM660L GPIO 7/8: volume up, Bixby
++	 * PM660L GPIO 7/8: volume up, Bixby; PM660L S3 (VDD_CX, the GPU's rail: sweet_a5xx.c)
 +	 */
 +	allowed = allowed || (sid == 0 && peripheral == 0x08) ||
-+	    (sid == 2 && (peripheral == 0xc6 || peripheral == 0xc7));
++	    (sid == 2 && (peripheral == 0xc6 || peripheral == 0xc7)) ||
++	    ((sid == 2 || sid == 3) && peripheral == 0x1a);
 +#endif
 +	if (!sp_ready || !out || addr > 0xffffu || !allowed) {
  		return -1;
  	}
  	IOLockLock(sp_lock);
-@@ -100,19 +159,23 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+@@ -100,19 +160,23 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
  		IOLockUnlock(sp_lock);
  		return -1;
  	}
