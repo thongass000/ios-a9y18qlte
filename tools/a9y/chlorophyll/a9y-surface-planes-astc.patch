@@ -1,5 +1,5 @@
 diff --git a/air/air_metal.c b/air/air_metal.c
-index de181b4..a1c5ab7 100644
+index de181b4..2c32c04 100644
 --- a/air/air_metal.c
 +++ b/air/air_metal.c
 @@ -257,6 +257,11 @@ struct rwa_texture {
@@ -52,10 +52,77 @@ index de181b4..a1c5ab7 100644
           sbo_cache[sbo_victim].used = ++sbo_clock;
           pipe_resource_reference(&sbo_cache[sbo_victim].res, texture->res);
        }
-@@ -1842,6 +1860,14 @@ rwa_texture_flush_surface(struct rwa_texture *texture)
+@@ -1842,6 +1860,81 @@ rwa_texture_flush_surface(struct rwa_texture *texture)
     return sweet_drm_bo_sync(-1, texture->surface_handle, 0, 0);
  }
  
++/* a9y18qlte: Mesa's own ASTC decoder (src/mesa/main/texcompress_astc.cpp, built into libbgair by
++ * tools/a9y/mesa/a9y-bgair-astc.patch) and the three format questions it asks, answered from the
++ * Gallium tables (mesa_format is enum pipe_format): libbgair has no Mesa GL core to ask. */
++void _mesa_unpack_astc_2d_ldr(uint8_t *dst_row, unsigned dst_stride, const uint8_t *src_row, unsigned src_stride,
++                              unsigned src_width, unsigned src_height, enum pipe_format format);
++bool _mesa_is_format_astc_2d(enum pipe_format format);
++bool _mesa_is_format_srgb(enum pipe_format format);
++void _mesa_get_format_block_size(enum pipe_format format, unsigned *bw, unsigned *bh);
++
++bool
++_mesa_is_format_astc_2d(enum pipe_format format)
++{
++   return util_format_description(format)->layout == UTIL_FORMAT_LAYOUT_ASTC &&
++          util_format_get_blockdepth(format) == 1;
++}
++
++bool
++_mesa_is_format_srgb(enum pipe_format format)
++{
++   return util_format_is_srgb(format);
++}
++
++void
++_mesa_get_format_block_size(enum pipe_format format, unsigned *bw, unsigned *bh)
++{
++   *bw = util_format_get_blockwidth(format);
++   *bh = util_format_get_blockheight(format);
++}
++
++/* a9y18qlte: the A512 samples CoreAnimation's ASTC snapshots as one flat colour (the app switcher's further cards
++ * purple; the bytes are valid ASTC, none zero), so an ASTC texture's level 0 is decoded here on the CPU into RGBA8
++ * and the caller samples that instead (rwa_texture_astc_decoded). Returns NULL when the texture is not ASTC. */
++struct rwa_texture *
++rwa_texture_astc_decoded(struct rwa_texture *texture, const void *blocks, size_t length, char *why, size_t why_size)
++{
++   if (!texture || !texture->res || !_mesa_is_format_astc_2d(texture->res->format))
++      return NULL;
++   unsigned w = texture->shape.width, h = texture->shape.height ? texture->shape.height : 1;
++   unsigned bw = util_format_get_blockwidth(texture->res->format), bh = util_format_get_blockheight(texture->res->format);
++   size_t row = (size_t)((w + bw - 1) / bw) * 16;
++   if (row * ((h + bh - 1) / bh) > length) {
++      say(why, why_size, "%zu bytes for a %ux%u %s, which needs %zu", length, w, h, texture->format_name,
++          row * ((h + bh - 1) / bh));
++      return NULL;
++   }
++   uint8_t *rgba = malloc((size_t)w * h * 4);
++   if (!rgba) {
++      say(why, why_size, "out of memory decoding a %ux%u %s", w, h, texture->format_name);
++      return NULL;
++   }
++   _mesa_unpack_astc_2d_ldr(rgba, w * 4, blocks, (unsigned)row, w, h, texture->res->format);
++   struct rwa_texture_shape shape = texture->shape;
++   shape.pixel_format = util_format_is_srgb(texture->res->format) ? 71 /* MTLPixelFormatRGBA8Unorm_sRGB */
++                                                                  : 70 /* MTLPixelFormatRGBA8Unorm */;
++   shape.mip_levels = 1;
++   struct rwa_texture *out = rwa_texture_create(texture->device, &shape, why, why_size);
++   if (out) {
++      const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
++      if (rwa_texture_write(out, 0, 0, o, sz, rgba, (size_t)w * 4, why, why_size) != 0) {
++         rwa_texture_destroy(out);
++         out = NULL;
++      }
++   }
++   free(rgba);
++   return out;
++}
++
 +unsigned
 +rwa_texture_block_rows(const struct rwa_texture *texture, unsigned height)
 +{
@@ -67,7 +134,7 @@ index de181b4..a1c5ab7 100644
  /* Chlorophyll: a texture-to-texture copy on the GPU (freedreno's blitter), queued in order with the draws: no CPU read of memory
   * the GPU wrote (no cache maintenance, no wait). QuartzCore copies its framebuffer into a texture for every backdrop blur; done
   * on the CPU that read stale cache lines (white materials) or needed a full clean of a 10 MB surface. Refuses (-1, the caller
-@@ -1882,10 +1908,36 @@ texture_surface(struct rwa_texture *t)
+@@ -1882,10 +1975,36 @@ texture_surface(struct rwa_texture *t)
  {
     if (!t->surface)
        t->surface = t->device->pipe->create_surface(t->device->pipe, t->res,
@@ -105,7 +172,7 @@ index de181b4..a1c5ab7 100644
  /* Bind a framebuffer of cached surfaces and remember which textures it holds. An equal state is a no-op in
   * freedreno (util_framebuffer_state_equal compares the surface pointers), which is the point. */
  static void
-@@ -1930,7 +1982,7 @@ rwa_texture_destroy(struct rwa_texture *texture)
+@@ -1930,7 +2049,7 @@ rwa_texture_destroy(struct rwa_texture *texture)
      * the moment the last reference went, which is the same trap delete_compute_state
      * below is about.
      */
@@ -114,7 +181,7 @@ index de181b4..a1c5ab7 100644
         tex_pool_put(texture->device, texture->res, texture->view)) {
        free(texture);          /* the pool holds the resource's reference and the view now */
        return;
-@@ -7440,6 +7492,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char
+@@ -7440,6 +7559,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char
           goto fail;
        }
        if (present++ == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
@@ -122,7 +189,7 @@ index de181b4..a1c5ab7 100644
        surf[i] = texture_surface(t);
        if (!surf[i]) { say(why, why_size, "no render surface for colour attachment %u", i); goto fail; }
        fb.cbufs[i] = surf[i];
-@@ -7716,13 +7769,15 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+@@ -7716,13 +7836,15 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        }
        unsigned tw = t->shape.width;
        unsigned th = t->shape.height ? t->shape.height : 1;
@@ -143,10 +210,10 @@ index de181b4..a1c5ab7 100644
     }
  
 diff --git a/air/air_metal.h b/air/air_metal.h
-index ee2b232..72af9e4 100644
+index ee2b232..4f80de8 100644
 --- a/air/air_metal.h
 +++ b/air/air_metal.h
-@@ -141,6 +141,11 @@ struct rwa_texture *rwa_texture_create(struct rwa_device *device,
+@@ -141,6 +141,15 @@ struct rwa_texture *rwa_texture_create(struct rwa_device *device,
  void rwa_texture_destroy(struct rwa_texture *texture);
  /* Bergamota: after the GPU work that wrote an IOSurface-backed texture has finished, make its pixels visible to the compositor. */
  int rwa_texture_flush_surface(struct rwa_texture *texture);
@@ -155,20 +222,33 @@ index ee2b232..72af9e4 100644
 +/* a9y18qlte: a texture that renders into one mip level of another's memory (a render pass's attachment level); NULL
 + * past the last level. Destroyed with rwa_texture_destroy, which leaves the other texture alone. */
 +struct rwa_texture *rwa_texture_level_view(struct rwa_texture *texture, unsigned level);
++/* a9y18qlte: an RGBA8 texture holding an ASTC texture's level 0 decoded on the CPU from these blocks (packed rows of
++ * blocks); NULL when the texture is not ASTC or the decode failed (why says which). */
++struct rwa_texture *rwa_texture_astc_decoded(struct rwa_texture *texture, const void *blocks, size_t length, char *why,
++                                             size_t why_size);
  
  /*
   * The same texture, over memory somebody else allocated: an IOSurface of CoreAnimation's.
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index 7243a7d..b674720 100644
+index 7243a7d..f2e809d 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
-@@ -345,7 +345,14 @@ bg_install_fallback(Class c)
+@@ -24,6 +24,7 @@
+ #import <objc/message.h>
+ #import <objc/runtime.h>
+ #include <time.h>
++#include <mach/mach_time.h>
+ #import <IOSurface/IOSurfaceRef.h>
+ #include <dlfcn.h>
+ #include <stdarg.h>
+@@ -345,7 +346,15 @@ bg_install_fallback(Class c)
     const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
     NSUInteger _ncLength;
     void (^_ncDealloc)(void *, NSUInteger);
 -}
 +   BOOL _ncLoaded;       // a block-compressed one: copied when its bytes change (_ncHash, sampled), not at each use
 +   uint64_t _ncHash;
++   struct rwa_texture *_astcTex;   // a9y18qlte: an ASTC no-copy texture decoded on the CPU (RGBA8), sampled in its place
 +   BOOL _cpuCopy;        // a9y18qlte: an IOSurface the GPU cannot import (a pitch its own layout would change): a texture of ours,
 +   BOOL _cpuLoaded;      // filled from the surface's memory and again whenever its seed moves
 +   uint32_t _cpuSeed;
@@ -178,7 +258,7 @@ index 7243a7d..b674720 100644
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
  - (struct rwa_texture *)rwaTexture;
-@@ -1564,6 +1571,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1564,6 +1573,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     w->t_sslice = ss; w->t_slevel = sl; w->t_dslice = ds; w->t_dlevel = dl;
     w->t_sorg[0] = so.x; w->t_sorg[1] = so.y; w->t_sorg[2] = so.z; w->t_dorg[0] = dorg.x; w->t_dorg[1] = dorg.y; w->t_dorg[2] = dorg.z;
     w->t_size[0] = size.width; w->t_size[1] = size.height; w->t_size[2] = size.depth;
@@ -189,7 +269,7 @@ index 7243a7d..b674720 100644
     [_cb bgRecord:w];
  }
  - (void)copyFromTexture:(id)src toTexture:(id)dst
-@@ -1612,6 +1623,9 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1612,6 +1625,9 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  - (void)synchronizeTexture:(id)t slice:(NSUInteger)s level:(NSUInteger)l { (void)t; (void)s; (void)l; }
  - (void)generateMipmapsForTexture:(id)t
  {
@@ -199,7 +279,7 @@ index 7243a7d..b674720 100644
     BGWork *w = [[[BGWork alloc] init] autorelease];
     w->kind = BG_WORK_MIPMAPS; w->dst = [t retain];
     [_cb bgRecord:w];
-@@ -1650,8 +1664,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1650,8 +1666,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     if (surface) {
        _shape.usage |= 5;   /* a drawable is rendered into and may be sampled whatever CA asked for (MTLTextureUsageRenderTarget | ShaderRead) */
        /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
@@ -217,7 +297,7 @@ index 7243a7d..b674720 100644
        bg_unlock();
        _surface = CFRetain(surface);
        _plane = plane;
-@@ -1660,12 +1682,53 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1660,13 +1684,54 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
        _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
        bg_unlock();
     }
@@ -268,11 +348,13 @@ index 7243a7d..b674720 100644
 +}
  - (void)dealloc
  {
+-   bg_lock(); if (_tex) rwa_texture_destroy(_tex); bg_unlock();
 +   for (unsigned i = 0; i < 16; i++) [_levelViews[i] release];
-    bg_lock(); if (_tex) rwa_texture_destroy(_tex); bg_unlock();
++   bg_lock(); if (_astcTex) rwa_texture_destroy(_astcTex); if (_tex) rwa_texture_destroy(_tex); bg_unlock();
     if (_surface) CFRelease(_surface);
     [_linSrc release];
-@@ -1691,6 +1754,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+    if (_ncDealloc) { _ncDealloc((void *)_ncBytes, _ncLength); Block_release(_ncDealloc); }
+@@ -1691,6 +1756,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
     // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
     // (one kernel clean per surface, ever) left those layers stale or missing until this.
@@ -292,7 +374,7 @@ index 7243a7d..b674720 100644
     if (_surface && _tex) {
        static NSMutableDictionary *seeds;
        static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
-@@ -1710,13 +1786,49 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1710,13 +1788,64 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  - (struct rwa_texture *)rwaTexture
  {
@@ -321,7 +403,22 @@ index 7243a7d..b674720 100644
 -      if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)_ncBytes, (unsigned)(_ncLength / (_shape.height ? _shape.height : 1)),
 +      /* a9y18qlte: a row of the caller's memory is a row of blocks (ASTC 4x4 snapshots: length / height was a quarter of one, and
 +       * every refresh was refused). Their length is page-rounded, so it says nothing of the row: blocks are packed (stride 0). */
-+      if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)_ncBytes,
++      /* a9y18qlte: ASTC is decoded on the CPU into an RGBA8 texture that is sampled instead (the A512 drew it as one colour) */
++      struct rwa_texture *dec = NULL;
++      uint64_t t0 = mach_absolute_time();
++      if (rows != _shape.height) dec = rwa_texture_astc_decoded(_tex, _ncBytes, _ncLength, why, sizeof(why));
++      if (dec) {
++         if (_astcTex) rwa_texture_destroy(_astcTex);
++         _astcTex = dec;
++         static int toldDec;
++         if (toldDec++ < 8) {
++            mach_timebase_info_data_t tb; mach_timebase_info(&tb);
++            BG_LOG("ASTC %ux%u decoded on the CPU in %llu ms\n", _shape.width, _shape.height,
++                   (unsigned long long)((mach_absolute_time() - t0) * tb.numer / tb.denom / 1000000));
++         }
++      }
++      if (!dec && why[0]) BG_LOG("ASTC decode: %s\n", why);
++      if (!dec && rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)_ncBytes,
 +                            rows != _shape.height ? 0 : (unsigned)(_ncLength / (_shape.height ? _shape.height : 1)),
                              why, sizeof(why)) != 0)
           BG_LOG("no-copy texture refresh: %s\n", why);
@@ -344,7 +441,16 @@ index 7243a7d..b674720 100644
        bg_unlock();
     }
     if (_linSrc && _tex) {
-@@ -1872,7 +1984,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1728,7 +1857,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+          BG_LOG("linear texture refresh: %s\n", why);
+       bg_unlock();
+    }
+-   return _tex;
++   return _astcTex ? _astcTex : _tex;
+ }
+ - (id)device { return _owner; }
+ - (NSUInteger)width { return _shape.width; }
+@@ -1872,7 +2001,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     for (unsigned i = 0; i < 8; i++) {
        MTLRenderPassColorAttachmentDescriptor *a = [[d colorAttachments] objectAtIndexedSubscript:i];
        if (!a || ![a texture]) continue;
@@ -356,7 +462,7 @@ index 7243a7d..b674720 100644
        _ncolor = i + 1;
        if ([a loadAction] == MTLLoadActionClear) {
           MTLClearColor c = [a clearColor];
-@@ -1940,7 +2055,13 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1940,7 +2072,13 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
     if (b) { [_scratch addObject:b]; [self setFragmentBuffer:b offset:0 atIndex:i]; }
  }
@@ -371,7 +477,7 @@ index 7243a7d..b674720 100644
  - (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _smp[i] = s; if (i + 1 > _shigh) _shigh = (unsigned)i + 1; } }
  - (void)setViewport:(MTLViewport)v
  {
-@@ -1961,6 +2082,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1961,6 +2099,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
          indexBuffer:(id)ib indexType:(NSUInteger)it indexOffset:(NSUInteger)io baseVertex:(NSInteger)bv baseInstance:(NSUInteger)bi
  {
     if (!_pipeline) { BG_LOG("draw with no pipeline\n"); return; }
@@ -380,7 +486,7 @@ index 7243a7d..b674720 100644
        BG_LOG("draw: prim %lu start %lu count %lu inst %lu index %s type %lu off %lu\n", (unsigned long)prim, (unsigned long)start,
               (unsigned long)count, (unsigned long)inst, ib ? "yes" : "no", (unsigned long)it, (unsigned long)io);
 diff --git a/test/bgmtl_carenderer_probe.m b/test/bgmtl_carenderer_probe.m
-index bab10f8..47c9269 100644
+index bab10f8..09f13d8 100644
 --- a/test/bgmtl_carenderer_probe.m
 +++ b/test/bgmtl_carenderer_probe.m
 @@ -167,6 +167,39 @@ make_scene(int n)
@@ -423,16 +529,49 @@ index bab10f8..47c9269 100644
     case 10: {  // square corners at fractional positions, edge antialiased: the fringe alone
        CALayer *b = [CALayer layer];
        b.frame = CGRectMake(40.5, 40.25, 175.5, 175.75);
-@@ -236,7 +269,7 @@ main(int argc, char **argv)
+@@ -236,7 +269,40 @@ main(int argc, char **argv)
        printf("default device: %s\n", d ? [[d name] UTF8String] : "nil");
        if (!d) return 2;
        int bad = 0, done = 0;
 -      for (int n = 0; n < 11; n++) {
++      if (argc > 2 && !strcmp(argv[2], "mip")) {
++         // a9y18qlte: render passes into mip levels: level 1 cleared red, level 0 green, level 2 drawn by a pass that loads it
++         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64
++                                                                                   mipmapped:YES];
++         td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
++         id<MTLTexture> t = [d newTextureWithDescriptor:td];
++         id<MTLCommandQueue> q = [d newCommandQueue];
++         id<MTLCommandBuffer> cb = [q commandBuffer];
++         const double col[3][4] = { { 0, 1, 0, 1 }, { 1, 0, 0, 1 }, { 0, 0, 1, 1 } };   // level 0 green, 1 red, 2 blue
++         for (int lv = 0; lv < 3; lv++) {
++            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
++            rp.colorAttachments[0].texture = t;
++            rp.colorAttachments[0].level = lv;
++            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
++            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
++            rp.colorAttachments[0].clearColor = MTLClearColorMake(col[lv][0], col[lv][1], col[lv][2], col[lv][3]);
++            [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
++         }
++         [cb commit];
++         [cb waitUntilCompleted];
++         for (int lv = 0; lv < 3; lv++) {
++            unsigned s = 64 >> lv;
++            uint8_t *px = calloc(s * s, 4);
++            [t getBytes:px bytesPerRow:s * 4 fromRegion:MTLRegionMake2D(0, 0, s, s) mipmapLevel:lv];
++            printf("mip level %d (%ux%u, want BGRA %d %d %d): first %u %u %u %u, centre %u %u %u %u, last %u %u %u %u\n", lv, s, s,
++                   (int)(col[lv][2] * 255), (int)(col[lv][1] * 255), (int)(col[lv][0] * 255),
++                   px[0], px[1], px[2], px[3], px[(s / 2 * s + s / 2) * 4], px[(s / 2 * s + s / 2) * 4 + 1],
++                   px[(s / 2 * s + s / 2) * 4 + 2], px[(s / 2 * s + s / 2) * 4 + 3], px[(s * s - 1) * 4], px[(s * s - 1) * 4 + 1],
++                   px[(s * s - 1) * 4 + 2], px[(s * s - 1) * 4 + 3]);
++            free(px);
++         }
++         return 0;
++      }
 +      for (int n = 0; n < 13; n++) {
           if (only >= 0 && n != only) continue;
           CALayer *scene = make_scene(n);
           // the reference: CoreAnimation's CPU path into a bitmap
-@@ -285,6 +318,14 @@ main(int argc, char **argv)
+@@ -285,6 +351,14 @@ main(int argc, char **argv)
           double sum = 0; unsigned nonzero = 0;
           for (int i = 0; i < W * H * 4; i++) { sum += abs((int)out[i] - (int)ref[i]); if (out[i]) nonzero++; }
           printf("scene %d: mean abs diff %.2f over %d channels, %u non-zero bytes rendered\n", n, sum / (W * H * 4), W * H * 4, nonzero);

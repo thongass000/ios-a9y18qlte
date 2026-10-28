@@ -44,6 +44,7 @@ if [ ! -d mesa-air ]; then
 		fd-bo-new-purge-retry; do
 		patch -p1 -d mesa-air < "chl/patches/$p.patch"
 	done
+	patch -p1 -d mesa-air < "$MESA/a9y-bgair-astc.patch"   # libbgair gets Mesa's ASTC decoder (after air-ir3 declares it)
 	mkdir -p mesa-air/src/compiler/air
 	cp chl/air/* mesa-air/src/compiler/air/
 fi

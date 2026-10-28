@@ -1,0 +1,13 @@
+--- a/src/gallium/drivers/freedreno/meson.build	2026-10-28 20:46:56.874705971 +0700
++++ b/src/gallium/drivers/freedreno/meson.build	2026-10-28 20:47:09.119248088 +0700
+@@ -331,7 +331,9 @@
+ 
+   libbgair = shared_library(
+     'bgair',
+-    files('../../../compiler/air/air_metal.c'),
++    files('../../../compiler/air/air_metal.c',
++          # a9y18qlte: Mesa's ASTC decoder, for the snapshots the A512 samples as one colour (air_metal.c)
++          '../../../mesa/main/texcompress_astc.cpp'),
+     include_directories : [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium,
+                            inc_gallium_aux, inc_gallium_winsys_sw, inc_gallium_winsys,
+                            include_directories('../../drivers')],
