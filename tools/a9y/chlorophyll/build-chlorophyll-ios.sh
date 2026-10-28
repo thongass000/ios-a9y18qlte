@@ -65,6 +65,7 @@ OBJC=(-O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations)
 O="$WORK/out/chl"
 mkdir -p "$O"
 cp -f "$BLD/src/gallium/drivers/freedreno/libbgair.dylib" "$O/libbgair.dylib"
+cp "$O/libbgair.dylib" "$O/libbgair.syms.dylib"   # a9y18qlte: local symbols kept, for naming profiler offsets (not deployed)
 xcrun strip -x "$O/libbgair.dylib"
 "${CC[@]}" "${OBJC[@]}" -I chl/air -c chl/src/bgmtl.m -o "$O/bgmtl.o"
 # the Metal probes, then CoreAnimation over the device in a test process (MTLAddDevice, CAMetalLayer drawables, CARenderer
