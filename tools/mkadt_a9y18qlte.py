@@ -46,6 +46,11 @@ UFS, UFS_SIZE = 0x1da4000, 0x3000
 
 # Kryo 260: cpu0-3 Cortex-A53 based (MPIDR 0x0-0x3), cpu4-7 Cortex-A73 based (0x100-0x103)
 CPUS = [(0x000 + i, 1843200000) for i in range(4)] + [(0x100 + i, 2208000000) for i in range(4)]
+# A9Y_GOLD_FIRST=1: the boot core, then the gold cluster, then the rest of silver, so that cpus=5 is cpu0 and the
+# four A73s (XNU's scheduler does not know the clusters apart: with all eight the compositor lands on an A53 half
+# of the time)
+if os.environ.get('A9Y_GOLD_FIRST') == '1':
+    CPUS = CPUS[:1] + CPUS[4:] + CPUS[1:4]
 
 
 def prop(n, key):
