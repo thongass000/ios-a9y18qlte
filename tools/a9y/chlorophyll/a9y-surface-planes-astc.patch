@@ -244,10 +244,10 @@ index ee2b232..4f80de8 100644
  /*
   * The same texture, over memory somebody else allocated: an IOSurface of CoreAnimation's.
 diff --git a/inject/bgmtl_inject.m b/inject/bgmtl_inject.m
-index 56a4384..fc0374d 100644
+index 56a4384..c34c219 100644
 --- a/inject/bgmtl_inject.m
 +++ b/inject/bgmtl_inject.m
-@@ -245,6 +245,142 @@ watchdog_bb(void *arg)
+@@ -245,6 +245,152 @@ watchdog_bb(void *arg)
     return NULL;
  }
  
@@ -261,7 +261,7 @@ index 56a4384..fc0374d 100644
 +#include <mach/thread_act.h>
 +
 +#define F_PROF "/private/var/tmp/a9yprof"
-+enum { PROF_DEPTH = 12, PROF_MAX = 16384, PROF_TOP = 40 };
++enum { PROF_DEPTH = 16, PROF_MAX = 16384, PROF_TOP = 50 };
 +struct prof_hit { uintptr_t addr; unsigned self, incl; };
 +
 +static int
@@ -274,10 +274,17 @@ index 56a4384..fc0374d 100644
 +static void
 +prof_report(struct prof_hit *h, unsigned n, unsigned samples, int by_incl)
 +{
-+   /* functions, not addresses: each address folded to its dladdr symbol start */
++   /* functions, not addresses: each address folded to its dladdr symbol start -- except in Chlorophyll's own libraries,
++    * whose functions are not exported (dladdr names the nearest export): their raw offsets are kept, rounded to 64 bytes,
++    * for nm on the build machine */
 +   for (unsigned i = 0; i < n; i++) {
 +      Dl_info di;
-+      if (dladdr((void *)h[i].addr, &di) && di.dli_saddr) h[i].addr = (uintptr_t)di.dli_saddr;
++      if (!dladdr((void *)h[i].addr, &di)) continue;
++      if (di.dli_fname && (strstr(di.dli_fname, "libbgair") || strstr(di.dli_fname, "bgmtl-inject") ||
++                           strstr(di.dli_fname, "libdrm")))
++         h[i].addr &= ~(uintptr_t)63;
++      else if (di.dli_saddr)
++         h[i].addr = (uintptr_t)di.dli_saddr;
 +   }
 +   qsort(h, n, sizeof(*h), prof_cmp);
 +   unsigned m = 0;
@@ -339,14 +346,17 @@ index 56a4384..fc0374d 100644
 +      uint64_t end = clock_gettime_nsec_np(CLOCK_MONOTONIC) + (uint64_t)secs * 1000000000ull;
 +      while (n < PROF_MAX && clock_gettime_nsec_np(CLOCK_MONOTONIC) < end) {
 +         usleep(2000);
-+         if (thread_suspend(target) != KERN_SUCCESS) break;
-+         arm_thread_state64_t st;
-+         mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
++         /* running or not is asked BEFORE the suspend: a suspended thread never reports TH_STATE_RUNNING (the first
++          * profile kept 20 of 10000 samples) */
 +         thread_basic_info_data_t bi;
 +         mach_msg_type_number_t bcnt = THREAD_BASIC_INFO_COUNT;
 +         int running = thread_info(target, THREAD_BASIC_INFO, (thread_info_t)&bi, &bcnt) == KERN_SUCCESS &&
 +                       bi.run_state == TH_STATE_RUNNING;
-+         if (running && thread_get_state(target, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
++         if (!running) { idle++; continue; }
++         if (thread_suspend(target) != KERN_SUCCESS) break;
++         arm_thread_state64_t st;
++         mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
++         if (thread_get_state(target, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
 +            unsigned d = 0;
 +            frames[n][d++] = (uintptr_t)arm_thread_state64_get_pc(st);
 +            frames[n][d++] = (uintptr_t)arm_thread_state64_get_lr(st);
@@ -390,7 +400,7 @@ index 56a4384..fc0374d 100644
  static void *
  watchdog(void *arg)
  {
-@@ -351,6 +487,8 @@ bb_init(void)
+@@ -351,6 +497,8 @@ bb_init(void)
     pthread_t th;
     pthread_create(&th, NULL, watchdog_bb, (void *)(intptr_t)crashtest);
     pthread_detach(th);
@@ -400,7 +410,7 @@ index 56a4384..fc0374d 100644
  
  __attribute__((constructor)) static void
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index 7243a7d..f96865b 100644
+index 7243a7d..7c78852 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
 @@ -24,6 +24,7 @@
@@ -524,7 +534,7 @@ index 7243a7d..f96865b 100644
     if (_surface) CFRelease(_surface);
     [_linSrc release];
     if (_ncDealloc) { _ncDealloc((void *)_ncBytes, _ncLength); Block_release(_ncDealloc); }
-@@ -1691,6 +1756,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1691,17 +1756,30 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
     // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
     // (one kernel clean per surface, ever) left those layers stale or missing until this.
@@ -542,8 +552,26 @@ index 7243a7d..f96865b 100644
 +      return [self rwaTexture];
 +   }
     if (_surface && _tex) {
-       static NSMutableDictionary *seeds;
+-      static NSMutableDictionary *seeds;
++      /* a9y18qlte: a table indexed by surface ID (IDs come from a counter; a slot holding another ID counts as a change)
++       * instead of an NSMutableDictionary of NSNumbers: this runs for every sampled surface of every draw */
++      enum { SEED_SLOTS = 4096 };
++      static struct { uint32_t id, seed; } seeds[SEED_SLOTS];
        static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+-      NSNumber *key = @(IOSurfaceGetID((IOSurfaceRef)_surface));
++      uint32_t id = IOSurfaceGetID((IOSurfaceRef)_surface);
+       uint32_t seed = IOSurfaceGetSeed((IOSurfaceRef)_surface);
+       os_unfair_lock_lock(&lk);
+-      if (!seeds) seeds = [[NSMutableDictionary alloc] init];
+-      NSNumber *was = seeds[key];
+-      BOOL changed = !was || [was unsignedIntValue] != seed;
+-      if (changed) seeds[key] = @(seed);
+-      if ([seeds count] > 4096) [seeds removeAllObjects];
++      BOOL changed = seeds[id % SEED_SLOTS].id != id || seeds[id % SEED_SLOTS].seed != seed;
++      if (changed) { seeds[id % SEED_SLOTS].id = id; seeds[id % SEED_SLOTS].seed = seed; }
+       os_unfair_lock_unlock(&lk);
+       if (changed) rwa_texture_flush_surface(_tex);
+    }
 @@ -1710,13 +1788,67 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  - (struct rwa_texture *)rwaTexture
