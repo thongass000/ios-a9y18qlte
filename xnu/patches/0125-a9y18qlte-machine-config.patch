@@ -1362,10 +1362,10 @@ index 0000000..91746ca
 +#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
 diff --git a/bsd/dev/sweet_a5xx.c b/bsd/dev/sweet_a5xx.c
 new file mode 100644
-index 0000000..4907135
+index 0000000..ead84c3
 --- /dev/null
 +++ b/bsd/dev/sweet_a5xx.c
-@@ -0,0 +1,886 @@
+@@ -0,0 +1,903 @@
 +/*
 + * Adreno 512 core for the a9y18qlte (SDM660): the sweet_a6xx.h core API
 + * (same a6_* names, so bsd/dev/sweet_gpu.c and the accelerator above it run
@@ -1623,10 +1623,27 @@ index 0000000..4907135
 + * up to 2.2 GHz. With mhz (boot-arg sweetgoldmhz) the PLL is relocked at one of Linux's corner frequencies and the
 + * mux moved to its early output, as OSM's sequencer does (it rewrites L live). The rails stay as ABL set them
 + * (868-872 mV): Linux's perfcl ceilings are 788 mV at 1401.6 MHz and 868 mV at 1747.2 MHz, so both are within.
++ * mhz 1 (the default) picks by the rails as read: 1747 when PM660 S1-S3 all hold 868 mV or more, 1401 at 788 mV or
++ * more, else ABL's clock; 0 keeps ABL's. Both ran clean (a dependent-add bench: eight threads at ~1.24 GHz each,
++ * twice ABL's clocks).
 + */
 +static void gold_clock(unsigned mhz)
 +{
 +	const uint64_t pll = 0x17816000ull, rcg = 0x17811050ull;
++	if (mhz == 1) {
++		unsigned low = 0xffff;
++		for (unsigned s = 1; s <= 3; s++) {
++			uint8_t lo = 0, hi = 0;
++			unsigned base = 0x1400 + 0x300 * (s - 1);
++			if (sweet_spmi_read(1, base + 0x40, &lo) || sweet_spmi_read(1, base + 0x41, &hi))
++				low = 0;
++			else if ((unsigned)(hi << 8 | lo) < low)
++				low = hi << 8 | lo;
++		}
++		mhz = low >= 868 && low != 0xffff ? 1747 : low >= 788 && low != 0xffff ? 1401 : 0;
++		a6_log("cpu gold: rails S1-S3 at %u mV or more: %s\n", low == 0xffff ? 0 : low,
++		       mhz ? (mhz == 1747 ? "1747 MHz" : "1401 MHz") : "unread or low, ABL's clock kept");
++	}
 +	unsigned l = mhz == 1113 ? 58 : mhz == 1401 ? 73 : mhz == 1747 ? 91 : 0;
 +	if (!l) {
 +		if (mhz)
@@ -2545,7 +2562,7 @@ index d9d7860..2556e9c 100644
  #define A6_FSR_FAULT		0xc00001feu
  #define A6_GMEM_LOG_OFF		0x91000ull
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index c87ed5d..36cfbce 100644
+index c87ed5d..9b1b701 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -238,6 +238,7 @@ int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const
@@ -2575,7 +2592,7 @@ index c87ed5d..36cfbce 100644
 +	 */
 +	uint32_t lvl = 400;
 +	PE_parse_boot_argn("sweetgpumhz", &lvl, sizeof(lvl));
-+	uint32_t gold = 0;      /* the gold CPU cluster: 1113, 1401 or 1747 MHz (sweet_a5xx.c gold_clock); 0: ABL's */
++	uint32_t gold = 1;      /* the gold CPU cluster: 1 by the rails, or 1113, 1401, 1747 MHz (sweet_a5xx.c gold_clock); 0: ABL's */
 +	PE_parse_boot_argn("sweetgoldmhz", &gold, sizeof(gold));
 +	gpu.gold_mhz = gold;
 +#else
