@@ -2562,7 +2562,7 @@ index d9d7860..2556e9c 100644
  #define A6_FSR_FAULT		0xc00001feu
  #define A6_GMEM_LOG_OFF		0x91000ull
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index c87ed5d..9b1b701 100644
+index c87ed5d..5dd6099 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -238,6 +238,7 @@ int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const
@@ -2602,7 +2602,7 @@ index c87ed5d..9b1b701 100644
  	gpu.perf_level = lvl;
  	pool_kva = va;
  	vm_offset_t pva = 0;
-@@ -449,11 +463,25 @@ gpu_recover_locked(const char *why)
+@@ -449,11 +463,36 @@ gpu_recover_locked(const char *why)
  
  /* ---- the panel ---- */
  
@@ -2623,12 +2623,23 @@ index c87ed5d..9b1b701 100644
 +	a6_wr(SSPP_VIG(0) + SSPP_YSTRIDE0, stride);
 +	a6_wr(CTL0_FLUSH, 0x1);
 +	a6_log("panel stride %u\n", stride);
++	/*
++	 * How ABL left the panel running (screen changes seen sweeping top to bottom): an interface's timing engine is on
++	 * for a video-mode panel (INTF 0x6b000 + 0x800n, +0x0); a command-mode one refreshes from a ping-pong block's
++	 * autorefresh (PP 0x71000 + 0x800n, +0x30: bit 31 enable, frame count below) and tear check (+0x0 sync config,
++	 * +0x4 vsync height), read as raw words. Offsets from the SDM660 mdss device tree.
++	 */
++	for (uint32_t i = 0; i < 4; i++) {
++		a6_log("mdp intf%u timing_en %x hsync %x vsync_period %x | pp%u sync_cfg %x height %x autorefresh %x\n", i,
++		    a6_rd(MDP + 0x6b000 + 0x800 * i), a6_rd(MDP + 0x6b000 + 0x800 * i + 0x8), a6_rd(MDP + 0x6b000 + 0x800 * i + 0xc), i,
++		    a6_rd(MDP + 0x71000 + 0x800 * i), a6_rd(MDP + 0x71000 + 0x800 * i + 0x4), a6_rd(MDP + 0x71000 + 0x800 * i + 0x30));
++	}
 +}
 +#else
  /* ABL scans out through VIG0 + VIG1 (540 columns each); autorefresh picks a flushed change up. */
  void
  sweet_gpu_panel_stride(uint32_t stride)
-@@ -463,6 +491,7 @@ sweet_gpu_panel_stride(uint32_t stride)
+@@ -463,6 +502,7 @@ sweet_gpu_panel_stride(uint32_t stride)
  	a6_wr(CTL0_FLUSH, 0x3);
  	a6_log("panel stride %u\n", stride);
  }
@@ -2636,7 +2647,7 @@ index c87ed5d..9b1b701 100644
  
  /* ---- surfaces ---- */
  
-@@ -526,6 +555,11 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
+@@ -526,6 +566,11 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
  
  #define IB_OFF          A6_OFF_FREE     /* the present IBs in the pool (two, PRESENT_IB) */
  #define PRESENT_IB(k)   (IB_OFF + 0x4000ULL * (k))
@@ -2648,7 +2659,7 @@ index c87ed5d..9b1b701 100644
  
  static uint32_t present_fence[2];      /* of the present last queued from each IB slot */
  static uint32_t present_next;
-@@ -546,7 +580,11 @@ present_wait_locked(uint32_t k, const char *why)
+@@ -546,7 +591,11 @@ present_wait_locked(uint32_t k, const char *why)
  	return 0;
  }
  #define PANEL_W         1080
@@ -2660,7 +2671,7 @@ index c87ed5d..9b1b701 100644
  #define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
  #define DISPLAY_MASK_SIDE       256u
  #define DISPLAY_MASK_DIM        (DISPLAY_MASK_SIDE * 2)
-@@ -557,6 +595,38 @@ static uint32_t display_mask_radius;
+@@ -557,6 +606,38 @@ static uint32_t display_mask_radius;
  
  static uint64_t stat_frames, stat_clean_abs, stat_gpu_abs;
  
@@ -2699,7 +2710,7 @@ index c87ed5d..9b1b701 100644
  /* The four corner mattes: black, alpha = 1 - coverage of the image (SweetDisplayMask.h). */
  static void
  display_mask_build(uint32_t r, uint32_t ext)
-@@ -598,6 +668,14 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -598,6 +679,14 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	    DISPLAY_STAGE_OFF + (uint64_t)fb_pitch * PANEL_H > A6_POOL_SIZE) {
  		return -1;
  	}
@@ -2714,7 +2725,7 @@ index c87ed5d..9b1b701 100644
  	uint64_t t0 = mach_absolute_time();
  	if (kva) {
  		clean_dcache64((addr64_t)kva, (unsigned)((uint64_t)pitch * h + offset), FALSE);
-@@ -618,6 +696,12 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -618,6 +707,12 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	}
  	frame.dx = (PANEL_W - frame.dw) / 2;
  	frame.dy = (PANEL_H - frame.dh) / 2;
@@ -2727,7 +2738,7 @@ index c87ed5d..9b1b701 100644
  	uint32_t ext = corner_radius ? sweet_display_corner_extent(corner_radius) : 0;
  	if (ext > DISPLAY_MASK_SIDE || 2 * ext >= frame.dw || 2 * ext >= frame.dh) {
  		ext = 0;
-@@ -684,9 +768,16 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -684,9 +779,16 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	uint32_t k = present_next & 1;
  	int rc = present_wait_locked(k, "present");
  	if (rc == 0) {
@@ -2745,7 +2756,7 @@ index c87ed5d..9b1b701 100644
  		gpu_owner_locked(present_fence[k], 0);
  		rc = present_fence[k] ? 0 : -1;
  		present_next++;
-@@ -1118,6 +1209,23 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
+@@ -1118,6 +1220,23 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
  	}
  }
  
