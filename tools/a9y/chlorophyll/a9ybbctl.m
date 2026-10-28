@@ -3,6 +3,7 @@
 //   a9ybbctl install         backboardd's job runs /usr/local/bin/a9ybb (from the next boot; launchd reads the plist
 //                            at boot); the original plist is kept as /usr/local/etc/launchd.plist.orig
 //   a9ybbctl restore         put the original plist back (from the next boot)
+//   a9ybbctl trim            take daemons this phone has nothing for out of launchd.plist (from the next boot)
 //   a9ybbctl arm             this boot: the next backboardd launch gets Chlorophyll (a9ybb.arm = this boot's id, the
 //                            injection's bgmtl-bb.arm, its kill switch and state cleared, its log made writable by mobile)
 //   a9ybbctl disarm          launches from now on are stock
@@ -228,6 +229,32 @@ main(int argc, char **argv)
          p[@"LaunchDaemons"][JOB][@"ProgramArguments"] = @[ WRAPPER ];
          return save(p, PLIST);
       }
+      if (!strcmp(cmd, "trim")) {
+         /* Daemons this phone has nothing for, which under XNU respawned or spun and kept 3-4 cores busy with nothing
+          * on screen (a9ybbctl top: launchd, ReportCrash, vmd, voiced's synthesizer extensions): the Apple Watch face
+          * companion (crashed every ~10 s), Visual Voicemail (no telephony), Siri and VoiceOver speech. Taken out of
+          * launchd's job table from the next boot; restore puts the original back. */
+         static NSString *const trim[] = {
+            @"/System/Library/LaunchDaemons/com.apple.nanotimekitcompaniond.plist",
+            @"/System/Library/LaunchDaemons/com.apple.voicemail.vmd.plist",
+            @"/System/Library/LaunchDaemons/com.apple.sirittsd.plist",
+            @"/System/Library/LaunchDaemons/com.apple.voiced.plist",
+         };
+         NSMutableDictionary *p = load(PLIST);
+         if (!p || !p[@"LaunchDaemons"]) { printf("no LaunchDaemons in %s: nothing changed\n", PLIST); return 1; }
+         if (access(BACKUP, F_OK) != 0) {
+            NSData *d = [NSData dataWithContentsOfFile:@PLIST];
+            if (![d writeToFile:@BACKUP atomically:YES]) { printf("cannot keep %s: nothing changed\n", BACKUP); return 1; }
+            printf("kept the original as %s\n", BACKUP);
+         }
+         int removed = 0;
+         for (unsigned i = 0; i < sizeof(trim) / sizeof(trim[0]); i++) {
+            BOOL there = p[@"LaunchDaemons"][trim[i]] != nil;
+            printf("%s: %s\n", trim[i].UTF8String, there ? "removed" : "not there");
+            if (there) { [p[@"LaunchDaemons"] removeObjectForKey:trim[i]]; removed++; }
+         }
+         return removed ? save(p, PLIST) : 0;
+      }
       if (!strcmp(cmd, "restore")) {
          NSMutableDictionary *p = load(BACKUP);
          if (!p) { printf("no readable %s: nothing changed\n", BACKUP); return 1; }
@@ -375,7 +402,7 @@ main(int argc, char **argv)
          fclose(f);
          return 0;
       }
-      printf("usage: a9ybbctl status|install|restore|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE|threads NAME S|bench|top S\n");
+      printf("usage: a9ybbctl status|install|restore|trim|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE|threads NAME S|bench|top S\n");
       return 2;
    }
 }
