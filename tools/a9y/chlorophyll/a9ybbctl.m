@@ -9,6 +9,8 @@
 //   a9ybbctl respring        SIGTERM to backboardd: launchd starts it again, through a9ybb
 //   a9ybbctl wait SECONDS
 //   a9ybbctl pids NAME       the pids of processes called NAME
+//   a9ybbctl threads NAME S  where NAME's CPU time goes over S seconds, per thread
+//   a9ybbctl hex FILE        a file as hex lines (a binary back through the log)
 //   a9ybbctl cat FILE [MAX]  print a file (the injection logs to /private/var/tmp/bgmtl.log), at most MAX lines
 // The plist is changed on the phone, by CoreFoundation's own writer and the phone's own file system, never from Linux.
 #import <Foundation/Foundation.h>
@@ -22,6 +24,14 @@
 // libproc (in libSystem; the iOS SDK has no libproc.h)
 extern int proc_listallpids(void *buffer, int buffersize);
 extern int proc_name(int pid, void *buffer, uint32_t buffersize);
+extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
+#define PROC_PIDTHREADINFO 5
+#define PROC_PIDLISTTHREADS 6
+struct proc_threadinfo {   // sys/proc_info.h
+   uint64_t pth_user_time, pth_system_time;   // ns
+   int32_t pth_cpu_usage, pth_policy, pth_run_state, pth_flags, pth_sleep_time, pth_curpri, pth_priority, pth_maxpriority;
+   char pth_name[64];
+};
 
 #define PLIST "/System/Library/xpc/launchd.plist"
 #define BACKUP "/usr/local/etc/launchd.plist.orig"
@@ -174,6 +184,45 @@ main(int argc, char **argv)
          sleep((unsigned)atoi(argv[2]));
          return 0;
       }
+      if (!strcmp(cmd, "threads") && argc > 3) {   // where a process's CPU time goes: per thread over SECONDS
+         pid_t pp[1];
+         if (pids(argv[2], pp, 1) < 1) { printf("no %s running\n", argv[2]); return 1; }
+         enum { MAXT = 256 };
+         static uint64_t h0[MAXT], h1[MAXT], t0[MAXT];
+         static char nm[MAXT][64];
+         int n0 = proc_pidinfo(pp[0], PROC_PIDLISTTHREADS, 0, h0, sizeof(h0)) / 8;
+         for (int i = 0; i < n0; i++) {
+            struct proc_threadinfo ti;
+            t0[i] = proc_pidinfo(pp[0], PROC_PIDTHREADINFO, h0[i], &ti, sizeof(ti)) == sizeof(ti)
+                       ? ti.pth_user_time + ti.pth_system_time : 0;
+         }
+         unsigned secs = (unsigned)atoi(argv[3]);
+         sleep(secs);
+         int n1 = proc_pidinfo(pp[0], PROC_PIDLISTTHREADS, 0, h1, sizeof(h1)) / 8;
+         uint64_t total = 0, d[MAXT];
+         for (int i = 0; i < n1; i++) {
+            struct proc_threadinfo ti;
+            d[i] = 0;
+            nm[i][0] = 0;
+            if (proc_pidinfo(pp[0], PROC_PIDTHREADINFO, h1[i], &ti, sizeof(ti)) != sizeof(ti)) continue;
+            uint64_t before = 0;
+            for (int j = 0; j < n0; j++) if (h0[j] == h1[i]) before = t0[j];
+            d[i] = ti.pth_user_time + ti.pth_system_time - before;
+            snprintf(nm[i], sizeof(nm[i]), "%s", ti.pth_name[0] ? ti.pth_name : "-");
+            total += d[i];
+         }
+         printf("%s pid %d: %llu ms CPU in %u s (%u%% of one core), %d threads\n", argv[2], pp[0],
+                (unsigned long long)(total / 1000000), secs, secs ? (unsigned)(total / 10000000 / secs) : 0, n1);
+         for (int k = 0; k < 12; k++) {   // the busiest first
+            int best = -1;
+            for (int i = 0; i < n1; i++) if (d[i] && (best < 0 || d[i] > d[best])) best = i;
+            if (best < 0) break;
+            printf("  %6llu ms  %s (thread %llx)\n", (unsigned long long)(d[best] / 1000000), nm[best],
+                   (unsigned long long)h1[best]);
+            d[best] = 0;
+         }
+         return 0;
+      }
       if (!strcmp(cmd, "pids") && argc > 2) {
          pid_t pp[16];
          int n = pids(argv[2], pp, 16);
@@ -207,7 +256,7 @@ main(int argc, char **argv)
          fclose(f);
          return 0;
       }
-      printf("usage: a9ybbctl status|install|restore|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE\n");
+      printf("usage: a9ybbctl status|install|restore|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE|threads NAME S\n");
       return 2;
    }
 }
