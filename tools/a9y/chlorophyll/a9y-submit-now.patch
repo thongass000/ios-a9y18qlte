@@ -1,0 +1,18 @@
+diff --git a/air/air_metal.c b/air/air_metal.c
+index 6921f8e..de181b4 100644
+--- a/air/air_metal.c
++++ b/air/air_metal.c
+@@ -4458,6 +4458,13 @@ rwa_flush(struct rwa_device *device)
+ {
+    struct pipe_fence_handle *fence = NULL;
+    device->pipe->flush(device->pipe, &fence, 0);
++   /* a9y18qlte: and into the kernel now. freedreno's msm backend defers a submit (merging it with later ones) until
++    * something waits on its fence, which with asynchronous completion was the completion queue, later: CoreAnimation,
++    * told "scheduled" at once, swapped the framebuffer first, and the kernel's GPU present, queued behind what the ring
++    * held, copied a frame not yet drawn (half-drawn frames on the panel). fence_finish with no timeout flushes the
++    * deferred submits (and waits for the submit thread) without waiting for the GPU. */
++   if (fence)
++      (void)device->screen->fence_finish(device->screen, NULL, fence, 0);
+    return (struct rwa_fence *)fence;
+ }
+ 
