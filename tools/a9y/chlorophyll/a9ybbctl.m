@@ -240,6 +240,9 @@ main(int argc, char **argv)
             @"/System/Library/LaunchDaemons/com.apple.voicemail.vmd.plist",
             @"/System/Library/LaunchDaemons/com.apple.sirittsd.plist",
             @"/System/Library/LaunchDaemons/com.apple.voiced.plist",
+            /* the crash reporter itself: still 0.6 core after the others went, with few reports to write (an
+             * AegirPoster or OTAUpdate one every few minutes); without it a crash only ends the process */
+            @"/System/Library/LaunchDaemons/com.apple.ReportCrash.plist",
          };
          NSMutableDictionary *p = load(PLIST);
          if (!p || !p[@"LaunchDaemons"]) { printf("no LaunchDaemons in %s: nothing changed\n", PLIST); return 1; }
