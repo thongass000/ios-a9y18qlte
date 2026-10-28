@@ -489,7 +489,7 @@ index 7243a7d..f96865b 100644
        BG_LOG("draw: prim %lu start %lu count %lu inst %lu index %s type %lu off %lu\n", (unsigned long)prim, (unsigned long)start,
               (unsigned long)count, (unsigned long)inst, ib ? "yes" : "no", (unsigned long)it, (unsigned long)io);
 diff --git a/test/bgmtl_carenderer_probe.m b/test/bgmtl_carenderer_probe.m
-index bab10f8..09f13d8 100644
+index bab10f8..8db9734 100644
 --- a/test/bgmtl_carenderer_probe.m
 +++ b/test/bgmtl_carenderer_probe.m
 @@ -167,6 +167,39 @@ make_scene(int n)
@@ -574,7 +574,7 @@ index bab10f8..09f13d8 100644
           if (only >= 0 && n != only) continue;
           CALayer *scene = make_scene(n);
           // the reference: CoreAnimation's CPU path into a bitmap
-@@ -285,6 +351,14 @@ main(int argc, char **argv)
+@@ -285,6 +351,26 @@ main(int argc, char **argv)
           double sum = 0; unsigned nonzero = 0;
           for (int i = 0; i < W * H * 4; i++) { sum += abs((int)out[i] - (int)ref[i]); if (out[i]) nonzero++; }
           printf("scene %d: mean abs diff %.2f over %d channels, %u non-zero bytes rendered\n", n, sum / (W * H * 4), W * H * 4, nonzero);
@@ -584,6 +584,18 @@ index bab10f8..09f13d8 100644
 +               for (int x = 40; x < W - 40; x++) for (int k = 0; k < 3; k++) c[k] += out[(y * W + x) * 4 + k];
 +               printf("scene %d: row %d mean BGR %.0f %.0f %.0f (reference %d %d %d at x 128)\n", n, y, c[0] / (W - 80),
 +                      c[1] / (W - 80), c[2] / (W - 80), ref[(y * W + 128) * 4], ref[(y * W + 128) * 4 + 1], ref[(y * W + 128) * 4 + 2]);
++            }
++            // a9y18qlte: the picture itself, coarsely (pixelation shows as blocks where a blur is smooth): green, 4x8 cells
++            static const char lum[] = " .:-=+*#%@";
++            for (int y = 0; y < H; y += 8) {
++               char line[W / 4 + 1];
++               for (int x = 0; x < W; x += 4) {
++                  unsigned s = 0;
++                  for (int yy = y; yy < y + 8; yy++) for (int xx = x; xx < x + 4; xx++) s += out[(yy * W + xx) * 4 + 1];
++                  line[x / 4] = lum[s / 32 * 10 / 256];
++               }
++               line[W / 4] = 0;
++               printf("pic %d %3d |%s|\n", n, y, line);
 +            }
 +         }
           // a9y18qlte: where they differ (thin wrong lines vanish in a mean): the worst channel per pixel, a map of 4x4 cells
