@@ -1,5 +1,5 @@
 diff --git a/air/air_metal.c b/air/air_metal.c
-index de181b4..227288a 100644
+index de181b4..a1c5ab7 100644
 --- a/air/air_metal.c
 +++ b/air/air_metal.c
 @@ -257,6 +257,11 @@ struct rwa_texture {
@@ -114,6 +114,34 @@ index de181b4..227288a 100644
         tex_pool_put(texture->device, texture->res, texture->view)) {
        free(texture);          /* the pool holds the resource's reference and the view now */
        return;
+@@ -7440,6 +7492,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char
+          goto fail;
+       }
+       if (present++ == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
++      else { w = MIN2(w, t->shape.width); h = MIN2(h, t->shape.height ? t->shape.height : 1); }   /* the smallest, as for draws */
+       surf[i] = texture_surface(t);
+       if (!surf[i]) { say(why, why_size, "no render surface for colour attachment %u", i); goto fail; }
+       fb.cbufs[i] = surf[i];
+@@ -7716,13 +7769,15 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+       }
+       unsigned tw = t->shape.width;
+       unsigned th = t->shape.height ? t->shape.height : 1;
++      /* a9y18qlte: attachments of different sizes are legal in Metal, which renders over the smallest of them.
++       * CoreAnimation's blurs render into a mip level (a level view, rwa_texture_level_view) beside a second
++       * attachment at its full size: refusing them skipped every such draw (the app switcher's background black). */
+       if (present++ == 0) {
+          w = tw;
+          h = th;
+-      } else if (tw != w || th != h) {
+-         say(why, why_size, "colour attachment %u is %ux%u and the first one is %ux%u", i,
+-             tw, th, w, h);
+-         return -1;
++      } else {
++         w = MIN2(w, tw);
++         h = MIN2(h, th);
+       }
+    }
+ 
 diff --git a/air/air_metal.h b/air/air_metal.h
 index ee2b232..72af9e4 100644
 --- a/air/air_metal.h
@@ -131,24 +159,26 @@ index ee2b232..72af9e4 100644
  /*
   * The same texture, over memory somebody else allocated: an IOSurface of CoreAnimation's.
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index 7243a7d..5356904 100644
+index 7243a7d..b674720 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
-@@ -345,7 +345,13 @@ bg_install_fallback(Class c)
+@@ -345,7 +345,14 @@ bg_install_fallback(Class c)
     const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
     NSUInteger _ncLength;
     void (^_ncDealloc)(void *, NSUInteger);
-+   BOOL _ncLoaded;       // a block-compressed one: nothing draws into ASTC with the CPU, so it is copied once and not at each use
+-}
++   BOOL _ncLoaded;       // a block-compressed one: copied when its bytes change (_ncHash, sampled), not at each use
++   uint64_t _ncHash;
 +   BOOL _cpuCopy;        // a9y18qlte: an IOSurface the GPU cannot import (a pitch its own layout would change): a texture of ours,
 +   BOOL _cpuLoaded;      // filled from the surface's memory and again whenever its seed moves
 +   uint32_t _cpuSeed;
 +   id _levelViews[16];   // a9y18qlte: render targets for mip levels 1..15 (bgLevelView:), made once so a pass's surface stays the same
- }
++}
 +- (id)bgLevelView:(NSUInteger)level;
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
  - (struct rwa_texture *)rwaTexture;
-@@ -1564,6 +1570,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1564,6 +1571,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     w->t_sslice = ss; w->t_slevel = sl; w->t_dslice = ds; w->t_dlevel = dl;
     w->t_sorg[0] = so.x; w->t_sorg[1] = so.y; w->t_sorg[2] = so.z; w->t_dorg[0] = dorg.x; w->t_dorg[1] = dorg.y; w->t_dorg[2] = dorg.z;
     w->t_size[0] = size.width; w->t_size[1] = size.height; w->t_size[2] = size.depth;
@@ -159,7 +189,7 @@ index 7243a7d..5356904 100644
     [_cb bgRecord:w];
  }
  - (void)copyFromTexture:(id)src toTexture:(id)dst
-@@ -1612,6 +1622,9 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1612,6 +1623,9 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  - (void)synchronizeTexture:(id)t slice:(NSUInteger)s level:(NSUInteger)l { (void)t; (void)s; (void)l; }
  - (void)generateMipmapsForTexture:(id)t
  {
@@ -169,7 +199,7 @@ index 7243a7d..5356904 100644
     BGWork *w = [[[BGWork alloc] init] autorelease];
     w->kind = BG_WORK_MIPMAPS; w->dst = [t retain];
     [_cb bgRecord:w];
-@@ -1650,8 +1663,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1650,8 +1664,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     if (surface) {
        _shape.usage |= 5;   /* a drawable is rendered into and may be sampled whatever CA asked for (MTLTextureUsageRenderTarget | ShaderRead) */
        /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
@@ -187,7 +217,7 @@ index 7243a7d..5356904 100644
        bg_unlock();
        _surface = CFRetain(surface);
        _plane = plane;
-@@ -1660,12 +1681,53 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1660,12 +1682,53 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
        _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
        bg_unlock();
     }
@@ -242,7 +272,7 @@ index 7243a7d..5356904 100644
     bg_lock(); if (_tex) rwa_texture_destroy(_tex); bg_unlock();
     if (_surface) CFRelease(_surface);
     [_linSrc release];
-@@ -1691,6 +1753,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1691,6 +1754,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
     // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
     // (one kernel clean per surface, ever) left those layers stale or missing until this.
@@ -262,28 +292,48 @@ index 7243a7d..5356904 100644
     if (_surface && _tex) {
        static NSMutableDictionary *seeds;
        static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
-@@ -1710,13 +1785,29 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1710,13 +1786,49 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  - (struct rwa_texture *)rwaTexture
  {
 -   if (_ncBytes && _tex) {
-+   if (_ncBytes && _tex && !_ncLoaded) {
++   unsigned rows = (_ncBytes && _tex) ? rwa_texture_block_rows(_tex, _shape.height) : 0;
++   uint64_t fp = 0;
++   size_t nblocks = 0, zeros = 0;
++   if (_ncBytes && _tex && rows != _shape.height) {
++      /* a9y18qlte: a compressed one is copied again only when its bytes change, judged by 256 blocks spread over it: a
++       * snapshot's memory may be filled after the texture is made (all-zero ASTC blocks decode as magenta: purple cards) */
++      const uint64_t *q = (const uint64_t *)_ncBytes;
++      nblocks = (size_t)((_shape.width + 3) / 4) * rows;
++      if (nblocks * 16 > _ncLength) nblocks = _ncLength / 16;
++      for (size_t k = 0; k < 256 && nblocks; k++) {
++         size_t i = k * nblocks / 256;
++         uint64_t a = q[i * 2], b = q[i * 2 + 1];
++         if (!a && !b) zeros++;
++         fp = (fp ^ a ^ (b * 0x9e3779b97f4a7c15ull)) * 0x100000001b3ull;
++      }
++      if (_ncLoaded && fp == _ncHash) nblocks = 0;   /* unchanged: nothing to copy */
++   }
++   if (_ncBytes && _tex && (rows == _shape.height || nblocks)) {
        bg_lock();
        char why[256] = { 0 };
        const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
 -      if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)_ncBytes, (unsigned)(_ncLength / (_shape.height ? _shape.height : 1)),
 +      /* a9y18qlte: a row of the caller's memory is a row of blocks (ASTC 4x4 snapshots: length / height was a quarter of one, and
 +       * every refresh was refused). Their length is page-rounded, so it says nothing of the row: blocks are packed (stride 0). */
-+      unsigned rows = rwa_texture_block_rows(_tex, _shape.height);
 +      if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)_ncBytes,
 +                            rows != _shape.height ? 0 : (unsigned)(_ncLength / (_shape.height ? _shape.height : 1)),
                              why, sizeof(why)) != 0)
           BG_LOG("no-copy texture refresh: %s\n", why);
 +      else if (rows != _shape.height) {
++         BOOL again = _ncLoaded;
 +         _ncLoaded = YES;
++         _ncHash = fp;
 +         static int told;
 +         if (told++ < 24) {
 +            const uint8_t *b = (const uint8_t *)_ncBytes;
++            BG_LOG("no-copy compressed %s: %zu of 256 sampled blocks all zero\n", again ? "copied again (bytes changed)" : "first copy",
++                   zeros);
 +            BG_LOG("no-copy compressed: %ux%u fmt %u mips %u, %lu bytes at %p (%u rows of blocks): "
 +                   "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x | %02x%02x%02x%02x %02x%02x%02x%02x\n",
 +                   _shape.width, _shape.height, _shape.pixel_format, _shape.mip_levels, (unsigned long)_ncLength, _ncBytes, rows,
@@ -294,7 +344,7 @@ index 7243a7d..5356904 100644
        bg_unlock();
     }
     if (_linSrc && _tex) {
-@@ -1872,7 +1963,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1872,7 +1984,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     for (unsigned i = 0; i < 8; i++) {
        MTLRenderPassColorAttachmentDescriptor *a = [[d colorAttachments] objectAtIndexedSubscript:i];
        if (!a || ![a texture]) continue;
@@ -306,7 +356,7 @@ index 7243a7d..5356904 100644
        _ncolor = i + 1;
        if ([a loadAction] == MTLLoadActionClear) {
           MTLClearColor c = [a clearColor];
-@@ -1940,7 +2034,13 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1940,7 +2055,13 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
     if (b) { [_scratch addObject:b]; [self setFragmentBuffer:b offset:0 atIndex:i]; }
  }
@@ -321,7 +371,7 @@ index 7243a7d..5356904 100644
  - (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _smp[i] = s; if (i + 1 > _shigh) _shigh = (unsigned)i + 1; } }
  - (void)setViewport:(MTLViewport)v
  {
-@@ -1961,6 +2061,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1961,6 +2082,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
          indexBuffer:(id)ib indexType:(NSUInteger)it indexOffset:(NSUInteger)io baseVertex:(NSInteger)bv baseInstance:(NSUInteger)bi
  {
     if (!_pipeline) { BG_LOG("draw with no pipeline\n"); return; }
