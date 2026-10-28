@@ -3416,7 +3416,7 @@ index 2545cf9..6d3c7e9 100644
  		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
  		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index bc98b59..70cd0a1 100644
+index bc98b59..a42f8eb 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -49,7 +49,11 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
@@ -3542,7 +3542,27 @@ index bc98b59..70cd0a1 100644
  bool
  AppleCLCD::presentGPU(const uint8_t *rec)
  {
-@@ -535,9 +636,27 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -508,6 +609,19 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	uint32_t dx = 0, dy = 0, dw = 0, dh = 0;
+ 	int rc = sweet_gpu_present(slot, s->kernelAddress(), s->offset, s->width, s->height, s->bytesPerRow,
+ 	    fRowBytes, fCornerRadius, &dx, &dy, &dw, &dh);
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	/* the first few draws: once the GPU is idle, the frame's centre against the panel's (write-combined) */
++	static uint32_t fit_checks;
++	if (rc == 0 && fit_checks < 6) {
++		fit_checks++;
++		int idle = sweet_gpu_wait_idle_ns(SWEET_FB_GPU_WAIT_NS);
++		uintptr_t c = s->kernelAddress() + s->offset + (uint64_t)(s->height / 2) * s->bytesPerRow + (s->width / 2) * 4;
++		flush_dcache64((addr64_t)c, 64, FALSE);
++		IOLog("SWEET FB: GPU present %u (idle %d): frame centre %08x, panel centre %08x\n", fit_checks, idle,
++		    *(volatile uint32_t *)c,
++		    *(volatile uint32_t *)(fPixels + (uint64_t)(dy + dh / 2) * fRowBytes + (dx + dw / 2) * 4));
++	}
++#endif
+ 	s->release();
+ 	if (rc) {
+ 		return gpu_fallback(7, "GPU blit failed");
+@@ -535,9 +649,27 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
@@ -3570,7 +3590,7 @@ index bc98b59..70cd0a1 100644
  	if (sweet_display_fit_w) {
  		sweet_display_fit_w = 0;        /* touch back to the crop mapping */
  		sweet_display_fit_x = sweet_display_fit_y = sweet_display_fit_h = 0;
-@@ -568,6 +687,9 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -568,6 +700,9 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
