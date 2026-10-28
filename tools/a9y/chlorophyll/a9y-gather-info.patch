@@ -1,0 +1,18 @@
+diff --git a/air/air_metal.c b/air/air_metal.c
+index 6dbc3ba..6921f8e 100644
+--- a/air/air_metal.c
++++ b/air/air_metal.c
+@@ -5806,6 +5806,13 @@ make_stage_cso(struct rwa_device *device, nir_shader *nir, char *why, size_t why
+       lower_fbfetch_pre_a6xx(clone);
+       widen_fs_outputs(clone);
+    }
++   /* a9y18qlte: the shader info as the driver will compile it. air_to_nir never gathers it, and ir3 enables helper
++    * pixels only from info.fs.needs_quad_helper_invocations (need_pixlod -> fd5's PIXLODENABLE): without it a
++    * derivative in a 2x2 quad that straddles a triangle edge read lanes that never ran. CoreAnimation's rounded
++    * edges (fixed_frag_lph_cpf: coverage = saturate((1 - d) / fwidth(d) + 0.5) over a nine-slice ring) drew
++    * dashes along the ring's diagonals on the A512 (CARenderer probe scene 9; host ir3_compiler: need_pixlod 0,
++    * 1 once gathered). */
++   nir_shader_gather_info(clone, nir_shader_get_entrypoint(clone));
+ 
+    struct pipe_shader_state templ = { .type = PIPE_SHADER_IR_NIR, .ir.nir = clone };
+    struct pipe_context *pipe = device->pipe;
