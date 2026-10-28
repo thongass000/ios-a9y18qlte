@@ -14,6 +14,7 @@
 //   a9ybbctl hex FILE        a file as hex lines (a binary back through the log)
 //   a9ybbctl bench           the cores' clocks (dependent adds), one thread and one per core
 //   a9ybbctl top S           every process's CPU time over S seconds, the busiest first
+//   a9ybbctl ls DIR [MAX]    a directory, newest first
 //   a9ybbctl cat FILE [MAX]  print a file (the injection logs to /private/var/tmp/bgmtl.log), at most MAX lines
 // The plist is changed on the phone, by CoreFoundation's own writer and the phone's own file system, never from Linux.
 #import <Foundation/Foundation.h>
@@ -288,6 +289,24 @@ main(int argc, char **argv)
          sleep((unsigned)atoi(argv[2]));
          return 0;
       }
+      if (!strcmp(cmd, "ls") && argc > 2) {   // a directory, newest first (crash reports name what crashed)
+         NSFileManager *fm = [NSFileManager defaultManager];
+         NSArray *names = [fm contentsOfDirectoryAtPath:@(argv[2]) error:NULL];
+         if (!names) { printf("%s: not readable\n", argv[2]); return 1; }
+         NSMutableArray *rows = [NSMutableArray array];
+         for (NSString *n in names) {
+            NSDictionary *a = [fm attributesOfItemAtPath:[@(argv[2]) stringByAppendingPathComponent:n] error:NULL];
+            if (a) [rows addObject:@[ a[NSFileModificationDate] ?: [NSDate distantPast], n, a[NSFileSize] ?: @0 ]];
+         }
+         [rows sortUsingComparator:^NSComparisonResult(NSArray *x, NSArray *y) { return [y[0] compare:x[0]]; }];
+         int max = argc > 3 ? atoi(argv[3]) : 40;
+         printf("%s: %lu entries\n", argv[2], (unsigned long)rows.count);
+         for (NSArray *r in rows) {
+            if (max-- <= 0) break;
+            printf("  %s %8llu %s\n", [[r[0] description] UTF8String], [r[2] unsignedLongLongValue], [r[1] UTF8String]);
+         }
+         return 0;
+      }
       if (!strcmp(cmd, "top") && argc > 2) {   // every process's CPU time over SECONDS, the busiest first
          enum { MAXP = 1024 };
          static pid_t pid[MAXP];
@@ -402,7 +421,7 @@ main(int argc, char **argv)
          fclose(f);
          return 0;
       }
-      printf("usage: a9ybbctl status|install|restore|trim|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE|threads NAME S|bench|top S\n");
+      printf("usage: a9ybbctl status|install|restore|trim|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE|threads NAME S|bench|top S|ls DIR [MAX]\n");
       return 2;
    }
 }
