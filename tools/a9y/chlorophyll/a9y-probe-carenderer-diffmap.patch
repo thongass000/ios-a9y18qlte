@@ -1,8 +1,8 @@
 diff --git a/test/bgmtl_carenderer_probe.m b/test/bgmtl_carenderer_probe.m
-index 9f9abc5..c9f07c3 100644
+index 9f9abc5..bab10f8 100644
 --- a/test/bgmtl_carenderer_probe.m
 +++ b/test/bgmtl_carenderer_probe.m
-@@ -131,6 +131,30 @@ make_scene(int n)
+@@ -131,6 +131,50 @@ make_scene(int n)
        }
        break;
     }
@@ -30,19 +30,39 @@ index 9f9abc5..c9f07c3 100644
 +      [root addSublayer:b];
 +      break;
 +   }
++   case 9: {   // scene 7 without edge antialiasing: the interior alone
++      CALayer *b = [CALayer layer];
++      b.frame = CGRectMake(40, 40, 176, 176);
++      b.cornerRadius = 36;
++      [b setValue:@"continuous" forKey:@"cornerCurve"];
++      b.masksToBounds = YES;
++      b.allowsEdgeAntialiasing = NO;
++      b.edgeAntialiasingMask = 0;
++      b.backgroundColor = CGColorCreateGenericRGB(0.6, 0.6, 0.65, 1);
++      [root addSublayer:b];
++      break;
++   }
++   case 10: {  // square corners at fractional positions, edge antialiased: the fringe alone
++      CALayer *b = [CALayer layer];
++      b.frame = CGRectMake(40.5, 40.25, 175.5, 175.75);
++      b.allowsEdgeAntialiasing = YES;
++      b.backgroundColor = CGColorCreateGenericRGB(0.6, 0.6, 0.65, 1);
++      [root addSublayer:b];
++      break;
++   }
     }
     return root;
  }
-@@ -192,7 +216,7 @@ main(int argc, char **argv)
+@@ -192,7 +236,7 @@ main(int argc, char **argv)
        printf("default device: %s\n", d ? [[d name] UTF8String] : "nil");
        if (!d) return 2;
        int bad = 0, done = 0;
 -      for (int n = 0; n < 7; n++) {
-+      for (int n = 0; n < 9; n++) {
++      for (int n = 0; n < 11; n++) {
           if (only >= 0 && n != only) continue;
           CALayer *scene = make_scene(n);
           // the reference: CoreAnimation's CPU path into a bitmap
-@@ -241,6 +265,36 @@ main(int argc, char **argv)
+@@ -241,6 +285,36 @@ main(int argc, char **argv)
           double sum = 0; unsigned nonzero = 0;
           for (int i = 0; i < W * H * 4; i++) { sum += abs((int)out[i] - (int)ref[i]); if (out[i]) nonzero++; }
           printf("scene %d: mean abs diff %.2f over %d channels, %u non-zero bytes rendered\n", n, sum / (W * H * 4), W * H * 4, nonzero);
