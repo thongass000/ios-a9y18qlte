@@ -391,6 +391,17 @@ main(int argc, char **argv)
          }
          return 0;
       }
+      if (!strcmp(cmd, "prof") && argc > 2) {   // a profile of backboardd's compositor thread over SECONDS (bgmtl_inject.m)
+         FILE *f = fopen("/private/var/tmp/a9yprof", "w");
+         if (!f) { printf("prof: cannot write /private/var/tmp/a9yprof\n"); return 1; }
+         fprintf(f, "%d\n", atoi(argv[2]));
+         fclose(f);
+         chmod("/private/var/tmp/a9yprof", 0666);
+         int waited = 0;   // the report goes to backboardd's log; wait for the window to end so the run list stays in step
+         while (waited < atoi(argv[2]) + 30 && access("/private/var/tmp/a9yprof", F_OK) == 0) { sleep(1); waited++; }
+         printf("prof: window %s after %d s\n", access("/private/var/tmp/a9yprof", F_OK) ? "done" : "still open", waited);
+         return 0;
+      }
       if (!strcmp(cmd, "pids") && argc > 2) {
          pid_t pp[16];
          int n = pids(argv[2], pp, 16);

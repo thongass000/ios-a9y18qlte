@@ -243,6 +243,162 @@ index ee2b232..4f80de8 100644
  
  /*
   * The same texture, over memory somebody else allocated: an IOSurface of CoreAnimation's.
+diff --git a/inject/bgmtl_inject.m b/inject/bgmtl_inject.m
+index 56a4384..fc0374d 100644
+--- a/inject/bgmtl_inject.m
++++ b/inject/bgmtl_inject.m
+@@ -245,6 +245,142 @@ watchdog_bb(void *arg)
+    return NULL;
+ }
+ 
++/*
++ * a9y18qlte: a sampling profiler of backboardd's compositor thread (com.apple.coreanimation.display.primary), from inside
++ * the process (no task port needed). /private/var/tmp/a9yprof holding SECONDS starts a window: the thread is suspended about
++ * every 2 ms, its pc and frame-pointer chain read, and resumed; then each address is named with dladdr and the busiest
++ * functions are logged, by self time and by time including callees. The file is removed when the window ends.
++ */
++#include <mach/mach.h>
++#include <mach/thread_act.h>
++
++#define F_PROF "/private/var/tmp/a9yprof"
++enum { PROF_DEPTH = 12, PROF_MAX = 16384, PROF_TOP = 40 };
++struct prof_hit { uintptr_t addr; unsigned self, incl; };
++
++static int
++prof_cmp(const void *a, const void *b)
++{
++   const struct prof_hit *x = a, *y = b;
++   return x->addr < y->addr ? -1 : x->addr > y->addr;
++}
++
++static void
++prof_report(struct prof_hit *h, unsigned n, unsigned samples, int by_incl)
++{
++   /* functions, not addresses: each address folded to its dladdr symbol start */
++   for (unsigned i = 0; i < n; i++) {
++      Dl_info di;
++      if (dladdr((void *)h[i].addr, &di) && di.dli_saddr) h[i].addr = (uintptr_t)di.dli_saddr;
++   }
++   qsort(h, n, sizeof(*h), prof_cmp);
++   unsigned m = 0;
++   for (unsigned i = 0; i < n; i++) {
++      if (m && h[m - 1].addr == h[i].addr) { h[m - 1].self += h[i].self; h[m - 1].incl += h[i].incl; }
++      else h[m++] = h[i];
++   }
++   fprintf(stderr, "a9yprof: top %s of %u samples\n", by_incl ? "inclusive" : "self", samples);
++   for (int k = 0; k < PROF_TOP; k++) {
++      int best = -1;
++      for (unsigned i = 0; i < m; i++) {
++         unsigned v = by_incl ? h[i].incl : h[i].self;
++         if (v && (best < 0 || v > (by_incl ? h[best].incl : h[best].self))) best = (int)i;
++      }
++      if (best < 0) break;
++      Dl_info di = { 0 };
++      dladdr((void *)h[best].addr, &di);
++      const char *img = di.dli_fname ? strrchr(di.dli_fname, '/') : NULL;
++      fprintf(stderr, "a9yprof: %5.1f%% self %5.1f%% incl  %s  %s+0x%lx\n", 100.0 * h[best].self / samples,
++              100.0 * h[best].incl / samples, di.dli_sname ? di.dli_sname : "?", img ? img + 1 : "?",
++              (unsigned long)(h[best].addr - (uintptr_t)di.dli_fbase));
++      if (by_incl) h[best].incl = 0; else h[best].self = 0;
++   }
++}
++
++static void *
++profiler_bb(void *arg)
++{
++   (void)arg;
++   static uintptr_t frames[PROF_MAX][PROF_DEPTH];
++   static unsigned depth[PROF_MAX];
++   static struct prof_hit hits[PROF_MAX * PROF_DEPTH];
++   for (;;) {
++      sleep(2);
++      FILE *f = fopen(F_PROF, "r");
++      if (!f) continue;
++      unsigned secs = 20;
++      if (fscanf(f, "%u", &secs) != 1 || !secs || secs > 120) secs = 20;
++      fclose(f);
++      thread_act_array_t th = NULL;
++      mach_msg_type_number_t nth = 0;
++      thread_act_t target = MACH_PORT_NULL;
++      if (task_threads(mach_task_self(), &th, &nth) == KERN_SUCCESS) {
++         for (unsigned i = 0; i < nth; i++) {
++            pthread_t p = pthread_from_mach_thread_np(th[i]);
++            char name[64] = "";
++            if (p) pthread_getname_np(p, name, sizeof(name));
++            if (target == MACH_PORT_NULL && !strcmp(name, "com.apple.coreanimation.display.primary")) target = th[i];
++            else mach_port_deallocate(mach_task_self(), th[i]);
++         }
++         vm_deallocate(mach_task_self(), (vm_address_t)th, nth * sizeof(*th));
++      }
++      if (target == MACH_PORT_NULL) { fprintf(stderr, "a9yprof: no display thread\n"); unlink(F_PROF); continue; }
++      pthread_t tp = pthread_from_mach_thread_np(target);
++      uintptr_t stack_hi = tp ? (uintptr_t)pthread_get_stackaddr_np(tp) : 0;
++      uintptr_t stack_lo = tp ? stack_hi - pthread_get_stacksize_np(tp) : 0;
++      fprintf(stderr, "a9yprof: sampling the display thread for %u s\n", secs);
++      unsigned n = 0, idle = 0;
++      uint64_t end = clock_gettime_nsec_np(CLOCK_MONOTONIC) + (uint64_t)secs * 1000000000ull;
++      while (n < PROF_MAX && clock_gettime_nsec_np(CLOCK_MONOTONIC) < end) {
++         usleep(2000);
++         if (thread_suspend(target) != KERN_SUCCESS) break;
++         arm_thread_state64_t st;
++         mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
++         thread_basic_info_data_t bi;
++         mach_msg_type_number_t bcnt = THREAD_BASIC_INFO_COUNT;
++         int running = thread_info(target, THREAD_BASIC_INFO, (thread_info_t)&bi, &bcnt) == KERN_SUCCESS &&
++                       bi.run_state == TH_STATE_RUNNING;
++         if (running && thread_get_state(target, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
++            unsigned d = 0;
++            frames[n][d++] = (uintptr_t)arm_thread_state64_get_pc(st);
++            frames[n][d++] = (uintptr_t)arm_thread_state64_get_lr(st);
++            uintptr_t fp = (uintptr_t)arm_thread_state64_get_fp(st);
++            while (d < PROF_DEPTH && fp >= stack_lo && fp + 16 <= stack_hi && !(fp & 7)) {
++               uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
++               if (!ret) break;
++               frames[n][d++] = ret & 0x0000000fffffffffull;   /* no pointer authentication bits */
++               if (next <= fp) break;
++               fp = next;
++            }
++            depth[n++] = d;
++         } else {
++            idle++;
++         }
++         thread_resume(target);
++      }
++      mach_port_deallocate(mach_task_self(), target);
++      fprintf(stderr, "a9yprof: %u samples while running, %u while waiting\n", n, idle);
++      for (int pass = 0; pass < 2 && n; pass++) {
++         unsigned m = 0;
++         for (unsigned s = 0; s < n; s++) {
++            for (unsigned d = 0; d < depth[s]; d++) {
++               /* inclusive: once per sample per address (a recursion counts once); self: the pc alone */
++               int dup = 0;
++               for (unsigned e = 0; e < d; e++) if (frames[s][e] == frames[s][d]) dup = 1;
++               if (dup) continue;
++               hits[m].addr = frames[s][d] - (d ? 1 : 0);   /* a return address points past its call */
++               hits[m].self = d == 0;
++               hits[m].incl = 1;
++               m++;
++            }
++         }
++         prof_report(hits, m, n, pass);
++      }
++      unlink(F_PROF);
++   }
++   return NULL;
++}
++
+ static void *
+ watchdog(void *arg)
+ {
+@@ -351,6 +487,8 @@ bb_init(void)
+    pthread_t th;
+    pthread_create(&th, NULL, watchdog_bb, (void *)(intptr_t)crashtest);
+    pthread_detach(th);
++   pthread_create(&th, NULL, profiler_bb, NULL);   /* idle until /private/var/tmp/a9yprof appears */
++   pthread_detach(th);
+ }
+ 
+ __attribute__((constructor)) static void
 diff --git a/src/bgmtl.m b/src/bgmtl.m
 index 7243a7d..f96865b 100644
 --- a/src/bgmtl.m
