@@ -3889,7 +3889,7 @@ index 2514af3..b1d6c1b 100644
  	uint8_t ctrl = 0;
  	if (sweet_rtc_read(&rtc) == 0 && sweet_spmi_read(0, PM8150_RTC_CTRL, &ctrl) == 0) {
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index 423042f..2c8fad2 100644
+index 423042f..3785ae2 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
 @@ -35,6 +35,7 @@
@@ -3900,7 +3900,7 @@ index 423042f..2c8fad2 100644
  #include <libkern/c++/OSDictionary.h>
  #include <libkern/c++/OSNumber.h>
  #include <libkern/c++/OSUnserialize.h>
-@@ -269,11 +270,37 @@ sweet_div_up(uint32_t a, uint32_t b)
+@@ -269,11 +270,38 @@ sweet_div_up(uint32_t a, uint32_t b)
  	return b > 1 ? (a + b - 1) / b : a;
  }
  
@@ -3908,7 +3908,8 @@ index 423042f..2c8fad2 100644
 + * a9y18qlte: the Adreno 5xx imports a linear surface only with rows of whole 64-pixel tiles (freedreno's
 + * pitchalign is gmem_align_w = 64 texels there, 16 on a6xx), so 64 bytes is not enough: SpringBoard's
 + * app-switcher snapshots (281x609 'w30r' at 1152 bytes a row, 'LA08' at 224) were refused and drew grey.
-+ * Rows are padded to 64 pixels, a pitch the creator asked for included (clients read it back).
++ * Rows this side chooses are padded to 64 pixels; a pitch the creator asked for is kept, since SpringBoard
++ * draws its Control Center glyphs ('LA08' at 224 bytes a row) at its own pitch (padded: hatched icons).
 + */
 +#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
 +#define SWEET_SURFACE_ROW_LIMIT_ALIGN   256
@@ -3940,24 +3941,11 @@ index 423042f..2c8fad2 100644
  }
  
  /* Geometry from the creation properties (IOSurface.h keys). */
-@@ -328,6 +355,9 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
- 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
- 		return kIOReturnBadArgument;
- 	}
-+	if (s->elementWidth == 1 && props->getObject("IOSurfacePlaneInfo") == NULL) {
-+		s->bytesPerRow = sweet_align_row(s->bytesPerRow, s->bytesPerElement);
-+	}
- 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
- 
- 	OSArray *planes = one_plane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
-@@ -354,9 +384,18 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -354,9 +382,15 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
  			}
  			p->bytesPerRow = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
  			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement));
-+			if (p->elementWidth == 1) {
-+				p->bytesPerRow = sweet_align_row(p->bytesPerRow, p->bytesPerElement);
-+			}
-+			/* a pitch padded above may outgrow the creator's offsets and sizes: planes never overlap */
++			/* planes never overlap, whatever offsets and sizes the creator sent */
  			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
 -			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
 -			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
@@ -3971,7 +3959,17 @@ index 423042f..2c8fad2 100644
  			next = round_page((uint64_t)p->offset + p->size);
  			if ((uint64_t)p->offset + p->size > end) {
  				end = (uint64_t)p->offset + p->size;
-@@ -759,9 +798,22 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -644,6 +678,9 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		put32(p, 0x04, pl->height);
+ 		put32(p, 0x08, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
++		/* IOSurfaceClientGetBytesPerRowOfPlane (iOS 16.7) reads +0x10 of the plane, not +0x08: a planar surface's
++		 * planes answered 0 bytes a row (SpringBoard's 'b3a8' snapshots, refused by backboardd as textures) */
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;
+@@ -759,9 +796,22 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  		char name[32];
  		proc_selfname(name, sizeof(name));
  		sweet_surface_creates_logged++;
@@ -3996,7 +3994,7 @@ index 423042f..2c8fad2 100644
  	}
  	props->release();
  	if (ret != kIOReturnSuccess) {
-@@ -784,7 +836,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -784,7 +834,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
  	case kSweetSurfaceLimits: {
  		uint8_t limits[0x18] = { 0 };
  		put32(limits, 0x0, SWEET_SURFACE_ROW_ALIGN - 1);

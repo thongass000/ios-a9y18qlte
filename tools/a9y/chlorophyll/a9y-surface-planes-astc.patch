@@ -69,18 +69,21 @@ index ee2b232..f710a3b 100644
  /*
   * The same texture, over memory somebody else allocated: an IOSurface of CoreAnimation's.
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index 7243a7d..ebc708e 100644
+index 7243a7d..022e578 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
-@@ -345,6 +345,7 @@ bg_install_fallback(Class c)
+@@ -345,6 +345,10 @@ bg_install_fallback(Class c)
     const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
     NSUInteger _ncLength;
     void (^_ncDealloc)(void *, NSUInteger);
 +   BOOL _ncLoaded;       // a block-compressed one: nothing draws into ASTC with the CPU, so it is copied once and not at each use
++   BOOL _cpuCopy;        // a9y18qlte: an IOSurface the GPU cannot import (a pitch its own layout would change): a texture of ours,
++   BOOL _cpuLoaded;      // filled from the surface's memory and again whenever its seed moves
++   uint32_t _cpuSeed;
  }
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
-@@ -1650,8 +1651,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1650,8 +1654,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     if (surface) {
        _shape.usage |= 5;   /* a drawable is rendered into and may be sampled whatever CA asked for (MTLTextureUsageRenderTarget | ShaderRead) */
        /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
@@ -98,11 +101,26 @@ index 7243a7d..ebc708e 100644
        bg_unlock();
        _surface = CFRetain(surface);
        _plane = plane;
-@@ -1660,7 +1669,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1660,7 +1672,27 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
        _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
        bg_unlock();
     }
 -   if (!_tex) { BG_LOG("texture refused: %s\n", why); [self release]; return nil; }
++   /* a9y18qlte: SpringBoard's Control Center glyphs are surfaces at a pitch of their creator's (224 bytes a row), which the
++    * A512 cannot take as they are: they are sampled from a copy instead (rwaTextureSampledLocked) */
++   if (!_tex && surface && IOSurfaceGetPlaneCount((IOSurfaceRef)surface) <= 1) {
++      char why2[256] = { 0 };
++      bg_lock();
++      _tex = rwa_texture_create([device rwa], &_shape, why2, sizeof(why2));
++      bg_unlock();
++      if (_tex) {
++         _cpuCopy = YES;
++         static int told;
++         if (told++ < 8)
++            BG_LOG("texture over IOSurface %u copied instead (%lu bytes a row): %s\n", IOSurfaceGetID((IOSurfaceRef)surface),
++                   (unsigned long)IOSurfaceGetBytesPerRow((IOSurfaceRef)surface), why);
++      }
++   }
 +   if (!_tex && surface)
 +      BG_LOG("texture refused: %s (plane %lu of %lu: offset %ld, %lu bytes a row)\n", why, (unsigned long)plane,
 +             (unsigned long)IOSurfaceGetPlaneCount((IOSurfaceRef)surface),
@@ -112,7 +130,27 @@ index 7243a7d..ebc708e 100644
     _owner = device;
     return self;
  }
-@@ -1710,13 +1724,29 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1691,6 +1723,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+    // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
+    // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
+    // (one kernel clean per surface, ever) left those layers stale or missing until this.
++   if (_cpuCopy && _tex) {
++      uint32_t seed = IOSurfaceGetSeed((IOSurfaceRef)_surface);
++      if (!_cpuLoaded || seed != _cpuSeed) {
++         char why[256] = { 0 };
++         const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
++         if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)IOSurfaceGetBaseAddress((IOSurfaceRef)_surface),
++                               IOSurfaceGetBytesPerRow((IOSurfaceRef)_surface), why, sizeof(why)) != 0)
++            BG_LOG("surface copy: %s\n", why);
++         _cpuLoaded = YES;
++         _cpuSeed = seed;
++      }
++      return [self rwaTexture];
++   }
+    if (_surface && _tex) {
+       static NSMutableDictionary *seeds;
+       static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+@@ -1710,13 +1755,42 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  - (struct rwa_texture *)rwaTexture
  {
@@ -139,8 +177,89 @@ index 7243a7d..ebc708e 100644
 +                   _shape.width, _shape.height, _shape.pixel_format, _shape.mip_levels, (unsigned long)_ncLength, _ncBytes, rows,
 +                   b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
 +                   b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]);
++            /* the GPU's copy read back: if it is the caller's bytes, a wrong picture is the sampler's and not the upload's */
++            size_t row = (size_t)((_shape.width + 3) / 4) * 16, n = row * rows;
++            uint8_t *back = n <= _ncLength ? malloc(n) : NULL;
++            char why2[256] = { 0 };
++            if (back && rwa_texture_read(_tex, 0, 0, o, sz, back, 0, why2, sizeof(why2)) == 0) {
++               size_t first = n;
++               for (size_t i = 0; i < n; i++) if (back[i] != b[i]) { first = i; break; }
++               BG_LOG("no-copy compressed read back: %s (first difference at byte %zu of %zu, row of blocks %zu)\n",
++                      first == n ? "identical" : "DIFFERENT", first, n, first / row);
++            } else if (back) {
++               BG_LOG("no-copy compressed read back refused: %s\n", why2);
++            }
++            free(back);
 +         }
 +      }
        bg_unlock();
     }
     if (_linSrc && _tex) {
+diff --git a/test/bgmtl_carenderer_probe.m b/test/bgmtl_carenderer_probe.m
+index bab10f8..47c9269 100644
+--- a/test/bgmtl_carenderer_probe.m
++++ b/test/bgmtl_carenderer_probe.m
+@@ -167,6 +167,39 @@ make_scene(int n)
+       [root addSublayer:b];
+       break;
+    }
++   case 11:    // a9y18qlte: a variable blur over stripes (the status bar's edge and the App Library: black on the phone)
++   case 12: {  // ... and a plain blur of a large radius over the whole scene (the App Library's material)
++      for (int i = 0; i < 8; i++) {
++         CALayer *l = [CALayer layer];
++         l.frame = CGRectMake(i * 32, 0, 16, H);
++         l.backgroundColor = CGColorCreateGenericRGB(i & 1 ? 1 : 0.1, i & 2 ? 0.8 : 0.2, i & 4 ? 0.9 : 0.1, 1);
++         [root addSublayer:l];
++      }
++      Class bd = NSClassFromString(@"CABackdropLayer"), cf = NSClassFromString(@"CAFilter");
++      if (!bd || !cf) break;
++      CALayer *b = [bd layer];
++      b.frame = n == 11 ? CGRectMake(32, 32, 192, 192) : CGRectMake(0, 0, W, H);
++      id blur;
++      if (n == 11) {
++         CGColorSpaceRef gs = CGColorSpaceCreateDeviceGray();
++         CGContextRef g = CGBitmapContextCreate(NULL, 64, 64, 8, 0, gs, kCGImageAlphaNone);
++         for (int y = 0; y < 64; y++) {
++            CGContextSetGrayFillColor(g, y / 63.0, 1);
++            CGContextFillRect(g, CGRectMake(0, y, 64, 1));
++         }
++         CGImageRef mask = CGBitmapContextCreateImage(g);
++         blur = [cf performSelector:NSSelectorFromString(@"filterWithType:") withObject:@"variableBlur"];
++         [blur setValue:@24 forKey:@"inputRadius"];
++         [blur setValue:(__bridge id)mask forKey:@"inputMaskImage"];
++         [blur setValue:@YES forKey:@"inputNormalizeEdges"];
++      } else {
++         blur = [cf performSelector:NSSelectorFromString(@"filterWithType:") withObject:@"gaussianBlur"];
++         [blur setValue:@40 forKey:@"inputRadius"];
++      }
++      b.filters = blur ? @[ blur ] : @[];
++      [root addSublayer:b];
++      break;
++   }
+    case 10: {  // square corners at fractional positions, edge antialiased: the fringe alone
+       CALayer *b = [CALayer layer];
+       b.frame = CGRectMake(40.5, 40.25, 175.5, 175.75);
+@@ -236,7 +269,7 @@ main(int argc, char **argv)
+       printf("default device: %s\n", d ? [[d name] UTF8String] : "nil");
+       if (!d) return 2;
+       int bad = 0, done = 0;
+-      for (int n = 0; n < 11; n++) {
++      for (int n = 0; n < 13; n++) {
+          if (only >= 0 && n != only) continue;
+          CALayer *scene = make_scene(n);
+          // the reference: CoreAnimation's CPU path into a bitmap
+@@ -285,6 +318,14 @@ main(int argc, char **argv)
+          double sum = 0; unsigned nonzero = 0;
+          for (int i = 0; i < W * H * 4; i++) { sum += abs((int)out[i] - (int)ref[i]); if (out[i]) nonzero++; }
+          printf("scene %d: mean abs diff %.2f over %d channels, %u non-zero bytes rendered\n", n, sum / (W * H * 4), W * H * 4, nonzero);
++         if (n >= 11) {   // a blur's answer is not the CPU reference's (renderInContext draws no backdrop filter): its colour, by rows
++            for (int y = 40; y < H - 32; y += 48) {
++               double c[3] = { 0, 0, 0 };
++               for (int x = 40; x < W - 40; x++) for (int k = 0; k < 3; k++) c[k] += out[(y * W + x) * 4 + k];
++               printf("scene %d: row %d mean BGR %.0f %.0f %.0f (reference %d %d %d at x 128)\n", n, y, c[0] / (W - 80),
++                      c[1] / (W - 80), c[2] / (W - 80), ref[(y * W + 128) * 4], ref[(y * W + 128) * 4 + 1], ref[(y * W + 128) * 4 + 2]);
++            }
++         }
+          // a9y18qlte: where they differ (thin wrong lines vanish in a mean): the worst channel per pixel, a map of 4x4 cells
+          int maxd = 0, bad32 = 0, x0 = W, y0 = H, x1 = -1, y1 = -1;
+          for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
