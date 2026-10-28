@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <mach/mach_time.h>
+#include <mach/mach.h>
 
 // a9ybbctl bench: a core's clock from a chain of dependent adds (one cycle each); the cpu from TPIDRRO_EL0's low bits
 struct bench { unsigned cpu0, cpu1; double mhz; };
@@ -55,15 +56,37 @@ bench_thread(void *arg)
    return NULL;
 }
 
+// per-CPU ticks (user, system, idle, nice), to see which cores ran the bench
+static unsigned
+cpu_ticks(unsigned (*out)[4], unsigned max)
+{
+   natural_t ncpu = 0;
+   processor_info_array_t info = NULL;
+   mach_msg_type_number_t cnt = 0;
+   if (host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &ncpu, &info, &cnt) != KERN_SUCCESS)
+      return 0;
+   for (unsigned c = 0; c < ncpu && c < max; c++)
+      for (unsigned s = 0; s < 4; s++) out[c][s] = ((processor_cpu_load_info_t)info)[c].cpu_ticks[s];
+   vm_deallocate(mach_task_self(), (vm_address_t)info, cnt * sizeof(integer_t));
+   return ncpu < max ? ncpu : max;
+}
+
 static void
 bench(int n)
 {
    pthread_t t[8];
    struct bench b[8];
+   unsigned before[16][4], after[16][4];
+   unsigned nc = cpu_ticks(before, 16);
    for (int i = 0; i < n; i++) pthread_create(&t[i], NULL, bench_thread, &b[i]);
    for (int i = 0; i < n; i++) pthread_join(t[i], NULL);
+   cpu_ticks(after, 16);
    printf("bench %d thread%s:", n, n > 1 ? "s" : "");
-   for (int i = 0; i < n; i++) printf(" cpu%u%s%u %.0f MHz;", b[i].cpu0, b[i].cpu1 == b[i].cpu0 ? "=" : ">", b[i].cpu1, b[i].mhz);
+   for (int i = 0; i < n; i++) printf(" %.0f", b[i].mhz);
+   printf(" MHz; busy ticks per cpu (user+sys / idle):");
+   for (unsigned c = 0; c < nc; c++)
+      printf(" %u:%u/%u", c, after[c][CPU_STATE_USER] + after[c][CPU_STATE_SYSTEM] - before[c][CPU_STATE_USER] -
+             before[c][CPU_STATE_SYSTEM], after[c][CPU_STATE_IDLE] - before[c][CPU_STATE_IDLE]);
    printf("\n");
 }
 
@@ -232,7 +255,7 @@ main(int argc, char **argv)
       }
       if (!strcmp(cmd, "bench")) {   // the cores' clocks: one thread alone, then one per core at once
          bench(1);
-         bench(1);
+         bench(4);
          bench(8);
          return 0;
       }
