@@ -191,7 +191,23 @@ main(int argc, char **argv)
          fclose(f);
          return 0;
       }
-      printf("usage: a9ybbctl status|install|restore|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]\n");
+      if (!strcmp(cmd, "hex") && argc > 2) {   // a binary back through the log: "hex OFFSET BYTES" lines of 64 bytes
+         FILE *f = fopen(argv[2], "rb");
+         if (!f) { printf("%s: absent\n", argv[2]); return 1; }
+         unsigned char b[64];
+         size_t n, off = 0;
+         printf("hexfile %s\n", argv[2]);
+         while ((n = fread(b, 1, sizeof(b), f)) > 0) {
+            char line[2 * sizeof(b) + 1];
+            for (size_t i = 0; i < n; i++) sprintf(line + 2 * i, "%02x", b[i]);
+            printf("hex %zx %s\n", off, line);
+            off += n;
+         }
+         printf("hexend %zu\n", off);
+         fclose(f);
+         return 0;
+      }
+      printf("usage: a9ybbctl status|install|restore|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE\n");
       return 2;
    }
 }

@@ -1,0 +1,20 @@
+diff --git a/src/bgmtl.m b/src/bgmtl.m
+index b3a614e..dd8b407 100644
+--- a/src/bgmtl.m
++++ b/src/bgmtl.m
+@@ -750,8 +750,13 @@ bg_air_slice(NSData *d)
+    if (bg_trace() && getenv("BGMTL_DUMP")) {   // the exact modules this pipeline is built from, for air2nir on the Mac
+       mkdir(getenv("BGMTL_DUMP"), 0755);
+       NSString *d = [NSString stringWithUTF8String:getenv("BGMTL_DUMP")];
+-      if (vair) [vair writeToFile:[d stringByAppendingFormat:@"/%@.v.bc", [vertex name]] atomically:NO];
+-      [fair writeToFile:[d stringByAppendingFormat:@"/%@.f.bc", [fragment name]] atomically:NO];
++      /* a9y18qlte: numbered, the pipelines of one function pair differ in their specialization (Metal writes the
++       * constant values into the air.fc_initializer globals); the number is in the trace line below */
++      static unsigned dumped;
++      unsigned nr = ++dumped;
++      BG_LOG("  pipe dump %u\n", nr);
++      if (vair) [vair writeToFile:[d stringByAppendingFormat:@"/%u.%@.v.bc", nr, [vertex name]] atomically:NO];
++      [fair writeToFile:[d stringByAppendingFormat:@"/%u.%@.f.bc", nr, [fragment name]] atomically:NO];
+    }
+    struct rwa_render_shape shape;
+    memset(&shape, 0, sizeof(shape));
