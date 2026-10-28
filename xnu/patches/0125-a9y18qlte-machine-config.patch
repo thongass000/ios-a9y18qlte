@@ -2474,7 +2474,7 @@ index d9d7860..24e8990 100644
  #define A6_FSR_FAULT		0xc00001feu
  #define A6_GMEM_LOG_OFF		0x91000ull
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index c87ed5d..c0f21b1 100644
+index c87ed5d..fbdbb19 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -238,6 +238,7 @@ int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const
@@ -2569,7 +2569,46 @@ index c87ed5d..c0f21b1 100644
  #define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
  #define DISPLAY_MASK_SIDE       256u
  #define DISPLAY_MASK_DIM        (DISPLAY_MASK_SIDE * 2)
-@@ -598,6 +633,14 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -557,6 +592,38 @@ static uint32_t display_mask_radius;
+ 
+ static uint64_t stat_frames, stat_clean_abs, stat_gpu_abs;
+ 
++/*
++ * The first physical page of each buffer a GPU client imported (SweetAccelerator BoImport): a swapped frame
++ * starting there was drawn by the GPU, and its present needs no clean of the CPU's cache (11 MB of lines,
++ * 4-6 ms on the vsync thread per frame). Frames the CPU drew (CoreAnimation's own renderer) are not in it.
++ */
++#define IMPORTED_PA_MAX 512
++static uint64_t imported_pa[IMPORTED_PA_MAX];
++static uint32_t imported_pa_next;
++
++void sweet_gpu_note_import(uint64_t pa0);
++bool sweet_gpu_imported(uint64_t pa);
++
++void
++sweet_gpu_note_import(uint64_t pa0)
++{
++	if (pa0 == 0 || sweet_gpu_imported(pa0)) {
++		return;
++	}
++	imported_pa[imported_pa_next++ % IMPORTED_PA_MAX] = pa0;
++}
++
++bool
++sweet_gpu_imported(uint64_t pa)
++{
++	for (uint32_t i = 0; i < IMPORTED_PA_MAX; i++) {
++		if (imported_pa[i] == pa) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ /* The four corner mattes: black, alpha = 1 - coverage of the image (SweetDisplayMask.h). */
+ static void
+ display_mask_build(uint32_t r, uint32_t ext)
+@@ -598,6 +665,14 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	    DISPLAY_STAGE_OFF + (uint64_t)fb_pitch * PANEL_H > A6_POOL_SIZE) {
  		return -1;
  	}
@@ -2584,7 +2623,7 @@ index c87ed5d..c0f21b1 100644
  	uint64_t t0 = mach_absolute_time();
  	if (kva) {
  		clean_dcache64((addr64_t)kva, (unsigned)((uint64_t)pitch * h + offset), FALSE);
-@@ -618,6 +661,12 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -618,6 +693,12 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	}
  	frame.dx = (PANEL_W - frame.dw) / 2;
  	frame.dy = (PANEL_H - frame.dh) / 2;
@@ -2597,7 +2636,7 @@ index c87ed5d..c0f21b1 100644
  	uint32_t ext = corner_radius ? sweet_display_corner_extent(corner_radius) : 0;
  	if (ext > DISPLAY_MASK_SIDE || 2 * ext >= frame.dw || 2 * ext >= frame.dh) {
  		ext = 0;
-@@ -684,9 +733,16 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -684,9 +765,16 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	uint32_t k = present_next & 1;
  	int rc = present_wait_locked(k, "present");
  	if (rc == 0) {
@@ -2615,7 +2654,7 @@ index c87ed5d..c0f21b1 100644
  		gpu_owner_locked(present_fence[k], 0);
  		rc = present_fence[k] ? 0 : -1;
  		present_next++;
-@@ -1118,6 +1174,23 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
+@@ -1118,6 +1206,23 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
  	}
  }
  
@@ -3265,10 +3304,18 @@ index 0000000..7c82491
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
-index 0254860..8a741d6 100644
+index 0254860..e163443 100644
 --- a/iokit/Kernel/arm/SweetAccelerator.cpp
 +++ b/iokit/Kernel/arm/SweetAccelerator.cpp
-@@ -115,6 +115,18 @@ SweetAccelerator::start(IOService *provider)
+@@ -61,6 +61,7 @@ uint32_t sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsig
+ int sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns);
+ bool sweet_gpu_lost(uint64_t *epoch, uint32_t last_fence);
+ uint64_t sweet_gpu_recoveries(void);
++void sweet_gpu_note_import(uint64_t pa0);
+ uint64_t sweet_gpu_timestamp(void);
+ int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
+ uint64_t sweet_gpu_pool_avail(void);
+@@ -115,6 +116,18 @@ SweetAccelerator::start(IOService *provider)
  	/* sweetmtl=1: SweetMetal (host-made templates, phone/metal); sweetmtl=2: SweetMetal2 (metal2vulkan + Turnip, phone/metal2) */
  	uint32_t which = 1;
  	PE_parse_boot_argn("sweetmtl", &which, sizeof(which));
@@ -3287,7 +3334,7 @@ index 0254860..8a741d6 100644
  	const char *plugin = which == 2 ? "SweetMetal2" : "SweetMetal";
  	setProperty("MetalPluginName", plugin);
  	setProperty("MetalPluginClassName", which == 2 ? "SweetMTL2Device" : "SweetMTLDevice");
-@@ -413,8 +425,13 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
+@@ -413,8 +426,13 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
  		if (args->scalarOutputCount < 3) {
  			return kIOReturnBadArgument;
  		}
@@ -3301,7 +3348,7 @@ index 0254860..8a741d6 100644
  		out[2] = sweet_gpu_ready();
  		return kIOReturnSuccess;
  	case 1: {
-@@ -662,6 +679,19 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+@@ -662,6 +680,19 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
  	}
  	case NativeAdrenoMethodGetDeviceInfo: {
  		V2_OUT(NativeAdrenoAbiDeviceInfo);
@@ -3321,7 +3368,7 @@ index 0254860..8a741d6 100644
  		/* what bsd/dev/sweet_a6xx.c's hw_init programs: GMEM 1 MB at 0x100000, UBWC 3 (hbb 15, lvl 2+3 swizzle) */
  		rp->chip_id = 0x06040001;
  		rp->gmem_bytes = 0x100000;
-@@ -673,6 +703,7 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+@@ -673,6 +704,7 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
  		rp->ubwc_swizzle = 0x6;
  		rp->macrotile_mode = 0;
  		rp->ubwc_version = 3;
@@ -3329,7 +3376,7 @@ index 0254860..8a741d6 100644
  		rp->flags = NativeAdrenoDeviceClientIova;
  		return kIOReturnSuccess;
  	}
-@@ -732,8 +763,10 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+@@ -732,8 +764,10 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
  			return kIOReturnBadArgument;
  		}
  		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(rq->address, rq->bytes, kIODirectionInOut, fTask);
@@ -3340,19 +3387,21 @@ index 0254860..8a741d6 100644
  			md = IOMemoryDescriptor::withAddressRange(rq->address, rq->bytes, kIODirectionOut, fTask);
  			if (md != NULL && md->prepare() != kIOReturnSuccess) {
  				md->release();
-@@ -743,6 +776,25 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+@@ -743,6 +777,27 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
  		if (md == NULL) {
  			return kIOReturnBadArgument;
  		}
 +		/* which pages an import pins, against the ones the panel copy reads (SweetFramebuffer "surface ... pa"):
 +		 * backboardd's frames on Chlorophyll came out empty while the same renders into test IOSurfaces were right */
 +		static uint32_t sweet_import_logged;
++		IOByteCount seg = 0;
++		uint64_t pa0 = md->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
 +		if (sweet_import_logged < 48) {
 +			sweet_import_logged++;
-+			IOByteCount seg = 0;
 +			IOLog("SWEET MTL: import %s va %llx bytes %llx pa0 %llx%s\n", fName, rq->address, rq->bytes,
-+			    (unsigned long long)md->getPhysicalSegment(0, &seg, kIOMemoryMapperNone), ro ? " (read-only pin)" : "");
++			    (unsigned long long)pa0, ro ? " (read-only pin)" : "");
 +		}
++		sweet_gpu_note_import(pa0);     /* a frame drawn here needs no cache clean at its present */
 +		/*
 +		 * Clean the CPU's view to memory (the GPU does not snoop), as the v1 path does: lines the CPU
 +		 * left dirty (an IOSurface's zero fill) would otherwise be written back over what the GPU
@@ -3489,22 +3538,23 @@ index 2545cf9..6d3c7e9 100644
  		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
  		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index bc98b59..a42f8eb 100644
+index bc98b59..f3678f2 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -49,7 +49,11 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
+@@ -49,7 +49,12 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
  	uint32_t *out_dw, uint32_t *out_dh);
  void sweet_gpu_panel_stride(uint32_t stride);
  extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
 +void flush_dcache64(addr64_t addr, unsigned count, int phys);
 +int sweet_gpu_wait_idle_ns(uint64_t timeout_ns);
++bool sweet_gpu_imported(uint64_t pa);
  }
 +/* a swapped frame may still be drawing (asynchronous commits): the copy waits this long for the GPU at most */
 +#define SWEET_FB_GPU_WAIT_NS            50000000ULL
  #define SWEET_FB_GPU_ROWBYTES           4352    /* the 2D engine writes 64-byte multiples */
  
  #if defined(SWEET)
-@@ -144,6 +148,9 @@ public:
+@@ -144,6 +149,9 @@ public:
  	void swap(const uint8_t *rec);
  	void present(const uint8_t *rec);
  	bool presentGPU(const uint8_t *rec);
@@ -3514,7 +3564,7 @@ index bc98b59..a42f8eb 100644
  	void copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n);
  };
  
-@@ -443,6 +450,100 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
+@@ -443,6 +451,100 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
   * first time, the panel switches to the GPU's row stride and is cleared, so
   * the bars stay black. False: use the CPU copy.
   */
@@ -3615,10 +3665,17 @@ index bc98b59..a42f8eb 100644
  bool
  AppleCLCD::presentGPU(const uint8_t *rec)
  {
-@@ -508,6 +609,19 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+@@ -506,8 +608,24 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		IOLog("SWEET FB: frames now scaled to fit by the GPU (panel stride %u)\n", fRowBytes);
+ 	}
  	uint32_t dx = 0, dy = 0, dw = 0, dh = 0;
- 	int rc = sweet_gpu_present(slot, s->kernelAddress(), s->offset, s->width, s->height, s->bytesPerRow,
- 	    fRowBytes, fCornerRadius, &dx, &dy, &dw, &dh);
+-	int rc = sweet_gpu_present(slot, s->kernelAddress(), s->offset, s->width, s->height, s->bytesPerRow,
+-	    fRowBytes, fCornerRadius, &dx, &dy, &dw, &dh);
++	/* a frame a GPU client drew (its pages imported, SweetAccelerator) has no CPU lines to clean first */
++	IOByteCount pseg = 0;
++	bool gpuDrawn = sweet_gpu_imported(s->memory->getPhysicalSegment(0, &pseg, kIOMemoryMapperNone));
++	int rc = sweet_gpu_present(slot, gpuDrawn ? 0 : s->kernelAddress(), s->offset, s->width, s->height,
++	    s->bytesPerRow, fRowBytes, fCornerRadius, &dx, &dy, &dw, &dh);
 +#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
 +	/* the first few draws: once the GPU is idle, the frame's centre against the panel's (write-combined) */
 +	static uint32_t fit_checks;
@@ -3635,7 +3692,7 @@ index bc98b59..a42f8eb 100644
  	s->release();
  	if (rc) {
  		return gpu_fallback(7, "GPU blit failed");
-@@ -535,9 +649,27 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -535,9 +653,27 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
@@ -3663,7 +3720,7 @@ index bc98b59..a42f8eb 100644
  	if (sweet_display_fit_w) {
  		sweet_display_fit_w = 0;        /* touch back to the crop mapping */
  		sweet_display_fit_x = sweet_display_fit_y = sweet_display_fit_h = 0;
-@@ -568,6 +700,9 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -568,6 +704,9 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
