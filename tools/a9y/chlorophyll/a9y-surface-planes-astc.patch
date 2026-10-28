@@ -1,5 +1,5 @@
 diff --git a/air/air_metal.c b/air/air_metal.c
-index de181b4..2c32c04 100644
+index de181b4..25ed4c0 100644
 --- a/air/air_metal.c
 +++ b/air/air_metal.c
 @@ -257,6 +257,11 @@ struct rwa_texture {
@@ -181,7 +181,21 @@ index de181b4..2c32c04 100644
         tex_pool_put(texture->device, texture->res, texture->view)) {
        free(texture);          /* the pool holds the resource's reference and the view now */
        return;
-@@ -7440,6 +7559,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char
+@@ -2380,8 +2499,11 @@ sampler_state_from_metal(const struct rwa_sampler_state *st, struct pipe_sampler
+        */
+       .unnormalized_coords = !st->normalized_coordinates,
+       .max_anisotropy = st->max_anisotropy > 1 ? st->max_anisotropy : 0,
+-      .min_lod = st->lod_min,
+-      .max_lod = st->lod_max,
++      /* a9y18qlte: clamped to the levels a texture can have. Metal's "no clamp" is FLT_MAX (lodMaxClamp) or 65504 (a
++       * constexpr sampler's half), and fd5 packs MAX_LOD as 4.8 fixed point in 12 bits: 65504 * 256 wrapped to 0, so
++       * every explicit-LOD read came from level 0 (the variable blur's mosaic band; Mesa's GL clamps before the driver). */
++      .min_lod = CLAMP(st->lod_min, 0.0f, 15.0f),
++      .max_lod = CLAMP(st->lod_max, 0.0f, 15.0f),
+    };
+    /* transparent black, which is both Metal's default border colour and what
+     * clamp_to_zero reads by definition. Written out rather than left to the zeroing
+@@ -7440,6 +7562,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char
           goto fail;
        }
        if (present++ == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
@@ -189,7 +203,7 @@ index de181b4..2c32c04 100644
        surf[i] = texture_surface(t);
        if (!surf[i]) { say(why, why_size, "no render surface for colour attachment %u", i); goto fail; }
        fb.cbufs[i] = surf[i];
-@@ -7716,13 +7836,15 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+@@ -7716,13 +7839,15 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        }
        unsigned tw = t->shape.width;
        unsigned th = t->shape.height ? t->shape.height : 1;

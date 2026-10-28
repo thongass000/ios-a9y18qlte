@@ -3743,7 +3743,7 @@ index 2545cf9..6d3c7e9 100644
  		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
  		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index bc98b59..83fabbf 100644
+index bc98b59..564dd17 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -48,8 +48,16 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
@@ -3995,6 +3995,17 @@ index bc98b59..83fabbf 100644
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
  			h = (int32_t)s->height;
+@@ -758,7 +937,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+-				fFB->fDirty = true;     /* on: redraw the latest frame */
++				/* on: redraw the latest frame -- except after the GPU's blank (a9y18qlte), where that frame is the one
++				 * from before the display went off (a stale lock screen, then the real one): black until the next swap */
++				fFB->fDirty = !(fFB->fGPU && fFB->fBufMap[1] != NULL);
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 index 2514af3..b1d6c1b 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
