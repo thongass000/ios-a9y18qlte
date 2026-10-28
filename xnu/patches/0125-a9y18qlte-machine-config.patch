@@ -1009,10 +1009,10 @@ index 0000000..3da81c7
 +#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
 diff --git a/bsd/dev/a9y_touch.c b/bsd/dev/a9y_touch.c
 new file mode 100644
-index 0000000..91746ca
+index 0000000..24eb631
 --- /dev/null
 +++ b/bsd/dev/a9y_touch.c
-@@ -0,0 +1,347 @@
+@@ -0,0 +1,368 @@
 +/*
 + * a9y18qlte (Galaxy A9 2018, SDM660) touchscreen: Zinitix ZT7548 at 0x20 on
 + * BLSP1 QUP4 I2C (i2c@c178000: SDA/SCL GPIO 14/15, IRQ GPIO 67, low while a
@@ -1315,9 +1315,22 @@ index 0000000..91746ca
 +{
 +	uint32_t active = 0;
 +	int x[ZT_FINGERS] = { 0 }, y[ZT_FINGERS] = { 0 };
++	int sent_x[ZT_FINGERS] = { 0 }, sent_y[ZT_FINGERS] = { 0 };
++	/*
++	 * Moves go to iOS at most a9ytouchhz (default 60, 0 = every report) times
++	 * a second, the newest position, and only when it changed; downs and ups
++	 * at once. Each event costs backboardd's HID pipeline and SpringBoard more
++	 * CPU than a frame shows (ios-sailfish 0182).
++	 */
++	uint64_t move_gap = 0, move_last = 0;
++	uint32_t hz = 60;
 +
 +	if (touch_setup() != 0) {
 +		return;
++	}
++	(void)PE_parse_boot_argn("a9ytouchhz", &hz, sizeof(hz));
++	if (hz) {
++		nanoseconds_to_absolutetime(NSEC_PER_SEC / hz, &move_gap);
 +	}
 +	for (;;) {
 +		if (rd(tlmm_cfg(TOUCH_IRQ) + 4) & 1) {
@@ -1327,6 +1340,8 @@ index 0000000..91746ca
 +		uint8_t p[4 + 6 * ZT_FINGERS];
 +		if (zt_read(0x0080, p, sizeof(p)) == 0) {
 +			uint32_t now = 0;
++			uint64_t t = mach_absolute_time();
++			bool move_ok = t - move_last >= move_gap;
 +			for (int f = 0; f < ZT_FINGERS; f++) {
 +				const uint8_t *c = p + 4 + 6 * f;
 +				/* SUB_BIT_EXIST without SUB_BIT_UP: the finger is on the panel */
@@ -1334,7 +1349,13 @@ index 0000000..91746ca
 +					x[f] = c[0] | c[1] << 8;
 +					y[f] = c[2] | c[3] << 8;
 +					now |= 1u << f;
-+					sweet_hid_touch(f, 1, x[f], y[f]);
++					if (!(active & (1u << f)) ||
++					    ((x[f] != sent_x[f] || y[f] != sent_y[f]) && move_ok)) {
++						sweet_hid_touch(f, 1, x[f], y[f]);
++						sent_x[f] = x[f];
++						sent_y[f] = y[f];
++						move_last = t;
++					}
 +				} else if (active & (1u << f)) {
 +					sweet_hid_touch(f, 0, x[f], y[f]);
 +				}
@@ -1362,10 +1383,10 @@ index 0000000..91746ca
 +#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
 diff --git a/bsd/dev/sweet_a5xx.c b/bsd/dev/sweet_a5xx.c
 new file mode 100644
-index 0000000..81823b4
+index 0000000..5a7540a
 --- /dev/null
 +++ b/bsd/dev/sweet_a5xx.c
-@@ -0,0 +1,903 @@
+@@ -0,0 +1,948 @@
 +/*
 + * Adreno 512 core for the a9y18qlte (SDM660): the sweet_a6xx.h core API
 + * (same a6_* names, so bsd/dev/sweet_gpu.c and the accelerator above it run
@@ -1616,6 +1637,50 @@ index 0000000..81823b4
 +			e += snprintf(e, line + sizeof(line) - e, " S%u %u mV%s", s, (unsigned)(hi << 8 | lo), en & 0x80 ? "" : " (off)");
 +	}
 +	a6_log("cpu rails, PM660 SMPS set points:%s\n", line);
++}
++
++/*
++ * Read only: a clock's rate through the GCC debug mux (gcc-sdm660.c gcc_debug_mux, clk-debug.c measure): select it in
++ * GCC_DEBUG_CLK_CTL (0x62000; bit 16 enable, post divider 1), count it against XO/4 (XO_DIV4_CBCR 0x43008) in
++ * CLOCK_FRQ_MEASURE_CTL / STATUS (0x62004 / 8). Only these debug registers change, restored afterwards. For how ABL
++ * leaves the RPM's bus clocks: the Pixel 1 port (ios-sailfish 0145) found its DDR far below Linux's vote.
++ */
++#define GCC_DBG_CTL	(GCC + 0x62000)
++#define GCC_DBG_MEAS	(GCC + 0x62004)
++#define GCC_DBG_STATUS	(GCC + 0x62008)
++#define GCC_XO_DIV4	(GCC + 0x43008)
++
++static uint32_t measure_run(uint32_t ticks)
++{
++	wr32(GCC_DBG_MEAS, ticks);
++	(void)wait_bit(GCC_DBG_STATUS, 1u << 25, 0, 1000);
++	wr32(GCC_DBG_MEAS, (1u << 20) | ticks);
++	(void)wait_bit(GCC_DBG_STATUS, 1u << 25, 1, 100000);
++	return rd32(GCC_DBG_STATUS) & 0x1ffffffu;
++}
++
++static unsigned measure_mhz(uint32_t sel)
++{
++	uint32_t ctl = rd32(GCC_DBG_CTL), cbcr = rd32(GCC_XO_DIV4);
++	wr32(GCC_DBG_CTL, (ctl & ~0xf3ffu) | (sel & 0x3ffu) | (1u << 16));
++	wr32(GCC_XO_DIV4, cbcr | 1u);
++	uint32_t s = measure_run(0x1000), f = measure_run(0x10000);
++	wr32(GCC_XO_DIV4, cbcr);
++	wr32(GCC_DBG_CTL, ctl);
++	if (f == s)
++		return 0;				/* not running */
++	return (unsigned)((((uint64_t)f * 10 + 15) * 4800000 / (0x10000 * 10 + 35)) / 1000000);
++}
++
++static void log_bus_clocks(void)
++{
++	static const struct { const char *name; uint32_t sel; } c[] = {
++		{ "bimc (DDR)", 0x19d }, { "snoc", 0x000 }, { "cnoc", 0x00e }, { "bimc_gfx", 0x0ac },
++	};
++	char line[160], *e = line;
++	for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++)
++		e += snprintf(e, line + sizeof(line) - e, " %s %u", c[i].name, measure_mhz(c[i].sel));
++	a6_log("bus clocks, MHz as measured:%s\n", line);
 +}
 +
 +/*
@@ -2204,6 +2269,7 @@ index 0000000..81823b4
 +		return -1;
 +	gfx_clock(g->perf_level);
 +	log_cpu_clocks();
++	log_bus_clocks();
 +	gold_clock(g->gold_mhz);
 +	if (gpu_cp_init(g, false))
 +		return -1;
@@ -4006,6 +4072,52 @@ index bc98b59..564dd17 100644
  			}
  			IOLockUnlock(fFB->fLock);
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index 73d9267..e0ce104 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -55,9 +55,12 @@ enum {
+ 
+ /*
+  * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
+- * (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear lock bits = unlocked.
++ * (MobileKeyBag MKBDeviceUnlockedSinceBoot), bit 1 "no passcode"; clear
++ * lock bits = unlocked. With only bit 2 (and lock state 0 in the device
++ * state) SpringBoard, duetexpertd, contextstored and coreduetd asked
++ * thousands of times (2500 in run 91), as on ios-sailfish (0180).
+  */
+-#define SWEET_AKS_LOCK_STATE    0x4
++#define SWEET_AKS_LOCK_STATE    0x6     /* no passcode (bit 1), unlocked since boot (bit 2) */
+ 
+ class AppleKeyStore : public IOService {
+ 	OSDeclareDefaultStructors(AppleKeyStore);
+@@ -150,7 +153,7 @@ sweet_aks_device_state(IOExternalMethodArguments *args)
+ 		const char *key;
+ 		uint8_t value;
+ 	} fields[] = {
+-		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
++		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 3 }, { "sb", 0 }, { "sfa", 0 },    /* sls 3: disabled (no passcode) */
+ 		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
+ 	};
+ 	uint8_t buf[128];
+@@ -275,10 +278,13 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	static uint32_t logged[128];            /* a few lines per selector: they are asked thousands of times */
++	if (selector >= 128 || logged[selector]++ < 5) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 index 2514af3..b1d6c1b 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
@@ -4388,6 +4500,24 @@ index cd7cc4c..4cf963e 100644
  	__asm__ volatile("dsb ishst" ::: "memory");
  }
  #endif
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index b082a10..e86adc5 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -568,7 +568,12 @@ cpu_idle(void)
+ #endif /* MONOTONIC */
+ 
+ 	if (wfi) {
+-#if !defined(APPLE_ARM64_ARCH_FAMILY)
++#if !defined(APPLE_ARM64_ARCH_FAMILY) && !defined(SWEET)
++		/*
++		 * (Not on SWEET: the caches stay coherent and powered while a core
++		 * waits; this cleaned and invalidated the whole D-cache by set/way
++		 * on every idle entry. joranv1/ios-sailfish 0180 skips it too.)
++		 */
+ 		platform_cache_idle_enter();
+ #endif
+ 
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 index 24f1abc..13d00e2 100644
 --- a/osfmk/arm64/sleh.c
