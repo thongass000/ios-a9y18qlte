@@ -11,6 +11,7 @@
 //   a9ybbctl pids NAME       the pids of processes called NAME
 //   a9ybbctl threads NAME S  where NAME's CPU time goes over S seconds, per thread
 //   a9ybbctl hex FILE        a file as hex lines (a binary back through the log)
+//   a9ybbctl bench           the cores' clocks (dependent adds), one thread and one per core
 //   a9ybbctl cat FILE [MAX]  print a file (the injection logs to /private/var/tmp/bgmtl.log), at most MAX lines
 // The plist is changed on the phone, by CoreFoundation's own writer and the phone's own file system, never from Linux.
 #import <Foundation/Foundation.h>
@@ -20,6 +21,51 @@
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <mach/mach_time.h>
+
+// a9ybbctl bench: a core's clock from a chain of dependent adds (one cycle each); the cpu from TPIDRRO_EL0's low bits
+struct bench { unsigned cpu0, cpu1; double mhz; };
+
+static unsigned
+cur_cpu(void)
+{
+   uint64_t v;
+   __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(v));
+   return (unsigned)(v & 7);
+}
+
+static void *
+bench_thread(void *arg)
+{
+   struct bench *b = arg;
+   mach_timebase_info_data_t tb;
+   mach_timebase_info(&tb);
+   b->cpu0 = cur_cpu();
+   uint64_t t0 = mach_absolute_time(), adds = 0, x = 0;
+   while ((mach_absolute_time() - t0) * tb.numer / tb.denom < 400000000ull) {
+      for (int i = 0; i < 4096; i++)
+         __asm__ volatile("add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
+                          "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n" : "+r"(x));
+      adds += 4096 * 8;
+   }
+   double ns = (double)((mach_absolute_time() - t0) * tb.numer / tb.denom);
+   b->cpu1 = cur_cpu();
+   b->mhz = adds / ns * 1000.0;
+   return NULL;
+}
+
+static void
+bench(int n)
+{
+   pthread_t t[8];
+   struct bench b[8];
+   for (int i = 0; i < n; i++) pthread_create(&t[i], NULL, bench_thread, &b[i]);
+   for (int i = 0; i < n; i++) pthread_join(t[i], NULL);
+   printf("bench %d thread%s:", n, n > 1 ? "s" : "");
+   for (int i = 0; i < n; i++) printf(" cpu%u%s%u %.0f MHz;", b[i].cpu0, b[i].cpu1 == b[i].cpu0 ? "=" : ">", b[i].cpu1, b[i].mhz);
+   printf("\n");
+}
 
 // libproc (in libSystem; the iOS SDK has no libproc.h)
 extern int proc_listallpids(void *buffer, int buffersize);
@@ -184,6 +230,12 @@ main(int argc, char **argv)
          sleep((unsigned)atoi(argv[2]));
          return 0;
       }
+      if (!strcmp(cmd, "bench")) {   // the cores' clocks: one thread alone, then one per core at once
+         bench(1);
+         bench(1);
+         bench(8);
+         return 0;
+      }
       if (!strcmp(cmd, "threads") && argc > 3) {   // where a process's CPU time goes: per thread over SECONDS
          pid_t pp[1];
          if (pids(argv[2], pp, 1) < 1) { printf("no %s running\n", argv[2]); return 1; }
@@ -256,7 +308,7 @@ main(int argc, char **argv)
          fclose(f);
          return 0;
       }
-      printf("usage: a9ybbctl status|install|restore|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE|threads NAME S\n");
+      printf("usage: a9ybbctl status|install|restore|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE|threads NAME S|bench\n");
       return 2;
    }
 }
