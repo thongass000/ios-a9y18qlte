@@ -1362,10 +1362,10 @@ index 0000000..91746ca
 +#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
 diff --git a/bsd/dev/sweet_a5xx.c b/bsd/dev/sweet_a5xx.c
 new file mode 100644
-index 0000000..dd57def
+index 0000000..4907135
 --- /dev/null
 +++ b/bsd/dev/sweet_a5xx.c
-@@ -0,0 +1,850 @@
+@@ -0,0 +1,886 @@
 +/*
 + * Adreno 512 core for the a9y18qlte (SDM660): the sweet_a6xx.h core API
 + * (same a6_* names, so bsd/dev/sweet_gpu.c and the accelerator above it run
@@ -1616,6 +1616,41 @@ index 0000000..dd57def
 +			e += snprintf(e, line + sizeof(line) - e, " S%u %u mV%s", s, (unsigned)(hi << 8 | lo), en & 0x80 ? "" : " (off)");
 +	}
 +	a6_log("cpu rails, PM660 SMPS set points:%s\n", line);
++}
++
++/*
++ * ABL leaves the gold cluster on GPLL0 (its mux at 0x401) with its PLL at L 32: ~600 MHz, where Linux's OSM runs it
++ * up to 2.2 GHz. With mhz (boot-arg sweetgoldmhz) the PLL is relocked at one of Linux's corner frequencies and the
++ * mux moved to its early output, as OSM's sequencer does (it rewrites L live). The rails stay as ABL set them
++ * (868-872 mV): Linux's perfcl ceilings are 788 mV at 1401.6 MHz and 868 mV at 1747.2 MHz, so both are within.
++ */
++static void gold_clock(unsigned mhz)
++{
++	const uint64_t pll = 0x17816000ull, rcg = 0x17811050ull;
++	unsigned l = mhz == 1113 ? 58 : mhz == 1401 ? 73 : mhz == 1747 ? 91 : 0;
++	if (!l) {
++		if (mhz)
++			a6_log("cpu gold: %u MHz is not one of 1113, 1401, 1747: left as ABL set it\n", mhz);
++		return;
++	}
++	wr32(rcg + 4, 0x401);			/* GPLL0 while the PLL relocks */
++	wr32(rcg, rd32(rcg) | 1);
++	(void)wait_bit(rcg, 1, 0, 1000);
++	wr32(pll, 0);
++	wr32(pll + 4, l);
++	wr32(pll, 2);				/* bypass off */
++	a6_delay_us(10);
++	wr32(pll, 6);				/* out of reset */
++	a6_delay_us(75);
++	wr32(pll, 7);				/* output on */
++	int locked = wait_bit(pll + 0x2c, 1u << 16, 1, 1000) == 0;
++	if (locked) {
++		wr32(rcg + 4, 0x501);		/* the PLL's early output, divider 1 (silver's setting) */
++		wr32(rcg, rd32(rcg) | 1);
++		locked = wait_bit(rcg, 1, 0, 1000) == 0;
++	}
++	a6_log("cpu gold: PLL L %u (%u MHz) %s, rcg cfg %x\n", l, l * 192 / 10,
++	       locked ? "locked, cluster on it" : "did not lock: cluster stays on GPLL0", rd32(rcg + 4));
 +}
 +
 +static void gfx_clock(unsigned mhz)
@@ -2152,6 +2187,7 @@ index 0000000..dd57def
 +		return -1;
 +	gfx_clock(g->perf_level);
 +	log_cpu_clocks();
++	gold_clock(g->gold_mhz);
 +	if (gpu_cp_init(g, false))
 +		return -1;
 +	/* self test: an IB (scratch + 0x200) whose CP_MEM_WRITE lands at scratch + 0x100 */
@@ -2428,7 +2464,7 @@ index 0155304..fb56a32 100644
  #include <sys/param.h>
  #include <sys/systm.h>
 diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
-index d9d7860..24e8990 100644
+index d9d7860..2556e9c 100644
 --- a/bsd/dev/sweet_a6xx.h
 +++ b/bsd/dev/sweet_a6xx.h
 @@ -48,11 +48,19 @@
@@ -2451,16 +2487,17 @@ index d9d7860..24e8990 100644
  
  struct a6_gpu {
  	uint64_t pool_pa;
-@@ -61,7 +69,7 @@ struct a6_gpu {
+@@ -61,7 +69,8 @@ struct a6_gpu {
  	uint32_t fence;			/* last fence value submitted */
  	uint32_t hfi_seq;
  	uint32_t pt_next;		/* next free table in the arena */
 -	uint32_t perf_level;		/* GMU perf vote: 1 (257 MHz) .. 5 (585 MHz); 0 = 1 */
 +	uint32_t perf_level;		/* GMU perf vote: 1 (257 MHz) .. 5 (585 MHz); 0 = 1. A512: MHz, 0 = XO */
++	uint32_t gold_mhz;		/* a9y18qlte: the gold CPU cluster's clock (sweet_a5xx.c gold_clock); 0 = ABL's */
  };
  
  /* ---- environment ---- */
-@@ -146,6 +154,28 @@ struct a6_blit {
+@@ -146,6 +155,28 @@ struct a6_blit {
  #define A6_BLIT_MAX_DW	256
  uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *dw);
  
@@ -2489,7 +2526,7 @@ index d9d7860..24e8990 100644
  #define A6_CP_NOP		0x10
  #define A6_CP_WAIT_FOR_IDLE	0x26
  #define A6_CP_BLIT		0x2c
-@@ -157,10 +187,16 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
+@@ -157,10 +188,16 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
  #define A6_CP_MEMCPY		0x75
  
  /* Register/state access for status and dumps */
@@ -2508,7 +2545,7 @@ index d9d7860..24e8990 100644
  #define A6_FSR_FAULT		0xc00001feu
  #define A6_GMEM_LOG_OFF		0x91000ull
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index c87ed5d..fbdbb19 100644
+index c87ed5d..36cfbce 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -238,6 +238,7 @@ int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const
@@ -2527,7 +2564,7 @@ index c87ed5d..fbdbb19 100644
  }
  
  static void
-@@ -286,8 +288,17 @@ sweet_gpu_init(void)
+@@ -286,8 +288,20 @@ sweet_gpu_init(void)
  	}
  	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
  	a6_init_state(&gpu, ptoa_64(pn));
@@ -2538,6 +2575,9 @@ index c87ed5d..fbdbb19 100644
 +	 */
 +	uint32_t lvl = 400;
 +	PE_parse_boot_argn("sweetgpumhz", &lvl, sizeof(lvl));
++	uint32_t gold = 0;      /* the gold CPU cluster: 1113, 1401 or 1747 MHz (sweet_a5xx.c gold_clock); 0: ABL's */
++	PE_parse_boot_argn("sweetgoldmhz", &gold, sizeof(gold));
++	gpu.gold_mhz = gold;
 +#else
  	uint32_t lvl = 4;	/* 499 MHz; boot-arg sweetgpufreq=1 (257) .. 5 (585) */
  	PE_parse_boot_argn("sweetgpufreq", &lvl, sizeof(lvl));
@@ -2545,7 +2585,7 @@ index c87ed5d..fbdbb19 100644
  	gpu.perf_level = lvl;
  	pool_kva = va;
  	vm_offset_t pva = 0;
-@@ -449,11 +460,25 @@ gpu_recover_locked(const char *why)
+@@ -449,11 +463,25 @@ gpu_recover_locked(const char *why)
  
  /* ---- the panel ---- */
  
@@ -2571,7 +2611,7 @@ index c87ed5d..fbdbb19 100644
  /* ABL scans out through VIG0 + VIG1 (540 columns each); autorefresh picks a flushed change up. */
  void
  sweet_gpu_panel_stride(uint32_t stride)
-@@ -463,6 +488,7 @@ sweet_gpu_panel_stride(uint32_t stride)
+@@ -463,6 +491,7 @@ sweet_gpu_panel_stride(uint32_t stride)
  	a6_wr(CTL0_FLUSH, 0x3);
  	a6_log("panel stride %u\n", stride);
  }
@@ -2579,7 +2619,7 @@ index c87ed5d..fbdbb19 100644
  
  /* ---- surfaces ---- */
  
-@@ -526,6 +552,11 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
+@@ -526,6 +555,11 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
  
  #define IB_OFF          A6_OFF_FREE     /* the present IBs in the pool (two, PRESENT_IB) */
  #define PRESENT_IB(k)   (IB_OFF + 0x4000ULL * (k))
@@ -2591,7 +2631,7 @@ index c87ed5d..fbdbb19 100644
  
  static uint32_t present_fence[2];      /* of the present last queued from each IB slot */
  static uint32_t present_next;
-@@ -546,7 +577,11 @@ present_wait_locked(uint32_t k, const char *why)
+@@ -546,7 +580,11 @@ present_wait_locked(uint32_t k, const char *why)
  	return 0;
  }
  #define PANEL_W         1080
@@ -2603,7 +2643,7 @@ index c87ed5d..fbdbb19 100644
  #define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
  #define DISPLAY_MASK_SIDE       256u
  #define DISPLAY_MASK_DIM        (DISPLAY_MASK_SIDE * 2)
-@@ -557,6 +592,38 @@ static uint32_t display_mask_radius;
+@@ -557,6 +595,38 @@ static uint32_t display_mask_radius;
  
  static uint64_t stat_frames, stat_clean_abs, stat_gpu_abs;
  
@@ -2642,7 +2682,7 @@ index c87ed5d..fbdbb19 100644
  /* The four corner mattes: black, alpha = 1 - coverage of the image (SweetDisplayMask.h). */
  static void
  display_mask_build(uint32_t r, uint32_t ext)
-@@ -598,6 +665,14 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -598,6 +668,14 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	    DISPLAY_STAGE_OFF + (uint64_t)fb_pitch * PANEL_H > A6_POOL_SIZE) {
  		return -1;
  	}
@@ -2657,7 +2697,7 @@ index c87ed5d..fbdbb19 100644
  	uint64_t t0 = mach_absolute_time();
  	if (kva) {
  		clean_dcache64((addr64_t)kva, (unsigned)((uint64_t)pitch * h + offset), FALSE);
-@@ -618,6 +693,12 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -618,6 +696,12 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	}
  	frame.dx = (PANEL_W - frame.dw) / 2;
  	frame.dy = (PANEL_H - frame.dh) / 2;
@@ -2670,7 +2710,7 @@ index c87ed5d..fbdbb19 100644
  	uint32_t ext = corner_radius ? sweet_display_corner_extent(corner_radius) : 0;
  	if (ext > DISPLAY_MASK_SIDE || 2 * ext >= frame.dw || 2 * ext >= frame.dh) {
  		ext = 0;
-@@ -684,9 +765,16 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+@@ -684,9 +768,16 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	uint32_t k = present_next & 1;
  	int rc = present_wait_locked(k, "present");
  	if (rc == 0) {
@@ -2688,7 +2728,7 @@ index c87ed5d..fbdbb19 100644
  		gpu_owner_locked(present_fence[k], 0);
  		rc = present_fence[k] ? 0 : -1;
  		present_next++;
-@@ -1118,6 +1206,23 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
+@@ -1118,6 +1209,23 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
  	}
  }
  
