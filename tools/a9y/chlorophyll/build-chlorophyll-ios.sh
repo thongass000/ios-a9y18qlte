@@ -33,6 +33,7 @@ if [ ! -d chl ]; then
 	git -C chl apply "$HERE/a9y-vdump.patch"               # A9Y_VDUMP=N: a draw's vertex layout, indices, bytes
 	git -C chl apply "$HERE/a9y-submit-now.patch"          # a commit reaches the kernel at once (async: no half-drawn frames)
 	git -C chl apply "$HERE/a9y-completion-queue.patch"    # completed handlers on the client's queue (async: flicker in motion)
+	git -C chl apply "$HERE/a9y-surface-planes-astc.patch" # planar snapshots by plane; ASTC no-copy rows of blocks (grey cards)
 fi
 if [ ! -d mesa-air ]; then
 	mkdir -p air-src && tar -C air-src -xf mesa.tar.xz && mv air-src/mesa-* mesa-air && rmdir air-src

@@ -1,0 +1,122 @@
+diff --git a/air/air_metal.c b/air/air_metal.c
+index de181b4..9dbb1f1 100644
+--- a/air/air_metal.c
++++ b/air/air_metal.c
+@@ -1674,7 +1674,9 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
+       } else {
+          sr = sweet_drm_surface_bo(-1, &sb);
+       }
+-      if (sr != 0 || sb.planes > 1 || sb.bytes_per_row == 0) {
++      /* a9y18qlte: a caller that names a pitch names one plane of a planar surface, at that offset into the surface */
++      bool plane = import->row_bytes != 0;
++      if (sr != 0 || (sb.planes > 1 && !plane) || sb.bytes_per_row == 0) {
+          say(why, why_size, "the kernel would not describe IOSurface %d (error %d, planes %u, %u bytes a row): it knows nothing of an ID that "
+                             "was never made shareable", import->id, sr, sb.planes, sb.bytes_per_row);
+          free(texture);
+@@ -1685,6 +1687,17 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
+          free(texture);
+          return NULL;
+       }
++      const struct rwa_sbo sb_kernel = sb;   /* the cache keeps the kernel's answer, not a plane's */
++      if (plane) {
++         sb.offset += import->offset;
++         sb.bytes_per_row = import->row_bytes;
++         if (sb.offset >= sb.size) {
++            say(why, why_size, "IOSurface %d: a plane at offset %u is outside its %llu bytes", import->id, sb.offset,
++                (unsigned long long)sb.size);
++            free(texture);
++            return NULL;
++         }
++      }
+       struct winsys_handle whandle = {
+          .type = WINSYS_HANDLE_TYPE_KMS,
+          .handle = sb.handle,
+@@ -1752,7 +1765,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
+          sweet_drm_bo_sync(-1, texture->surface_handle, 0, 0);   /* clean the CPU's dirty lines before the GPU first writes */
+          pipe_resource_reference(&sbo_cache[sbo_victim].res, NULL);  /* evict the least recently used entry */
+          sbo_cache[sbo_victim].dev = device; sbo_cache[sbo_victim].id = import->id; sbo_cache[sbo_victim].w = width;
+-         sbo_cache[sbo_victim].h = height; sbo_cache[sbo_victim].f = fmt->pipe; sbo_cache[sbo_victim].sb = sb;
++         sbo_cache[sbo_victim].h = height; sbo_cache[sbo_victim].f = fmt->pipe; sbo_cache[sbo_victim].sb = sb_kernel;
+          sbo_cache[sbo_victim].used = ++sbo_clock;
+          pipe_resource_reference(&sbo_cache[sbo_victim].res, texture->res);
+       }
+@@ -1842,6 +1855,14 @@ rwa_texture_flush_surface(struct rwa_texture *texture)
+    return sweet_drm_bo_sync(-1, texture->surface_handle, 0, 0);
+ }
+ 
++unsigned
++rwa_texture_block_rows(const struct rwa_texture *texture, unsigned height)
++{
++   if (!texture || !texture->res)
++      return 0;
++   return util_format_get_nblocksy(texture->res->format, height);
++}
++
+ /* Chlorophyll: a texture-to-texture copy on the GPU (freedreno's blitter), queued in order with the draws: no CPU read of memory
+  * the GPU wrote (no cache maintenance, no wait). QuartzCore copies its framebuffer into a texture for every backdrop blur; done
+  * on the CPU that read stale cache lines (white materials) or needed a full clean of a 10 MB surface. Refuses (-1, the caller
+diff --git a/air/air_metal.h b/air/air_metal.h
+index ee2b232..f710a3b 100644
+--- a/air/air_metal.h
++++ b/air/air_metal.h
+@@ -141,6 +141,8 @@ struct rwa_texture *rwa_texture_create(struct rwa_device *device,
+ void rwa_texture_destroy(struct rwa_texture *texture);
+ /* Bergamota: after the GPU work that wrote an IOSurface-backed texture has finished, make its pixels visible to the compositor. */
+ int rwa_texture_flush_surface(struct rwa_texture *texture);
++/* a9y18qlte: how many rows of blocks a texture of this many texel rows has (ASTC 4x4: a quarter); 0 for no texture */
++unsigned rwa_texture_block_rows(const struct rwa_texture *texture, unsigned height);
+ 
+ /*
+  * The same texture, over memory somebody else allocated: an IOSurface of CoreAnimation's.
+diff --git a/src/bgmtl.m b/src/bgmtl.m
+index 7243a7d..0af4bed 100644
+--- a/src/bgmtl.m
++++ b/src/bgmtl.m
+@@ -345,6 +345,7 @@ bg_install_fallback(Class c)
+    const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
+    NSUInteger _ncLength;
+    void (^_ncDealloc)(void *, NSUInteger);
++   BOOL _ncLoaded;       // a block-compressed one: nothing draws into ASTC with the CPU, so it is copied once and not at each use
+ }
+ - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
+ - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
+@@ -1650,8 +1651,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+    if (surface) {
+       _shape.usage |= 5;   /* a drawable is rendered into and may be sampled whatever CA asked for (MTLTextureUsageRenderTarget | ShaderRead) */
+       /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
++      /* a9y18qlte: a plane of a planar surface (SpringBoard's 'b3a8' snapshots: BGR10_XR + A8) is that plane's offset and pitch;
++       * 0, 0 is the kernel's answer for the whole surface */
++      unsigned poff = 0, prow = 0;
++      if (IOSurfaceGetPlaneCount((IOSurfaceRef)surface) > 1) {
++         poff = (unsigned)((uintptr_t)IOSurfaceGetBaseAddressOfPlane((IOSurfaceRef)surface, plane) -
++                           (uintptr_t)IOSurfaceGetBaseAddress((IOSurfaceRef)surface));
++         prow = (unsigned)IOSurfaceGetBytesPerRowOfPlane((IOSurfaceRef)surface, plane);
++      }
+       bg_lock();
+-      _tex = rwa_texture_from_surface([device rwa], &_shape, (int)IOSurfaceGetID((IOSurfaceRef)surface), 0, 0, why, sizeof(why));
++      _tex = rwa_texture_from_surface([device rwa], &_shape, (int)IOSurfaceGetID((IOSurfaceRef)surface), poff, prow, why, sizeof(why));
+       bg_unlock();
+       _surface = CFRetain(surface);
+       _plane = plane;
+@@ -1710,13 +1719,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+ 
+ - (struct rwa_texture *)rwaTexture
+ {
+-   if (_ncBytes && _tex) {
++   if (_ncBytes && _tex && !_ncLoaded) {
+       bg_lock();
+       char why[256] = { 0 };
+       const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
+-      if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)_ncBytes, (unsigned)(_ncLength / (_shape.height ? _shape.height : 1)),
++      /* a9y18qlte: a row of the caller's memory is a row of blocks (ASTC 4x4 snapshots: length / height was a quarter of one, and
++       * every refresh was refused). Their length is page-rounded, so it says nothing of the row: blocks are packed (stride 0). */
++      unsigned rows = rwa_texture_block_rows(_tex, _shape.height);
++      if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)_ncBytes,
++                            rows != _shape.height ? 0 : (unsigned)(_ncLength / (_shape.height ? _shape.height : 1)),
+                             why, sizeof(why)) != 0)
+          BG_LOG("no-copy texture refresh: %s\n", why);
++      else if (rows != _shape.height)
++         _ncLoaded = YES;
+       bg_unlock();
+    }
+    if (_linSrc && _tex) {

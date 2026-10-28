@@ -3888,6 +3888,90 @@ index 2514af3..b1d6c1b 100644
  	uint32_t rtc = 0;
  	uint8_t ctrl = 0;
  	if (sweet_rtc_read(&rtc) == 0 && sweet_spmi_read(0, PM8150_RTC_CTRL, &ctrl) == 0) {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 423042f..feff979 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -269,11 +269,37 @@ sweet_div_up(uint32_t a, uint32_t b)
+ 	return b > 1 ? (a + b - 1) / b : a;
+ }
+ 
++/*
++ * a9y18qlte: the Adreno 5xx imports a linear surface only with rows of whole 64-pixel tiles (freedreno's
++ * pitchalign is gmem_align_w = 64 texels there, 16 on a6xx), so 64 bytes is not enough: SpringBoard's
++ * app-switcher snapshots (281x609 'w30r' at 1152 bytes a row, 'LA08' at 224) were refused and drew grey.
++ * Rows are padded to 64 pixels, a pitch the creator asked for included (clients read it back).
++ */
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++#define SWEET_SURFACE_ROW_LIMIT_ALIGN   256
++#else
++#define SWEET_SURFACE_ROW_LIMIT_ALIGN   SWEET_SURFACE_ROW_ALIGN
++#endif
++
++/* bpe 0: a format of blocks, aligned to 64 bytes only */
++static uint32_t
++sweet_align_row(uint64_t row, uint32_t bpe)
++{
++	uint32_t a = SWEET_SURFACE_ROW_ALIGN;
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	if (bpe != 0 && (bpe & (bpe - 1)) == 0 && bpe <= 16 && 64 * bpe > a) {
++		a = 64 * bpe;
++	}
++#else
++	(void)bpe;
++#endif
++	return (uint32_t)((row + a - 1) / a * a);
++}
++
+ static uint32_t
+ sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
+ {
+-	uint64_t row = (uint64_t)sweet_div_up(width, ew) * bpe;
+-	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
++	return sweet_align_row((uint64_t)sweet_div_up(width, ew) * bpe, ew == 1 ? bpe : 0);
+ }
+ 
+ /* Geometry from the creation properties (IOSurface.h keys). */
+@@ -328,6 +354,9 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
++	if (s->elementWidth == 1 && props->getObject("IOSurfacePlaneInfo") == NULL) {
++		s->bytesPerRow = sweet_align_row(s->bytesPerRow, s->bytesPerElement);
++	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+ 	OSArray *planes = one_plane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+@@ -354,9 +383,18 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			}
+ 			p->bytesPerRow = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
+ 			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement));
++			if (p->elementWidth == 1) {
++				p->bytesPerRow = sweet_align_row(p->bytesPerRow, p->bytesPerElement);
++			}
++			/* a pitch padded above may outgrow the creator's offsets and sizes: planes never overlap */
+ 			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
+-			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
+-			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
++			if (p->offset < next) {
++				p->offset = (uint32_t)next;
++			}
++			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize", 0);
++			if (p->size < p->bytesPerRow * sweet_div_up(p->height, p->elementHeight)) {
++				p->size = p->bytesPerRow * sweet_div_up(p->height, p->elementHeight);
++			}
+ 			next = round_page((uint64_t)p->offset + p->size);
+ 			if ((uint64_t)p->offset + p->size > end) {
+ 				end = (uint64_t)p->offset + p->size;
+@@ -784,7 +822,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	case kSweetSurfaceLimits: {
+ 		uint8_t limits[0x18] = { 0 };
+ 		put32(limits, 0x0, SWEET_SURFACE_ROW_ALIGN - 1);
+-		put32(limits, 0x4, SWEET_SURFACE_ROW_ALIGN - 1);
++		put32(limits, 0x4, SWEET_SURFACE_ROW_LIMIT_ALIGN - 1);
+ 		limits[0x16] = 1;
+ 		sweet_surf_log_once("sel", selector);
+ 		return sweet_struct_out(args, limits, sizeof(limits));
 diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
 index f876fb0..4d98724 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
