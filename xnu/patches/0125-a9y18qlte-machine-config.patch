@@ -1362,10 +1362,10 @@ index 0000000..91746ca
 +#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
 diff --git a/bsd/dev/sweet_a5xx.c b/bsd/dev/sweet_a5xx.c
 new file mode 100644
-index 0000000..284a746
+index 0000000..dd57def
 --- /dev/null
 +++ b/bsd/dev/sweet_a5xx.c
-@@ -0,0 +1,816 @@
+@@ -0,0 +1,850 @@
 +/*
 + * Adreno 512 core for the a9y18qlte (SDM660): the sweet_a6xx.h core API
 + * (same a6_* names, so bsd/dev/sweet_gpu.c and the accelerator above it run
@@ -1584,6 +1584,39 @@ index 0000000..284a746
 + * which the display already holds at SVS or above. Back on XO if the RCG does not latch.
 + */
 +#include "sweet_spmi.h"
++
++/*
++ * Read only: the CPU clusters as ABL left them, for a CPU clock under XNU (nothing scales it here; a dependent-add
++ * loop runs at ~1.2 GHz where Linux goes to 1.84 / 2.2 GHz). Each cluster's PLL (mode, L = rate / 19.2 MHz, user
++ * control with its post divider), the mux in front of it (APCS RCG: PLL or GPLL0), whether OSM drives it, and
++ * PM660's SMPS set points (the APC rails are among them, under SAW / CPRh).
++ */
++static void log_cpu_clocks(void)
++{
++	static const struct { const char *name; uint64_t pll, rcg; } cl[2] = {
++		{ "pwrcl (silver)", 0x17916000ull, 0x17911050ull },
++		{ "perfcl (gold)", 0x17816000ull, 0x17811050ull },
++	};
++	for (unsigned i = 0; i < 2; i++) {
++		uint32_t l = rd32(cl[i].pll + 4);
++		a6_log("cpu %s: pll mode %x L %u (%u MHz) user %x status %x, rcg cmd %x cfg %x\n", cl[i].name,
++		       rd32(cl[i].pll), l & 0xff, (l & 0xff) * 192 / 10, rd32(cl[i].pll + 0xc), rd32(cl[i].pll + 0x2c),
++		       rd32(cl[i].rcg), rd32(cl[i].rcg + 4));
++	}
++	a6_log("cpu osm: version %x, enable %x / %x, index %x / %x\n", rd32(0x179c0000ull), rd32(0x179c1004ull),
++	       rd32(0x179c3004ull), rd32(0x179c1150ull), rd32(0x179c3150ull));
++	char line[160], *e = line;
++	for (unsigned s = 1; s <= 6; s++) {
++		uint8_t lo = 0, hi = 0, en = 0;
++		unsigned base = 0x1400 + 0x300 * (s - 1);
++		if (sweet_spmi_init() || sweet_spmi_read(1, base + 0x40, &lo) || sweet_spmi_read(1, base + 0x41, &hi) ||
++		    sweet_spmi_read(1, base + 0x46, &en))
++			e += snprintf(e, line + sizeof(line) - e, " S%u ?", s);
++		else
++			e += snprintf(e, line + sizeof(line) - e, " S%u %u mV%s", s, (unsigned)(hi << 8 | lo), en & 0x80 ? "" : " (off)");
++	}
++	a6_log("cpu rails, PM660 SMPS set points:%s\n", line);
++}
 +
 +static void gfx_clock(unsigned mhz)
 +{
@@ -2118,6 +2151,7 @@ index 0000000..284a746
 +	if (smmu_banks(a6_pool_pa(g, A6_OFF_GT_L1)) || power_gx())
 +		return -1;
 +	gfx_clock(g->perf_level);
++	log_cpu_clocks();
 +	if (gpu_cp_init(g, false))
 +		return -1;
 +	/* self test: an IB (scratch + 0x200) whose CP_MEM_WRITE lands at scratch + 0x100 */
@@ -2693,7 +2727,7 @@ index d405964..5d43ce3 100644
  static LCK_GRP_DECLARE(sweet_pmem_grp, "sweet_pmem");
  static LCK_MTX_DECLARE(sweet_pmem_lock, &sweet_pmem_grp);
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
-index 6a121c5..2fc87aa 100644
+index 6a121c5..16538bd 100644
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
 @@ -15,17 +15,56 @@
@@ -2796,7 +2830,7 @@ index 6a121c5..2fc87aa 100644
  		printf("SWEET BATTERY: unsupported SPMI arb=%#x APIDs=%u\n",
  		    arb_version, sp_count);
  		return -1;
-@@ -89,9 +140,18 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+@@ -89,9 +140,20 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
  {
  	/* Restrict access to the battery blocks and the RTC (0x60); keys retain their own lanes. */
  	unsigned peripheral = addr >> 8;
@@ -2808,17 +2842,19 @@ index 6a121c5..2fc87aa 100644
 +#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
 +	/*
 +	 * PM660 PON: power and volume down (a9y_keys.c), cable power (SweetBattery);
-+	 * PM660L GPIO 7/8: volume up, Bixby; PM660L S3 (VDD_CX, the GPU's rail: sweet_a5xx.c)
++	 * PM660L GPIO 7/8: volume up, Bixby; PM660L S3 (VDD_CX, the GPU's rail: sweet_a5xx.c); PM660 S1..S6
++	 * (the CPU rails among them: sweet_a5xx.c log_cpu_clocks)
 +	 */
 +	allowed = allowed || (sid == 0 && peripheral == 0x08) ||
 +	    (sid == 2 && (peripheral == 0xc6 || peripheral == 0xc7)) ||
-+	    ((sid == 2 || sid == 3) && peripheral == 0x1a);
++	    ((sid == 2 || sid == 3) && peripheral == 0x1a) ||
++	    (sid == 1 && peripheral >= 0x14 && peripheral <= 0x23 && (peripheral - 0x14) % 3 == 0);
 +#endif
 +	if (!sp_ready || !out || addr > 0xffffu || !allowed) {
  		return -1;
  	}
  	IOLockLock(sp_lock);
-@@ -100,19 +160,23 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+@@ -100,19 +162,23 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
  		IOLockUnlock(sp_lock);
  		return -1;
  	}
