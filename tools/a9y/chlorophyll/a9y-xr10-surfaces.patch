@@ -1,5 +1,5 @@
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index 7c78852..fbd3699 100644
+index 7c78852..d3287a9 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
 @@ -352,6 +352,10 @@ bg_install_fallback(Class c)
@@ -237,7 +237,48 @@ index 7c78852..fbd3699 100644
     uint64_t fp = 0;
     size_t nblocks = 0, zeros = 0;
     if (_ncBytes && _tex && rows != _shape.height) {
-@@ -1917,6 +2089,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1842,6 +2014,18 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+             const uint8_t *b = (const uint8_t *)_ncBytes;
+             BG_LOG("no-copy compressed %s: %zu of 256 sampled blocks all zero\n", again ? "copied again (bytes changed)" : "first copy",
+                    zeros);
++            /* a9y18qlte: purple cards: nine blocks on a 3x3 grid, raw, for decoding on the host (row of blocks, column) */
++            unsigned bw = (_shape.width + 3) / 4;
++            for (unsigned gy = 1; gy <= 3 && told <= 12; gy++) {
++               char line[200] = "", *e = line;
++               for (unsigned gx = 1; gx <= 3; gx++) {
++                  size_t bi = (size_t)(rows * gy / 4) * bw + bw * gx / 4;
++                  if ((bi + 1) * 16 > _ncLength) continue;
++                  e += sprintf(e, " %u,%u:", rows * gy / 4, bw * gx / 4);
++                  for (int k = 0; k < 16; k++) e += sprintf(e, "%02x", b[bi * 16 + k]);
++               }
++               BG_LOG("astc %ux%u%s\n", _shape.width, _shape.height, line);
++            }
+             BG_LOG("no-copy compressed: %ux%u fmt %u mips %u, %lu bytes at %p (%u rows of blocks): "
+                    "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x | %02x%02x%02x%02x %02x%02x%02x%02x\n",
+                    _shape.width, _shape.height, _shape.pixel_format, _shape.mip_levels, (unsigned long)_ncLength, _ncBytes, rows,
+@@ -1895,6 +2079,21 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+       const uint8_t *a = (const uint8_t *)bytes, *z = a + bpr * (r.size.height - 1);
+       BG_LOG("  first row px0 %u %u %u %u, last row px0 %u %u %u %u\n", a[0], a[1], a[2], a[3], z[0], z[1], z[2], z[3]);
+    }
++   /* a9y18qlte: purple snapshots: what a large upload holds (texels at the centre and the quarter points, raw bytes) */
++   static int toldUp;
++   if (bytes && r.size.width >= 700 && r.size.height >= 1500 && bpr >= r.size.width && toldUp < 16) {
++      toldUp++;
++      unsigned bpe = (unsigned)(bpr / r.size.width) >= 8 ? 8 : 4;
++      static const unsigned pts[5][2] = { { 1, 1 }, { 2, 2 }, { 3, 3 }, { 1, 3 }, { 3, 1 } };   // quarters of w, h
++      char line[200] = "", *e = line;
++      for (int k = 0; k < 5; k++) {
++         const uint8_t *p = (const uint8_t *)bytes + (r.size.height * pts[k][1] / 4) * bpr + (r.size.width * pts[k][0] / 4) * bpe;
++         for (unsigned b = 0; b < bpe; b++) e += sprintf(e, "%02x", p[b]);
++         *e++ = ' '; *e = 0;
++      }
++      BG_LOG("upload %lux%lu format %u, %lu bytes a row: %s\n", (unsigned long)r.size.width, (unsigned long)r.size.height,
++             _shape.pixel_format, (unsigned long)bpr, line);
++   }
+    (void)bpi;
+    unsigned o[3] = { (unsigned)r.origin.x, (unsigned)r.origin.y, (unsigned)r.origin.z };
+    unsigned sz[3] = { (unsigned)r.size.width, (unsigned)r.size.height, (unsigned)r.size.depth };
+@@ -1917,6 +2116,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     bg_lock();
     if (rwa_texture_read(_tex, (unsigned)level, (unsigned)slice, o, sz, bytes, bpr, why, sizeof(why)) != 0) BG_LOG("getBytes: %s\n", why);
     bg_unlock();
