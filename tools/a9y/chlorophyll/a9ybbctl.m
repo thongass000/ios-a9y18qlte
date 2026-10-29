@@ -341,6 +341,38 @@ main(int argc, char **argv)
          }
          return 0;
       }
+      if (!strcmp(cmd, "findsize") && argc > 4) {   // files under ROOT of MIN..MAX bytes, with their dates (cached images)
+         NSFileManager *fm = [NSFileManager defaultManager];
+         unsigned long long lo = strtoull(argv[2], NULL, 0), hi = strtoull(argv[3], NULL, 0);
+         NSDirectoryEnumerator *e = [fm enumeratorAtPath:@(argv[4])];
+         int max = argc > 5 ? atoi(argv[5]) : 40;
+         for (NSString *p in e) {
+            NSDictionary *a = [e fileAttributes];
+            if (![a[NSFileType] isEqual:NSFileTypeRegular]) continue;
+            unsigned long long sz = [a[NSFileSize] unsignedLongLongValue];
+            if (sz < lo || sz > hi) continue;
+            printf("  %s %llu %s/%s\n", [[a[NSFileModificationDate] description] UTF8String], sz, argv[4], [p UTF8String]);
+            if (--max <= 0) break;
+         }
+         return 0;
+      }
+      if (!strcmp(cmd, "rm") && argc > 2) {   // cache files only: under /private/var/mobile, no "..", not a directory
+         int bad = 0;
+         for (int i = 2; i < argc; i++) {
+            NSString *p = @(argv[i]);
+            BOOL dir = NO;
+            if (![p hasPrefix:@"/private/var/mobile/"] || [p rangeOfString:@".."].location != NSNotFound ||
+                ![[NSFileManager defaultManager] fileExistsAtPath:p isDirectory:&dir] || dir) {
+               printf("rm: %s: refused (not a file under /private/var/mobile)\n", argv[i]);
+               bad++;
+               continue;
+            }
+            BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:p error:NULL];
+            printf("rm: %s: %s\n", argv[i], ok ? "removed" : "failed");
+            bad += !ok;
+         }
+         return bad != 0;
+      }
       if (!strcmp(cmd, "top") && argc > 2) {   // every process's CPU time over SECONDS, the busiest first
          enum { MAXP = 1024 };
          static pid_t pid[MAXP];
@@ -466,7 +498,7 @@ main(int argc, char **argv)
          fclose(f);
          return 0;
       }
-      printf("usage: a9ybbctl status|install|restore|trim|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE|threads NAME S|bench|top S|ls DIR [MAX]|snapclear|findname NAME ROOT [MAX]\n");
+      printf("usage: a9ybbctl status|install|restore|trim|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE|threads NAME S|bench|top S|ls DIR [MAX]|snapclear|findname NAME ROOT [MAX]|findsize MIN MAX ROOT [MAX]|rm FILE...\n");
       return 2;
    }
 }
