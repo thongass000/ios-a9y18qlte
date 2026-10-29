@@ -203,9 +203,8 @@ int mss_boot(void)
 		return -1;
 	}
 	const struct phdr *ph = (const struct phdr *)(mdt + phoff);
-	log_rmb("before");
 
-	/* 1. the MBA */
+	/* 1. the MBA (MSS registers only once its clocks run: before, a read aborts, a kernel panic here) */
 	zero_fill(MBA_PA, MBA_SIZE);
 	pm_wr(MBA_PA, mba, (mba_len + 3) & ~(size_t)3);
 	if (hyp_assign(MBA_PA, MBA_SIZE, hlos, 1, msa, 1))
@@ -214,9 +213,15 @@ int mss_boot(void)
 	wr32(GCC_VOTE_1, rd32(GCC_VOTE_1) | 1u << 2);
 	int rc = branch_on(GCC_MSS_CFG_AHB_CBCR) | branch_on(GCC_BIMC_MSS_Q6_CBCR) << 1 |
 		 branch_on(GCC_MSS_SNOC_AXI_CBCR) << 2 | branch_on(GCC_MSS_MNOC_BIMC_CBCR) << 3;
+	if (rc) {
+		printf("mss: MSS clocks did not start (%x): not touching its registers\n", rc);
+		hyp_assign(MBA_PA, MBA_SIZE, msa, 1, hlos, 1);
+		return -1;
+	}
 	uint32_t dbg = rd32(MSS_QDSP6 + Q6_DBG_CFG);
 	printf("mss: clocks rc %x; q6 reset %x pwr %x dbg %x\n", rc, rd32(MSS_QDSP6 + Q6_RESET),
 	       rd32(MSS_QDSP6 + Q6_PWR_CTL), dbg);
+	log_rmb("before");
 	restart_pulse();
 	wr32(MSS_QDSP6 + Q6_DBG_CFG, dbg);
 	wr32(MSS_RMB + RMB_MBA_IMAGE, (uint32_t)MBA_PA);
