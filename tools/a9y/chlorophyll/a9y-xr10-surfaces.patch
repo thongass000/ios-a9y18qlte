@@ -1,5 +1,5 @@
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index 7c78852..98553a7 100644
+index 7c78852..9b3688d 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
 @@ -352,6 +352,10 @@ bg_install_fallback(Class c)
@@ -43,7 +43,7 @@ index 7c78852..98553a7 100644
     if (_status == 4 && !in_compositor) {
        NSMutableSet *written = nil;
        for (BGWork *w in _work)
-@@ -1674,8 +1694,26 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1674,8 +1694,35 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
                             (uintptr_t)IOSurfaceGetBaseAddress((IOSurfaceRef)surface));
           prow = (unsigned)IOSurfaceGetBytesPerRowOfPlane((IOSurfaceRef)surface, plane);
        }
@@ -52,6 +52,15 @@ index 7c78852..98553a7 100644
 +       * the app switcher came out purple. Such a plane is a texture of ours, converted into and out of the surface. */
 +      OSType spf = IOSurfaceGetPixelFormat((IOSurfaceRef)surface);
 +      unsigned mf = _shape.pixel_format;
++      if (spf == 'b3a8' || spf == 'w30r') {   // which Metal formats QuartzCore puts over them (supportsExtendedXR10Formats: NO)
++         static int seen;
++         if (seen++ < 32)
++            BG_LOG("texture over '%c%c%c%c' surface %u (%zux%zu, %zu planes): plane %lu, %ux%u format %u usage %u\n",
++                   (char)(spf >> 24), (char)(spf >> 16), (char)(spf >> 8), (char)spf, IOSurfaceGetID((IOSurfaceRef)surface),
++                   IOSurfaceGetWidth((IOSurfaceRef)surface), IOSurfaceGetHeight((IOSurfaceRef)surface),
++                   IOSurfaceGetPlaneCount((IOSurfaceRef)surface), (unsigned long)plane, _shape.width, _shape.height, mf,
++                   (unsigned)[d usage]);
++      }
 +      if ((spf == 'b3a8' || spf == 'w30r') && plane == 0 && (mf == 550 || mf == 551 || mf == 554 || mf == 555) &&
 +          _shape.mip_levels <= 1) {
 +         _xr = YES;
@@ -71,7 +80,7 @@ index 7c78852..98553a7 100644
        bg_unlock();
        _surface = CFRetain(surface);
        _plane = plane;
-@@ -1756,6 +1794,15 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1756,6 +1803,15 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
     // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
     // (one kernel clean per surface, ever) left those layers stale or missing until this.
@@ -87,7 +96,7 @@ index 7c78852..98553a7 100644
     if (_cpuCopy && _tex) {
        uint32_t seed = IOSurfaceGetSeed((IOSurfaceRef)_surface);
        if (!_cpuLoaded || seed != _cpuSeed) {
-@@ -1786,9 +1833,96 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1786,9 +1842,96 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     return [self rwaTexture];
  }
  
