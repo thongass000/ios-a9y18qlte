@@ -3852,6 +3852,76 @@ index 99a9c87..800977f 100644
  static void
  sweet_log_start(void)
  {
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..7a71453 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2099,6 +2099,41 @@ struct execsw {
+ 	{ NULL, NULL}
+ };
+ 
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++/*
++ * Boot-arg a9ydeny=WORD[,WORD...] ("-" = none): exec of any file whose name contains one of the words fails with
++ * EACCES before the point of no return (ios-sailfish 0182 sweetdeny). Default: the speech synthesis extensions, which
++ * abort at once without audio hardware and were relaunched on every display on and off, during the wake animation.
++ */
++static bool
++a9y_exec_denied(const char *name)
++{
++	static char list[256];
++	static int state;       /* 0 not parsed, 1 none, 2 set */
++	if (state == 0) {
++		if (!PE_parse_boot_argn("a9ydeny", list, sizeof(list))) {
++			strlcpy(list, "SiriTTSSynthesizerAU,MacinTalkAUSP,KonaSynthesizer", sizeof(list));
++		}
++		state = list[0] && strcmp(list, "-") != 0 ? 2 : 1;
++	}
++	for (const char *w = list; state == 2 && *w;) {
++		size_t n = 0;
++		while (w[n] && w[n] != ',') {
++			n++;
++		}
++		char word[64];
++		if (n >= 4 && n < sizeof(word)) {
++			memcpy(word, w, n);
++			word[n] = '\0';
++			if (strnstr(name, word, strlen(name) + 1) != NULL) {
++				return true;
++			}
++		}
++		w += n + (w[n] == ',');
++	}
++	return false;
++}
++#endif
+ 
+ /*
+  * exec_activate_image
+@@ -2197,6 +2232,23 @@ again:
+ 	}
+ 
+ 	error = exec_check_permissions(imgp);
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	if (error == 0) {
++		const char *path = imgp->ip_strings + strlen(EXECUTABLE_KEY), *base = path;
++		for (const char *c = path; *c; c++) {
++			if (*c == '/') {
++				base = c + 1;
++			}
++		}
++		if (a9y_exec_denied(base)) {
++			static uint32_t denied_logged;
++			if (denied_logged++ < 20) {
++				printf("exec %s denied (a9ydeny)\n", base);
++			}
++			error = EACCES;
++		}
++	}
++#endif
+ 	if (error) {
+ 		goto bad;
+ 	}
 diff --git a/config/MASTER.arm64.a9y18qlte b/config/MASTER.arm64.a9y18qlte
 new file mode 100644
 index 0000000..7c82491
