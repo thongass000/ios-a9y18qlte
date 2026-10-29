@@ -150,10 +150,31 @@ static int wlan_power(void)
 	return qmp_send("{class: clock, res: qdss, val: 1}") ? -1 : 0;
 }
 #else
-/* sdm660: the WCN3990 rails (pm660 l5/l9/l6/l19) are RPM regulators: not wired up yet */
+/*
+ * sdm660: the WCN3990 rails are RPM regulators (icnss in the stock DT; the RPM keeps this master's keys per
+ * resource, as rpm-smd-regulator.c sends them): vdd-cx-mx pm660 l5 at 848 mV, software enabled; vdd-1.8-xo
+ * l9, vdd-1.3-rfa l6 and vdd-3.3-ch0 l19 are the *_pin_ctrl ones, whose enable follows the chip's HW_EN1
+ * (pcen 2, swen 0), at their minimum voltages. Both sets (qcom,set 3). The reference clock (rf_clk1_pin) the
+ * kernel's RPM clock handoff already turned on.
+ */
 static int wlan_power(void)
 {
-	printf("wlan power: no RPM votes on this board yet\n");
+	static const struct { uint32_t id, uv, pin; } ldo[] = {
+		{ 5, 848000, 0 }, { 9, 1750000, 1 }, { 6, 1200000, 1 }, { 19, 3200000, 1 },
+	};
+	for (unsigned i = 0; i < sizeof(ldo) / sizeof(ldo[0]); i++) {
+		int rc = 0;
+		for (uint32_t set = 0; set < 2; set++) {
+			rc |= pm_rpm(set, "ldoa", ldo[i].id, "uv\0\0", ldo[i].uv);
+			if (ldo[i].pin)
+				rc |= pm_rpm(set, "ldoa", ldo[i].id, "pcen", 2) | pm_rpm(set, "ldoa", ldo[i].id, "swen", 0);
+			else
+				rc |= pm_rpm(set, "ldoa", ldo[i].id, "swen", 1);
+		}
+		printf("wlan power: pm660 l%u %u uV %s -> %d\n", ldo[i].id, ldo[i].uv, ldo[i].pin ? "pin ctrl" : "on", rc);
+		if (rc)
+			return -1;
+	}
 	return 0;
 }
 #endif

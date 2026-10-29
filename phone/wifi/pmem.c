@@ -119,3 +119,10 @@ int pm_rpmh(const char *res, unsigned n, const uint32_t *off, const uint32_t *va
 	}
 	return ioctl(pm_fd, PMEM_RPMH, &r) < 0 ? errno : 0;
 }
+
+/* TYPE and KEY as the RPM spells them, zero padded to 4 ("ldoa", "uv\0\0") */
+int pm_rpm(uint32_t set, const char type[4], uint32_t id, const char key[4], uint32_t value)
+{
+	struct pmem_rpm r = { set, RPM_WORD(type), id, RPM_WORD(key), value };
+	return ioctl(pm_fd, PMEM_RPM, &r) < 0 ? errno : 0;
+}

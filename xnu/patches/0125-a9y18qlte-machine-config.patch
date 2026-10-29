@@ -961,10 +961,10 @@ index 0000000..bf7474e
 +#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
 diff --git a/bsd/dev/a9y_rpm.c b/bsd/dev/a9y_rpm.c
 new file mode 100644
-index 0000000..d010535
+index 0000000..c33e4a0
 --- /dev/null
 +++ b/bsd/dev/a9y_rpm.c
-@@ -0,0 +1,386 @@
+@@ -0,0 +1,412 @@
 +/*
 + * a9y18qlte (SDM660) RPM clock votes over GLINK, polled: ABL leaves the RPM's bus clocks where it booted (bimc, the
 + * DDR, measured at 676 MHz where Linux's cpubw table goes to 1804 MHz) and nothing under XNU asks for more. Ported
@@ -983,12 +983,19 @@ index 0000000..d010535
 +#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
 +#include <sys/param.h>
 +#include <sys/systm.h>
++#include <sys/errno.h>
 +#include <kern/clock.h>
++#include <kern/locks.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +bool a9y_rpm_bus_max(void);
++int a9y_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++
++/* one request at a time: the boot-time clock handoff and userland's votes (/dev/pmem PMEM_RPM) */
++static LCK_GRP_DECLARE(a9y_rpm_grp, "a9y_rpm");
++static LCK_MTX_DECLARE(a9y_rpm_lock, &a9y_rpm_grp);
 +
 +#define RPM_MSGRAM_PA   0x00778000u
 +#define RPM_MSGRAM_SIZE 0x7000u
@@ -1335,7 +1342,12 @@ index 0000000..d010535
 +{
 +	int on = 1;
 +	(void)PE_parse_boot_argn("a9yddr", &on, sizeof(on));
-+	if (!on || !rpm_open()) {
++	if (!on) {
++		return false;
++	}
++	lck_mtx_lock(&a9y_rpm_lock);
++	if (!rpm_open()) {
++		lck_mtx_unlock(&a9y_rpm_lock);
 +		return false;
 +	}
 +	unsigned failed = 0;
@@ -1346,9 +1358,23 @@ index 0000000..d010535
 +		}
 +	}
 +	bool ok = failed == 0 && rpm_request(1, TYPE_MISC, 2, KEY_ENABLE, 1) && rpm_request(0, TYPE_MISC, 2, KEY_ENABLE, 1);
++	lck_mtx_unlock(&a9y_rpm_lock);
 +	printf("A9Y RPM: clock handoff (%u votes failed), scaling %s\n", failed,
 +	    ok ? "on" : failed ? "left off" : "FAILED");
 +	return ok;
++}
++
++/*
++ * One request from userland (wland's WLAN regulator votes): set 0 active / 1 sleep, resource type and id, one
++ * {key, value}. The RPM keeps the other keys of that resource as this master last set them. 0 or EIO.
++ */
++int
++a9y_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value)
++{
++	lck_mtx_lock(&a9y_rpm_lock);
++	bool ok = rpm_open() && rpm_request(set, type, id, key, value);
++	lck_mtx_unlock(&a9y_rpm_lock);
++	return ok ? 0 : EIO;
 +}
 +#endif /* ARM64_BOARD_CONFIG_A9Y18QLTE */
 diff --git a/bsd/dev/a9y_sm5705.c b/bsd/dev/a9y_sm5705.c
@@ -3351,10 +3377,29 @@ index c87ed5d..6c1b91c 100644
   * Did a reset since *epoch lose work of a client whose last fence is last_fence? Moves *epoch to now.
   * (Fences are global and in submission order: the client lost work if its last one was in a lost range.)
 diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
-index d405964..5d43ce3 100644
+index d405964..8679635 100644
 --- a/bsd/dev/sweet_pmem.c
 +++ b/bsd/dev/sweet_pmem.c
-@@ -89,7 +89,8 @@ static struct {
+@@ -76,6 +76,18 @@ struct pmem_rpmh {
+ };
+ #define PMEM_RPMH       _IOW('P', 5, struct pmem_rpmh)
+ extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++/* SDM660's RPM (no RPMh): one {key, value} for a resource (bsd/dev/a9y_rpm.c), e.g. ldoa 5 "uv"/"swen" */
++struct pmem_rpm {
++	uint32_t set;           /* 0 active, 1 sleep */
++	uint32_t type;          /* e.g. "ldoa" as a little-endian word */
++	uint32_t id;
++	uint32_t key;
++	uint32_t value;
++};
++#define PMEM_RPM        _IOW('P', 6, struct pmem_rpm)
++extern int a9y_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++#endif
+ 
+ #define PMEM_MAPS       16              /* 2 MB device windows, round robin */
+ #define PMEM_WIN        0x200000ULL
+@@ -89,7 +101,8 @@ static struct {
  	uint64_t win;
  } pm_map[PMEM_MAPS];
  static unsigned pm_map_next;
@@ -3364,6 +3409,23 @@ index d405964..5d43ce3 100644
  
  static LCK_GRP_DECLARE(sweet_pmem_grp, "sweet_pmem");
  static LCK_MTX_DECLARE(sweet_pmem_lock, &sweet_pmem_grp);
+@@ -334,6 +347,16 @@ pm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unus
+ 		printf("SWEET PMEM: rpmh %s %u cmds (%#x=%u ...) -> %d\n", r->res, r->n, r->offset[0], r->value[0], err);
+ 		return err;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A9Y18QLTE)
++	case PMEM_RPM: {
++		struct pmem_rpm *r = (struct pmem_rpm *)data;
++		lck_mtx_unlock(&sweet_pmem_lock);       /* waits up to 1 s for the RPM; not under our lock */
++		err = a9y_rpm_write(r->set, r->type, r->id, r->key, r->value);
++		printf("SWEET PMEM: rpm set %u %.4s %u %.4s=%u -> %d\n", r->set, (const char *)&r->type, r->id,
++		    (const char *)&r->key, r->value, err);
++		return err;
++	}
++#endif
+ 	default:
+ 		err = ENOTTY;
+ 	}
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
 index 6a121c5..16538bd 100644
 --- a/bsd/dev/sweet_spmi.c
@@ -3521,7 +3583,7 @@ index 6a121c5..16538bd 100644
  			return 0;
  		}
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 99a9c87..800977f 100644
+index 99a9c87..dc2e090 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -110,6 +110,7 @@ static struct {
@@ -3684,7 +3746,7 @@ index 99a9c87..800977f 100644
  	lck_mtx_unlock(&sweet_ufs_lock);
  	if (error) {
  		return error;
-@@ -660,6 +752,18 @@ sweet_ufs_init(void)
+@@ -660,6 +752,19 @@ sweet_ufs_init(void)
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
  	sweet_log_start();
@@ -3697,13 +3759,14 @@ index 99a9c87..800977f 100644
 +		a9y_keys_init();
 +		a9y_gpu_init();         /* stands down for sweetgpu=1 */
 +		sweet_gpu_init();       /* Adreno 512 (sweetgpu=1): bsd/dev/sweet_gpu.c over sweet_a5xx.c */
++		sweet_pmem_init();      /* /dev/pmem (wland: the modem, the WLAN radio, RPM votes) */
 +	}
 +#else
 +	/* these drive SM7150/SM8150 blocks (OSM, Wi-Fi, Adreno 6xx, PM8150, touch, DWC3) */
  	sweet_sample_start();
  	sweet_cpufreq_init();
  	sweet_pmem_init();       /* /dev/pmem: bsd/dev/sweet_pmem.c */
-@@ -670,6 +774,7 @@ sweet_ufs_init(void)
+@@ -670,6 +775,7 @@ sweet_ufs_init(void)
  	sweet_touch_init();
  	sweet_fts_init();
  	sweet_usb_probe();
@@ -3711,7 +3774,7 @@ index 99a9c87..800977f 100644
  	return 0;
  }
  
-@@ -705,7 +810,12 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+@@ -705,7 +811,12 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
   *   +0x1000 ring bytes (offset of byte n = n % ring size)
   * The next shim boot copies its tail to UFS (tools/flame-log-pull.sh rescue).
   */
@@ -3724,7 +3787,7 @@ index 99a9c87..800977f 100644
  struct sweet_mirror_header {
  	char magic[8];
  	uint64_t total;
-@@ -834,56 +944,95 @@ struct sweet_log_header {
+@@ -834,56 +945,95 @@ struct sweet_log_header {
  	uint64_t total, seq;
  };
  

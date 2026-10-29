@@ -37,6 +37,12 @@ struct pmem_rpmh {
 	uint32_t value[4];
 };
 #define PMEM_RPMH	_IOW('P', 5, struct pmem_rpmh)
+/* sdm660's RPM (a9y18qlte kernels): one {key, value} for a resource, set 0 active / 1 sleep */
+struct pmem_rpm {
+	uint32_t set, type, id, key, value;
+};
+#define PMEM_RPM	_IOW('P', 6, struct pmem_rpm)
+#define RPM_WORD(s)	((uint32_t)(s)[0] | (uint32_t)(s)[1] << 8 | (uint32_t)(s)[2] << 16 | (uint32_t)(s)[3] << 24)
 
 void pm_init(void);			/* exits if /dev/pmem is missing */
 uint32_t rd32(uint64_t pa);
@@ -49,6 +55,7 @@ int pm_free(uint64_t pa);
 void pm_smc(uint64_t x[8]);		/* x0..x7 in, x0..x3 out */
 int pm_list(struct pmem_list *l);
 int pm_rpmh(const char *res, unsigned n, const uint32_t *off, const uint32_t *val);	/* errno or 0 */
+int pm_rpm(uint32_t set, const char type[4], uint32_t id, const char key[4], uint32_t value);	/* errno or 0 */
 void delay_ms(unsigned ms);
 int wait_bit(uint64_t pa, uint32_t mask, int set, unsigned ms);	/* 0 = ok */
 
