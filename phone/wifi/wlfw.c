@@ -112,7 +112,7 @@ static int request(struct qmi_buf *q, struct qmi_msg *r, unsigned ms)
 	pend.done = 0;
 	pend.waiting = 1;
 	qrtr_send(QRTR_TYPE_DATA, WLFW_PORT, srv_node, srv_port, q->b, (uint32_t)qmi_finish(q));
-	for (unsigned t = 0; !pend.done && t < ms; t++)
+	for (uint64_t end = link_ms() + ms; !pend.done && link_ms() < end;)
 		link_poll(1);
 	pend.waiting = 0;
 	if (!pend.done) {
@@ -320,15 +320,15 @@ int wlfw_start(void)
 	 * icnss sends nothing more after CAP: the sdm660 WLAN firmware reads its board data itself (tftp) and
 	 * then says FW READY. The host download below is only the fallback.
 	 */
-	for (int t = 0; t < 10000 && !fw_ready; t++)
-		link_poll(1);
+	for (uint64_t end = link_ms() + 10000; !fw_ready && link_ms() < end;)
+		link_poll(10);	/* by the clock: 10000 link_poll(1) calls took 190 s */
 	if (!fw_ready)
 		printf("wlfw: no FW READY on its own, sending the board data\n");
 #endif
 	if (!fw_ready) {
 		/* ath10k waits for the MSA ready indication before the board data */
-		for (int t = 0; t < 5000 && !msa_ready; t++)
-			link_poll(1);
+		for (uint64_t end = link_ms() + 5000; !msa_ready && link_ms() < end;)
+			link_poll(10);
 		/* which request shape this firmware takes is not known yet: try them in turn */
 		static const struct { const char *path; int file_id, type; unsigned seg; } v[] = {
 			{ BDF_PATH, 0, -1, 6144 },
@@ -351,8 +351,8 @@ int wlfw_start(void)
 			qmi_tlv(&q, 0x01, &none, 1);	/* meta_data[]: none */
 			printf("wlfw: cal report -> %d\n", request(&q, &r, 5000));
 		}
-		for (int t = 0; t < 10000 && !fw_ready; t++)
-			link_poll(1);
+		for (uint64_t end = link_ms() + 10000; !fw_ready && link_ms() < end;)
+			link_poll(10);
 		if (!fw_ready) {
 			printf("wlfw: no FW READY\n");
 			return -1;
