@@ -117,8 +117,8 @@ def build(qemu=False, root_runs=None):
         gic = child(arm_io, 'gic')
         set_prop(gic, 'reg', u64(GICD - SOC_BASE, GICD_SIZE, GICR - SOC_BASE, GICR_SIZE))
         set_prop(gic, 'virtual-timer-intid', u32(VTIMER_INTID))
-    # disp0 stays: SweetFramebuffer (CPU copies into the splash buffer ABL keeps scanning out)
-    drop(arm_io, 'wlan')
+    # disp0 stays: SweetFramebuffer (CPU copies into the splash buffer ABL keeps scanning out).
+    # wlan stays too (launchd starts wifid only with it): en0 is the kernel's, the radio wland's (phone/wifi)
 
     fbcon = child(root, 'sweet-fbcon')
     set_prop(fbcon, 'reg', u64(FB, FB_SIZE))

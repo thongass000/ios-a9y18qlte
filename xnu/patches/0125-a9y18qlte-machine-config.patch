@@ -3583,7 +3583,7 @@ index 6a121c5..16538bd 100644
  			return 0;
  		}
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 99a9c87..dc2e090 100644
+index 99a9c87..0945b9a 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -110,6 +110,7 @@ static struct {
@@ -3746,7 +3746,7 @@ index 99a9c87..dc2e090 100644
  	lck_mtx_unlock(&sweet_ufs_lock);
  	if (error) {
  		return error;
-@@ -660,6 +752,19 @@ sweet_ufs_init(void)
+@@ -660,6 +752,20 @@ sweet_ufs_init(void)
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
  	sweet_log_start();
@@ -3760,13 +3760,14 @@ index 99a9c87..dc2e090 100644
 +		a9y_gpu_init();         /* stands down for sweetgpu=1 */
 +		sweet_gpu_init();       /* Adreno 512 (sweetgpu=1): bsd/dev/sweet_gpu.c over sweet_a5xx.c */
 +		sweet_pmem_init();      /* /dev/pmem (wland: the modem, the WLAN radio, RPM votes) */
++		flame_wlan_init();      /* /dev/wlan, en0 + Apple80211 for wifid: bsd/dev/flame_wlan.c */
 +	}
 +#else
 +	/* these drive SM7150/SM8150 blocks (OSM, Wi-Fi, Adreno 6xx, PM8150, touch, DWC3) */
  	sweet_sample_start();
  	sweet_cpufreq_init();
  	sweet_pmem_init();       /* /dev/pmem: bsd/dev/sweet_pmem.c */
-@@ -670,6 +775,7 @@ sweet_ufs_init(void)
+@@ -670,6 +776,7 @@ sweet_ufs_init(void)
  	sweet_touch_init();
  	sweet_fts_init();
  	sweet_usb_probe();
@@ -3774,7 +3775,7 @@ index 99a9c87..dc2e090 100644
  	return 0;
  }
  
-@@ -705,7 +811,12 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+@@ -705,7 +812,12 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
   *   +0x1000 ring bytes (offset of byte n = n % ring size)
   * The next shim boot copies its tail to UFS (tools/flame-log-pull.sh rescue).
   */
@@ -3787,7 +3788,7 @@ index 99a9c87..dc2e090 100644
  struct sweet_mirror_header {
  	char magic[8];
  	uint64_t total;
-@@ -834,56 +945,95 @@ struct sweet_log_header {
+@@ -834,56 +946,95 @@ struct sweet_log_header {
  	uint64_t total, seq;
  };
  
