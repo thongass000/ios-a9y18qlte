@@ -1,5 +1,5 @@
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index 7c78852..763b7a5 100644
+index 7c78852..fbd3699 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
 @@ -352,6 +352,10 @@ bg_install_fallback(Class c)
@@ -22,7 +22,18 @@ index 7c78852..763b7a5 100644
  @end
  
  @interface BGMTLSampler : _MTLSamplerState {
-@@ -1318,6 +1324,41 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -947,6 +953,10 @@ bg_air_slice(NSData *d)
+    t->_linSrc = [self retain];
+    t->_linOff = offset;
+    t->_linBpr = bpr;
++   static int told;   // a9y18qlte: a linear texture is refreshed FROM its buffer only: one drawn into never reaches the buffer
++   if (d.width >= 64 && d.height >= 64 && told++ < 32)
++      BG_LOG("linear texture %lux%lu format %lu usage %lu, %lu bytes a row\n", (unsigned long)d.width, (unsigned long)d.height,
++             (unsigned long)d.pixelFormat, (unsigned long)d.usage, (unsigned long)bpr);
+    return t;
+ }
+ @end
+@@ -1318,6 +1328,41 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     // round trip per attachment per commit over 10 MB surfaces (the largest cost in the first Metal-compositor profiles).
     static int in_compositor = -1;
     if (in_compositor < 0) in_compositor = getenv("BGMTL_BB") != NULL;
@@ -64,7 +75,7 @@ index 7c78852..763b7a5 100644
     if (_status == 4 && !in_compositor) {
        NSMutableSet *written = nil;
        for (BGWork *w in _work)
-@@ -1674,8 +1715,35 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1674,8 +1719,35 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
                             (uintptr_t)IOSurfaceGetBaseAddress((IOSurfaceRef)surface));
           prow = (unsigned)IOSurfaceGetBytesPerRowOfPlane((IOSurfaceRef)surface, plane);
        }
@@ -101,7 +112,18 @@ index 7c78852..763b7a5 100644
        bg_unlock();
        _surface = CFRetain(surface);
        _plane = plane;
-@@ -1756,6 +1824,15 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1683,6 +1755,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+       bg_lock();
+       _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
+       bg_unlock();
++      static int told;   // a9y18qlte: snapshot-sized textures of our own memory (purple snapshots): their format
++      if (_shape.width >= 700 && _shape.height >= 1500 && told++ < 32)
++         BG_LOG("texture %ux%u format %u usage %u storage %lu, own memory\n", _shape.width, _shape.height, _shape.pixel_format,
++                _shape.usage, (unsigned long)[d storageMode]);
+    }
+    /* a9y18qlte: SpringBoard's Control Center glyphs are surfaces at a pitch of their creator's (224 bytes a row), which the
+     * A512 cannot take as they are: they are sampled from a copy instead (rwaTextureSampledLocked) */
+@@ -1756,6 +1832,15 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
     // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
     // (one kernel clean per surface, ever) left those layers stale or missing until this.
@@ -117,7 +139,7 @@ index 7c78852..763b7a5 100644
     if (_cpuCopy && _tex) {
        uint32_t seed = IOSurfaceGetSeed((IOSurfaceRef)_surface);
        if (!_cpuLoaded || seed != _cpuSeed) {
-@@ -1786,9 +1863,96 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1786,9 +1871,96 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     return [self rwaTexture];
  }
  
@@ -215,3 +237,20 @@ index 7c78852..763b7a5 100644
     uint64_t fp = 0;
     size_t nblocks = 0, zeros = 0;
     if (_ncBytes && _tex && rows != _shape.height) {
+@@ -1917,6 +2089,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+    bg_lock();
+    if (rwa_texture_read(_tex, (unsigned)level, (unsigned)slice, o, sz, bytes, bpr, why, sizeof(why)) != 0) BG_LOG("getBytes: %s\n", why);
+    bg_unlock();
++   /* a9y18qlte: snapshots (purple) leave the GPU by a read back, not through a surface: which format, and its centre texel */
++   static int told;
++   if (told < 32 && sz[0] >= 64 && sz[1] >= 64) {
++      told++;
++      const uint8_t *c = (const uint8_t *)bytes + (sz[1] / 2) * bpr + (sz[0] / 2) * (bpr / sz[0]);
++      char hex[40] = "", *e = hex;
++      for (NSUInteger k = 0; k < bpr / sz[0] && k < 16; k++) e += sprintf(e, "%02x", c[k]);
++      BG_LOG("getBytes: %ux%u of %ux%u format %u, %lu bytes a row: centre %s\n", sz[0], sz[1], _shape.width, _shape.height,
++             _shape.pixel_format, (unsigned long)bpr, hex);
++   }
+ }
+ - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level
+ {
