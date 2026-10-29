@@ -1,0 +1,187 @@
+diff --git a/src/bgmtl.m b/src/bgmtl.m
+index 7c78852..98553a7 100644
+--- a/src/bgmtl.m
++++ b/src/bgmtl.m
+@@ -352,6 +352,10 @@ bg_install_fallback(Class c)
+    BOOL _cpuCopy;        // a9y18qlte: an IOSurface the GPU cannot import (a pitch its own layout would change): a texture of ours,
+    BOOL _cpuLoaded;      // filled from the surface's memory and again whenever its seed moves
+    uint32_t _cpuSeed;
++   BOOL _xr;             // a9y18qlte: plane 0 of an extended-range surface ('b3a8' snapshots, 'w30r'): the GPU draws a BGRA8
++   BOOL _xrAlpha;        // texture of ours, stored into the surface as BGR10_XR (+ the A8 plane) when a command buffer
++   BOOL _xrLoaded;       // completes, and loaded back from it when the surface's seed moves (someone else wrote it)
++   uint32_t _xrSeed;
+    id _levelViews[16];   // a9y18qlte: render targets for mip levels 1..15 (bgLevelView:), made once so a pass's surface stays the same
+ }
+ - (id)bgLevelView:(NSUInteger)level;
+@@ -359,6 +363,8 @@ bg_install_fallback(Class c)
+ - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
+ - (struct rwa_texture *)rwaTexture;
+ - (struct rwa_texture *)rwaTextureSampled;   // also cleans the CPU cache of a surface another process wrote since
++- (void)bgXrStore;                           // a9y18qlte: what the GPU drew, into an extended-range surface (_xr)
++- (void)bgXrLoad;                            // ... and back out of it, under bg_lock
+ @end
+ 
+ @interface BGMTLSampler : _MTLSamplerState {
+@@ -1318,6 +1324,20 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+    // round trip per attachment per commit over 10 MB surfaces (the largest cost in the first Metal-compositor profiles).
+    static int in_compositor = -1;
+    if (in_compositor < 0) in_compositor = getenv("BGMTL_BB") != NULL;
++   // a9y18qlte: an extended-range surface drawn into gets its BGR10_XR words now, in the compositor too (its snapshots)
++   if (_status == 4) {
++      NSMutableSet *xr = nil;
++      for (BGWork *w in _work)
++         if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR)
++            for (unsigned i = 0; i < w->color_count; i++) {
++               BGMTLTexture *t = (BGMTLTexture *)w->color[i];
++               if (t && t->_xr) {
++                  if (!xr) xr = [NSMutableSet set];
++                  [xr addObject:t];
++               }
++            }
++      for (BGMTLTexture *t in xr) [t bgXrStore];
++   }
+    if (_status == 4 && !in_compositor) {
+       NSMutableSet *written = nil;
+       for (BGWork *w in _work)
+@@ -1674,8 +1694,26 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+                            (uintptr_t)IOSurfaceGetBaseAddress((IOSurfaceRef)surface));
+          prow = (unsigned)IOSurfaceGetBytesPerRowOfPlane((IOSurfaceRef)surface, plane);
+       }
++      /* a9y18qlte: an extended-range surface stands in as BGRA8 on the A512 (550/551/554/555), but its readers (SpringBoard
++       * encoding a snapshot to ASTC on the CPU) take its words as BGR10_XR: drawn into directly, every card further back in
++       * the app switcher came out purple. Such a plane is a texture of ours, converted into and out of the surface. */
++      OSType spf = IOSurfaceGetPixelFormat((IOSurfaceRef)surface);
++      unsigned mf = _shape.pixel_format;
++      if ((spf == 'b3a8' || spf == 'w30r') && plane == 0 && (mf == 550 || mf == 551 || mf == 554 || mf == 555) &&
++          _shape.mip_levels <= 1) {
++         _xr = YES;
++         _xrAlpha = spf == 'b3a8' && IOSurfaceGetPlaneCount((IOSurfaceRef)surface) > 1 && (mf == 550 || mf == 551);
++         static int told;
++         if (told++ < 8)
++            BG_LOG("XR10 surface %u %ux%u '%c%c%c%c' plane %lu as format %u (alpha plane %d): a texture of ours\n",
++                   IOSurfaceGetID((IOSurfaceRef)surface), _shape.width, _shape.height, (char)(spf >> 24), (char)(spf >> 16),
++                   (char)(spf >> 8), (char)spf, (unsigned long)plane, mf, _xrAlpha);
++      }
+       bg_lock();
+-      _tex = rwa_texture_from_surface([device rwa], &_shape, (int)IOSurfaceGetID((IOSurfaceRef)surface), poff, prow, why, sizeof(why));
++      if (_xr)
++         _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
++      else
++         _tex = rwa_texture_from_surface([device rwa], &_shape, (int)IOSurfaceGetID((IOSurfaceRef)surface), poff, prow, why, sizeof(why));
+       bg_unlock();
+       _surface = CFRetain(surface);
+       _plane = plane;
+@@ -1756,6 +1794,15 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+    // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
+    // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
+    // (one kernel clean per surface, ever) left those layers stale or missing until this.
++   if (_xr && _tex) {
++      uint32_t seed = IOSurfaceGetSeed((IOSurfaceRef)_surface);
++      if (!_xrLoaded || seed != _xrSeed) {
++         [self bgXrLoad];
++         _xrLoaded = YES;
++         _xrSeed = seed;
++      }
++      return [self rwaTexture];
++   }
+    if (_cpuCopy && _tex) {
+       uint32_t seed = IOSurfaceGetSeed((IOSurfaceRef)_surface);
+       if (!_cpuLoaded || seed != _cpuSeed) {
+@@ -1786,9 +1833,96 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+    return [self rwaTexture];
+ }
+ 
++/* a9y18qlte: BGR10_XR words <-> the BGRA8 the A512 draws. XR10 maps 0..1 to 384..894 (510 steps), so a byte b is the word
++ * value 2b + 384, blue in bits 0..9, green 10..19, red 20..29; values outside 0..1 do not survive the BGRA8 stand-in. */
++static void
++bg_xr_stats(const char *what, unsigned w, unsigned h, uint64_t t0)
++{
++   static unsigned n[2];
++   static uint64_t ns[2];
++   int k = what[0] == 's';
++   mach_timebase_info_data_t tb;
++   mach_timebase_info(&tb);
++   ns[k] += (mach_absolute_time() - t0) * tb.numer / tb.denom;
++   if (++n[k] <= 4 || n[k] % 50 == 0)
++      BG_LOG("XR10 %s #%u (%ux%u): %llu ms on average\n", what, n[k], w, h, (unsigned long long)(ns[k] / n[k] / 1000000));
++}
++
++// called with bg_lock held (rwaTextureSampledLocked)
++- (void)bgXrLoad
++{
++   uint64_t t0 = mach_absolute_time();
++   unsigned w = _shape.width, h = _shape.height;
++   uint8_t *px = malloc((size_t)w * h * 4);
++   if (!px) return;
++   IOSurfaceRef s = (IOSurfaceRef)_surface;
++   IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
++   const uint8_t *p0 = IOSurfaceGetBaseAddressOfPlane(s, 0), *p1 = _xrAlpha ? IOSurfaceGetBaseAddressOfPlane(s, 1) : NULL;
++   size_t r0 = IOSurfaceGetBytesPerRowOfPlane(s, 0), r1 = _xrAlpha ? IOSurfaceGetBytesPerRowOfPlane(s, 1) : 0;
++   for (unsigned y = 0; y < h; y++) {
++      const uint32_t *src = (const uint32_t *)(p0 + y * r0);
++      uint8_t *d = px + (size_t)y * w * 4;
++      for (unsigned x = 0; x < w; x++, d += 4) {
++         uint32_t v = src[x];
++         for (int c = 0; c < 3; c++) {   // B, G, R
++            int code = (int)((v >> (10 * c)) & 0x3ff) - 384;
++            d[c] = code <= 0 ? 0 : code >= 510 ? 255 : (uint8_t)((code + 1) >> 1);
++         }
++         d[3] = p1 ? p1[y * r1 + x] : 255;
++      }
++   }
++   IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
++   char why[256] = { 0 };
++   const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
++   if (rwa_texture_write(_tex, 0, 0, o, sz, px, (size_t)w * 4, why, sizeof(why)) != 0)
++      BG_LOG("XR10 surface load: %s\n", why);
++   free(px);
++   bg_xr_stats("load", w, h, t0);
++}
++
++- (void)bgXrStore
++{
++   if (!_xr || !_tex) return;
++   uint64_t t0 = mach_absolute_time();
++   unsigned w = _shape.width, h = _shape.height;
++   uint8_t *px = malloc((size_t)w * h * 4);
++   if (!px) return;
++   char why[256] = { 0 };
++   const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
++   bg_lock();
++   int rc = rwa_texture_read(_tex, 0, 0, o, sz, px, (size_t)w * 4, why, sizeof(why));
++   bg_unlock();
++   if (rc != 0) { BG_LOG("XR10 surface store: %s\n", why); free(px); return; }
++   IOSurfaceRef s = (IOSurfaceRef)_surface;
++   IOSurfaceLock(s, 0, NULL);
++   uint8_t *p0 = IOSurfaceGetBaseAddressOfPlane(s, 0), *p1 = _xrAlpha ? IOSurfaceGetBaseAddressOfPlane(s, 1) : NULL;
++   size_t r0 = IOSurfaceGetBytesPerRowOfPlane(s, 0), r1 = _xrAlpha ? IOSurfaceGetBytesPerRowOfPlane(s, 1) : 0;
++   for (unsigned y = 0; y < h; y++) {
++      uint32_t *dst = (uint32_t *)(p0 + y * r0);
++      const uint8_t *b = px + (size_t)y * w * 4;
++      for (unsigned x = 0; x < w; x++, b += 4)
++         dst[x] = (2u * b[0] + 384) | (2u * b[1] + 384) << 10 | (2u * b[2] + 384) << 20;
++      if (p1)
++         for (unsigned x = 0; x < w; x++) p1[y * r1 + x] = px[((size_t)y * w + x) * 4 + 3];
++   }
++   static int told;
++   if (told++ < 8) {
++      const uint8_t *c = px + ((size_t)(h / 2) * w + w / 2) * 4;
++      BG_LOG("XR10 surface %u stored: centre BGRA %u %u %u %u -> word %08x\n", IOSurfaceGetID(s), c[0], c[1], c[2], c[3],
++             ((const uint32_t *)(p0 + (h / 2) * r0))[w / 2]);
++   }
++   IOSurfaceUnlock(s, 0, NULL);   // moves the seed: readers see a new picture
++   free(px);
++   bg_lock();
++   _xrLoaded = YES;               // the texture already holds what the surface now does
++   _xrSeed = IOSurfaceGetSeed(s);
++   bg_unlock();
++   bg_xr_stats("store", w, h, t0);
++}
++
+ - (struct rwa_texture *)rwaTexture
+ {
+-   unsigned rows = (_ncBytes && _tex) ? rwa_texture_block_rows(_tex, _shape.height) : 0;
++   unsigned rows =(_ncBytes && _tex) ? rwa_texture_block_rows(_tex, _shape.height) : 0;
+    uint64_t fp = 0;
+    size_t nblocks = 0, zeros = 0;
+    if (_ncBytes && _tex && rows != _shape.height) {
