@@ -310,6 +310,37 @@ main(int argc, char **argv)
          }
          return 0;
       }
+      if (!strcmp(cmd, "snapclear")) {   // the app snapshots SpringBoard keeps (SplashBoard), all of them: retaken as apps are used
+         NSFileManager *fm = [NSFileManager defaultManager];
+         NSMutableArray *dirs = [NSMutableArray arrayWithObject:@"/private/var/mobile/Library/SplashBoard/Snapshots"];
+         NSString *apps = @"/private/var/mobile/Containers/Data/Application";
+         for (NSString *c in [fm contentsOfDirectoryAtPath:apps error:NULL] ?: @[])
+            [dirs addObject:[apps stringByAppendingFormat:@"/%@/Library/SplashBoard/Snapshots", c]];
+         unsigned files = 0, failed = 0;
+         for (NSString *d in dirs) {
+            NSArray *names = [fm contentsOfDirectoryAtPath:d error:NULL];
+            if (!names.count) continue;
+            unsigned before = files;
+            for (NSString *n in names) {   // each entry (a bundle's folder or a file) goes, the Snapshots folder stays
+               if ([fm removeItemAtPath:[d stringByAppendingPathComponent:n] error:NULL]) files++;
+               else failed++;
+            }
+            printf("snapclear: %s: %u entries removed\n", [d UTF8String], files - before);
+         }
+         printf("snapclear: %u removed, %u failed\n", files, failed);
+         return failed != 0;
+      }
+      if (!strcmp(cmd, "findname") && argc > 3) {   // paths under ROOT whose last component contains NAME (case ignored)
+         NSFileManager *fm = [NSFileManager defaultManager];
+         NSDirectoryEnumerator *e = [fm enumeratorAtPath:@(argv[3])];
+         int max = argc > 4 ? atoi(argv[4]) : 40;
+         for (NSString *p in e) {
+            if ([[p lastPathComponent] rangeOfString:@(argv[2]) options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+            printf("  %s/%s\n", argv[3], [p UTF8String]);
+            if (--max <= 0) break;
+         }
+         return 0;
+      }
       if (!strcmp(cmd, "top") && argc > 2) {   // every process's CPU time over SECONDS, the busiest first
          enum { MAXP = 1024 };
          static pid_t pid[MAXP];
@@ -435,7 +466,7 @@ main(int argc, char **argv)
          fclose(f);
          return 0;
       }
-      printf("usage: a9ybbctl status|install|restore|trim|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE|threads NAME S|bench|top S|ls DIR [MAX]\n");
+      printf("usage: a9ybbctl status|install|restore|trim|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE|threads NAME S|bench|top S|ls DIR [MAX]|snapclear|findname NAME ROOT [MAX]\n");
       return 2;
    }
 }
