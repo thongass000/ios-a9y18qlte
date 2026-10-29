@@ -252,7 +252,11 @@ int wlfw_start(void)
 		fw_ready = 1;
 
 	if (!fw_ready) {
+#ifdef BOARD_A9Y
+		if (0) {	/* icnss never sends it, and the sdm660 WLAN firmware refuses it (error 1, malformed) */
+#else
 		if (!getenv("WLFW_NO_HOSTCAP")) {	/* downstream icnss never sends it */
+#endif
 			qmi_start(&q, QMI_REQUEST, 0, HOST_CAP);
 			qmi_tlv_u32(&q, 0x10, 0);	/* daemon_support */
 			int e = request(&q, &r, 5000);
@@ -311,6 +315,16 @@ int wlfw_start(void)
 	printf("wlfw: chip %#x family %#x board %#x soc %#x fw %#x \"%s\"\n", wlfw.chip_id, wlfw.chip_family,
 	       wlfw.board_id, wlfw.soc_id, wlfw.fw_version, wlfw.build_id);
 
+#ifdef BOARD_A9Y
+	/*
+	 * icnss sends nothing more after CAP: the sdm660 WLAN firmware reads its board data itself (tftp) and
+	 * then says FW READY. The host download below is only the fallback.
+	 */
+	for (int t = 0; t < 10000 && !fw_ready; t++)
+		link_poll(1);
+	if (!fw_ready)
+		printf("wlfw: no FW READY on its own, sending the board data\n");
+#endif
 	if (!fw_ready) {
 		/* ath10k waits for the MSA ready indication before the board data */
 		for (int t = 0; t < 5000 && !msa_ready; t++)
