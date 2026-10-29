@@ -4211,7 +4211,7 @@ index 2545cf9..6d3c7e9 100644
  		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
  		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index bc98b59..564dd17 100644
+index bc98b59..e2ac6ce 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -48,8 +48,16 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
@@ -4249,7 +4249,7 @@ index bc98b59..564dd17 100644
  	void copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n);
  };
  
-@@ -305,6 +317,25 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -305,6 +317,30 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
  	}
  	if (fb->fPowerOff) {
@@ -4264,6 +4264,11 @@ index bc98b59..564dd17 100644
 +			fb->fFadeStep = 7;
 +			IOLockUnlock(fb->fLock);
 +			if (blank) {
++				/*
++				 * The GPU first: a present of the dimming lock screen still queued behind clients' work landed in
++				 * the buffer just cleared and shown, and the darkened wallpaper stayed on with the display off.
++				 */
++				(void)sweet_gpu_wait_idle_ns(SWEET_FB_GPU_WAIT_NS);
 +				int b = (sweet_gpu_panel_shown() + 1) % 3;
 +				uint8_t *kva = (uint8_t *)(b == 0 ? fb->fPixels : (uintptr_t)fb->fBufMap[b]->getVirtualAddress());
 +				bzero(kva, (size_t)fb->fRowBytes * fb->fHeight);
@@ -4275,7 +4280,7 @@ index bc98b59..564dd17 100644
  		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
  		if (step <= 6) {
-@@ -443,6 +474,100 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
+@@ -443,6 +479,100 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
   * first time, the panel switches to the GPU's row stride and is cleared, so
   * the bars stay black. False: use the CPU copy.
   */
@@ -4376,7 +4381,7 @@ index bc98b59..564dd17 100644
  bool
  AppleCLCD::presentGPU(const uint8_t *rec)
  {
-@@ -501,13 +626,45 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+@@ -501,13 +631,45 @@ AppleCLCD::presentGPU(const uint8_t *rec)
  		sweet_gpu_panel_stride(SWEET_FB_GPU_ROWBYTES);
  		fRowBytes = SWEET_FB_GPU_ROWBYTES;
  		bzero((void *)fPixels, (size_t)fRowBytes * fHeight);
@@ -4424,7 +4429,7 @@ index bc98b59..564dd17 100644
  	s->release();
  	if (rc) {
  		return gpu_fallback(7, "GPU blit failed");
-@@ -535,9 +692,28 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -535,9 +697,28 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
@@ -4453,7 +4458,7 @@ index bc98b59..564dd17 100644
  	if (sweet_display_fit_w) {
  		sweet_display_fit_w = 0;        /* touch back to the crop mapping */
  		sweet_display_fit_x = sweet_display_fit_y = sweet_display_fit_h = 0;
-@@ -568,6 +744,9 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -568,6 +749,9 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
@@ -4463,7 +4468,7 @@ index bc98b59..564dd17 100644
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
  			h = (int32_t)s->height;
-@@ -758,7 +937,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -758,7 +942,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  			if (off != fFB->fPowerOff) {
  				fFB->fPowerOff = off;
  				fFB->fFadeStep = 0;
