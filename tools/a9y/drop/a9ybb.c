@@ -12,6 +12,10 @@
  * the injection last wrote "alive=1" to bgmtl-bb.state are in /private/var/tmp/a9ybb.tries, and after MAX_TRIES of
  * them this writes bgmtl-bb.off itself (backboardd crashed on its first frame, ten times a boot, with none of this).
  * Anything unexpected: plain backboardd.
+ *
+ * /usr/local/etc/a9ybb.always (it comes with the drop) arms every boot from its first backboardd launch, with no
+ * a9ybbctl arm and respring: the first launch of a boot (a9ybb.boot holds the boot the count is for) starts the count
+ * over and drops the last boot's kill switch and state, and the same MAX_TRIES guard applies.
  */
 #include <stddef.h>
 
@@ -22,6 +26,7 @@ extern int close(int);
 extern ssize_t read(int, void *, size_t);
 extern ssize_t write(int, const void *, size_t);
 extern int access(const char *, int);
+extern int unlink(const char *);
 extern int execve(const char *, char *const[], char *const[]);
 extern int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 extern char **environ;
@@ -38,6 +43,8 @@ extern char **environ;
 #define STATE           "/private/var/tmp/bgmtl-bb.state"
 #define TRIES           "/private/var/tmp/a9ybb.tries"
 #define ENV_FILE        "/usr/local/etc/a9ybb.env"
+#define ALWAYS          "/usr/local/etc/a9ybb.always"
+#define BOOT            "/private/var/tmp/a9ybb.boot"
 #define MAX_EXTRA       4
 #define MAX_TRIES       2
 #define MAX_ENV         256
@@ -92,6 +99,21 @@ static int armed(void)
 	if (sysctlbyname("kern.bootsessionuuid", boot, &len, 0, 0) || len < 8)
 		return 0;
 	boot[len] = 0;
+	if (access(ALWAYS, F_OK) == 0) {
+		char last[64] = "";
+		int same = slurp(BOOT, last, sizeof(last)) >= 8;
+		size_t blen = 0;
+		for (; boot[blen]; blen++)
+			if (last[blen] != boot[blen])
+				same = 0;
+		if (!same) {            /* this boot's first launch */
+			unlink(OFF);
+			unlink(STATE);
+			put(TRIES, "0", 1);
+			put(BOOT, boot, blen);
+		}
+		return access(OFF, F_OK) != 0 && access(INJECT, F_OK) == 0;
+	}
 	int fd = open(ARM, O_RDONLY);
 	if (fd < 0)
 		return 0;

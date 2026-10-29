@@ -272,7 +272,7 @@ index ee2b232..4f80de8 100644
  /*
   * The same texture, over memory somebody else allocated: an IOSurface of CoreAnimation's.
 diff --git a/inject/bgmtl_inject.m b/inject/bgmtl_inject.m
-index 56a4384..c34c219 100644
+index 56a4384..7b693f1 100644
 --- a/inject/bgmtl_inject.m
 +++ b/inject/bgmtl_inject.m
 @@ -245,6 +245,152 @@ watchdog_bb(void *arg)
@@ -428,7 +428,23 @@ index 56a4384..c34c219 100644
  static void *
  watchdog(void *arg)
  {
-@@ -351,6 +497,8 @@ bb_init(void)
+@@ -297,11 +443,12 @@ bb_init(void)
+    g_bb = 1;
+    if (exists(F_BB_OFF)) { ilog("backboardd: %s present, stock", F_BB_OFF); return; }
+    int crashtest = 0;
++   // a9y18qlte: /usr/local/etc/a9ybb.always arms every boot (a9ybb keeps the per-boot guard), no bgmtl-bb.arm needed
+    FILE *a = fopen(F_BB_ARM, "r");
+-   if (!a) { ilog("backboardd: not armed, stock"); return; }
++   if (!a && !exists("/usr/local/etc/a9ybb.always")) { ilog("backboardd: not armed, stock"); return; }
+    char word[32] = "";
+-   if (fscanf(a, "%31s", word) == 1 && !strcmp(word, "crashtest")) crashtest = 1;
+-   fclose(a);
++   if (a && fscanf(a, "%31s", word) == 1 && !strcmp(word, "crashtest")) crashtest = 1;
++   if (a) fclose(a);
+    unsigned minor = 0;
+    int st = bgmtl_gpu_state(&minor);
+    if (st != 1) { ilog("backboardd: GPU state %d (1 = ready): stock", st); return; }
+@@ -351,6 +498,8 @@ bb_init(void)
     pthread_t th;
     pthread_create(&th, NULL, watchdog_bb, (void *)(intptr_t)crashtest);
     pthread_detach(th);
