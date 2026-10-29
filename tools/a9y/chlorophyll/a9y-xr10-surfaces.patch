@@ -1,5 +1,5 @@
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index 7c78852..d3287a9 100644
+index 7c78852..eb133b2 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
 @@ -352,6 +352,10 @@ bg_install_fallback(Class c)
@@ -33,7 +33,7 @@ index 7c78852..d3287a9 100644
     return t;
  }
  @end
-@@ -1318,6 +1328,41 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1318,6 +1328,76 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     // round trip per attachment per commit over 10 MB surfaces (the largest cost in the first Metal-compositor profiles).
     static int in_compositor = -1;
     if (in_compositor < 0) in_compositor = getenv("BGMTL_BB") != NULL;
@@ -50,6 +50,41 @@ index 7c78852..d3287a9 100644
 +               }
 +            }
 +      for (BGMTLTexture *t in xr) [t bgXrStore];
++      /* a9y18qlte: in the compositor too, a surface drawn into only a few times is not a framebuffer: SpringBoard's snapshot
++       * surfaces (BGRA 1125x2436) are read back by its CPU and encoded to ASTC (the app switcher's cards). Without the
++       * clean and the seed bump below it read something else, and every card came out one flat purple. The first
++       * 4 draws of each surface ID get them; a framebuffer, drawn every frame, pays for 4 and no more. */
++      if (in_compositor) {
++         enum { SLOTS = 4096 };
++         static struct { uint32_t id, draws; } seen[SLOTS];
++         static int told;
++         NSMutableSet *fresh = nil;
++         for (BGWork *w in _work)
++            if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR)
++               for (unsigned i = 0; i < w->color_count; i++) {
++                  BGMTLTexture *t = (BGMTLTexture *)w->color[i];
++                  IOSurfaceRef s = t ? (IOSurfaceRef)[t iosurface] : NULL;
++                  if (!s || t->_xr) continue;
++                  uint32_t id = IOSurfaceGetID(s);
++                  if (seen[id % SLOTS].id != id) { seen[id % SLOTS].id = id; seen[id % SLOTS].draws = 0; }
++                  if (seen[id % SLOTS].draws++ >= 4) continue;
++                  rwa_texture_flush_surface([t rwaTexture]);
++                  if (!fresh) fresh = [NSMutableSet set];
++                  [fresh addObject:(id)s];
++               }
++         for (id surf in fresh) {
++            IOSurfaceRef s = (IOSurfaceRef)surf;
++            IOSurfaceLock(s, 0, NULL);
++            if (told < 16 && IOSurfaceGetWidth(s) >= 64) {
++               told++;
++               const uint32_t *c = (const uint32_t *)((const uint8_t *)IOSurfaceGetBaseAddress(s) +
++                                                      IOSurfaceGetHeight(s) / 2 * IOSurfaceGetBytesPerRow(s)) + IOSurfaceGetWidth(s) / 2;
++               BG_LOG("surface %u %zux%zu drawn: cleaned for CPU readers, centre %08x\n", IOSurfaceGetID(s), IOSurfaceGetWidth(s),
++                      IOSurfaceGetHeight(s), *c);
++            }
++            IOSurfaceUnlock(s, 0, NULL);
++         }
++      }
 +      // a9y18qlte: snapshots still purple: what a surface of another format holds once the GPU drew it (its centre texel)
 +      static int told;
 +      for (BGWork *w in _work)
@@ -75,7 +110,7 @@ index 7c78852..d3287a9 100644
     if (_status == 4 && !in_compositor) {
        NSMutableSet *written = nil;
        for (BGWork *w in _work)
-@@ -1674,8 +1719,35 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1674,8 +1754,35 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
                             (uintptr_t)IOSurfaceGetBaseAddress((IOSurfaceRef)surface));
           prow = (unsigned)IOSurfaceGetBytesPerRowOfPlane((IOSurfaceRef)surface, plane);
        }
@@ -112,7 +147,7 @@ index 7c78852..d3287a9 100644
        bg_unlock();
        _surface = CFRetain(surface);
        _plane = plane;
-@@ -1683,6 +1755,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1683,6 +1790,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
        bg_lock();
        _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
        bg_unlock();
@@ -123,7 +158,7 @@ index 7c78852..d3287a9 100644
     }
     /* a9y18qlte: SpringBoard's Control Center glyphs are surfaces at a pitch of their creator's (224 bytes a row), which the
      * A512 cannot take as they are: they are sampled from a copy instead (rwaTextureSampledLocked) */
-@@ -1756,6 +1832,15 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1756,6 +1867,15 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
     // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
     // (one kernel clean per surface, ever) left those layers stale or missing until this.
@@ -139,7 +174,7 @@ index 7c78852..d3287a9 100644
     if (_cpuCopy && _tex) {
        uint32_t seed = IOSurfaceGetSeed((IOSurfaceRef)_surface);
        if (!_cpuLoaded || seed != _cpuSeed) {
-@@ -1786,9 +1871,96 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1786,9 +1906,96 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     return [self rwaTexture];
  }
  
@@ -237,7 +272,7 @@ index 7c78852..d3287a9 100644
     uint64_t fp = 0;
     size_t nblocks = 0, zeros = 0;
     if (_ncBytes && _tex && rows != _shape.height) {
-@@ -1842,6 +2014,18 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1842,6 +2049,18 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
              const uint8_t *b = (const uint8_t *)_ncBytes;
              BG_LOG("no-copy compressed %s: %zu of 256 sampled blocks all zero\n", again ? "copied again (bytes changed)" : "first copy",
                     zeros);
@@ -256,7 +291,7 @@ index 7c78852..d3287a9 100644
              BG_LOG("no-copy compressed: %ux%u fmt %u mips %u, %lu bytes at %p (%u rows of blocks): "
                     "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x | %02x%02x%02x%02x %02x%02x%02x%02x\n",
                     _shape.width, _shape.height, _shape.pixel_format, _shape.mip_levels, (unsigned long)_ncLength, _ncBytes, rows,
-@@ -1895,6 +2079,21 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1895,6 +2114,21 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
        const uint8_t *a = (const uint8_t *)bytes, *z = a + bpr * (r.size.height - 1);
        BG_LOG("  first row px0 %u %u %u %u, last row px0 %u %u %u %u\n", a[0], a[1], a[2], a[3], z[0], z[1], z[2], z[3]);
     }
@@ -278,7 +313,7 @@ index 7c78852..d3287a9 100644
     (void)bpi;
     unsigned o[3] = { (unsigned)r.origin.x, (unsigned)r.origin.y, (unsigned)r.origin.z };
     unsigned sz[3] = { (unsigned)r.size.width, (unsigned)r.size.height, (unsigned)r.size.depth };
-@@ -1917,6 +2116,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1917,6 +2151,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     bg_lock();
     if (rwa_texture_read(_tex, (unsigned)level, (unsigned)slice, o, sz, bytes, bpr, why, sizeof(why)) != 0) BG_LOG("getBytes: %s\n", why);
     bg_unlock();
