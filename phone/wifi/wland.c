@@ -565,6 +565,37 @@ static int boot_modem(void)
 		return -1;
 	return wait_ready();
 }
+
+/*
+ * The apps ends of the modem's diag sockets, as diagfwd_socket.c opens them: CNTL, DATA and DCI are servers
+ * here (service 0x1001, the raw instance field = the instance id: modem base 0). Without them the modem never
+ * announced its own diag CMD server, and its dog took it down ("Task starvation: diag") 16 s after every
+ * boot. What arrives is only counted and its first packets shown.
+ */
+#define DIAG_SERVICE	0x1001
+#define DIAG_PORT0	0x30	/* + 0 CNTL, + 1 DATA, + 2 DCI */
+static const uint32_t diag_ins[3] = { 0, 2, 4 };
+static unsigned diag_rx[3];
+
+static void diag_init(void)
+{
+	for (unsigned i = 0; i < 3; i++)
+		if (qrtr_new_server(DIAG_SERVICE, diag_ins[i], 0, DIAG_PORT0 + i))
+			printf("diag: server %u failed\n", diag_ins[i]);
+	printf("diag: serving cntl/data/dci at %u:%x..%x\n", QRTR_NODE_APPS, DIAG_PORT0, DIAG_PORT0 + 2);
+}
+
+static void diag_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
+{
+	unsigned i = h->dst_port - DIAG_PORT0;
+	if (++diag_rx[i] > 4 && diag_rx[i] & (diag_rx[i] - 1))
+		return;		/* the first 4, then at powers of 2 */
+	printf("[%6llu] diag: < %s #%u from %u:%x, %u bytes:", (unsigned long long)link_ms(), (const char *[]){ "cntl", "data", "dci" }[i],
+	       diag_rx[i], h->src_node, h->src_port, n);
+	for (uint32_t k = 0; k < n && k < 32; k++)
+		printf(" %02x", d[k]);
+	printf("\n");
+}
 #endif
 
 static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
@@ -574,6 +605,12 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	if (h->type == QRTR_TYPE_DATA) {
 		if (h->confirm_rx)
 			qrtr_resume_tx(h);
+#ifdef BOARD_A9Y
+		if (h->dst_port >= DIAG_PORT0 && h->dst_port < DIAG_PORT0 + 3) {
+			diag_handle(h, d, n);
+			return;
+		}
+#endif
 		if (h->dst_port == RMTFS_PORT) {
 			rmtfs_handle(h, d, n);
 			return;
@@ -709,6 +746,9 @@ static int net(unsigned secs)
 		printf("net: no rmtfs\n");
 	if (pdmapper_init() || tftp_init())
 		printf("net: no pd-mapper/tftp\n");
+#ifdef BOARD_A9Y
+	diag_init();
+#endif
 	read_conf();
 	uint64_t end = link_ms() + (uint64_t)secs * 1000, stats = link_ms() + 30000;
 	while (!secs || link_ms() < end) {
