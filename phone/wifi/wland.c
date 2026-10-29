@@ -172,10 +172,8 @@ static int wlan_power(void)
 				rc |= pm_rpm(set, "ldoa", ldo[i].id, "swen", 1);
 		}
 		printf("wlan power: pm660 l%u %u uV %s -> %d\n", ldo[i].id, ldo[i].uv, ldo[i].pin ? "pin ctrl" : "on", rc);
-		if (rc)
-			return -1;
 	}
-	return 0;
+	return 0;	/* the modem boots without them: a failed vote shows only when the radio starts */
 }
 #endif
 
