@@ -154,8 +154,9 @@ static int wlan_power(void)
  * sdm660: the WCN3990 rails are RPM regulators (icnss in the stock DT; the RPM keeps this master's keys per
  * resource, as rpm-smd-regulator.c sends them): vdd-cx-mx pm660 l5 at 848 mV, software enabled; vdd-1.8-xo
  * l9, vdd-1.3-rfa l6 and vdd-3.3-ch0 l19 are the *_pin_ctrl ones, whose enable follows the chip's HW_EN1
- * (pcen 2, swen 0), at their minimum voltages. Both sets (qcom,set 3). The reference clock (rf_clk1_pin) the
- * kernel's RPM clock handoff already turned on.
+ * (pcen 2, swen 0), at their minimum voltages. Both sets (qcom,set 3). The reference clock is icnss's
+ * cxo_ref_clk_pin, RPM_SMD_RF_CLK1_PIN: XO buffer 4 ("clka"), pin-controlled enable ("pccb"). Nothing votes it
+ * under XNU otherwise (the modem went ERR-FATAL 3 s after the WLFW CAP while it was unvoted).
  */
 static int wlan_power(void)
 {
@@ -173,6 +174,8 @@ static int wlan_power(void)
 		}
 		printf("wlan power: pm660 l%u %u uV %s -> %d\n", ldo[i].id, ldo[i].uv, ldo[i].pin ? "pin ctrl" : "on", rc);
 	}
+	int rc = pm_rpm(0, "clka", 4, "pccb", 1) | pm_rpm(1, "clka", 4, "pccb", 1);
+	printf("wlan power: rf_clk1 pin ctrl -> %d\n", rc);
 	return 0;	/* the modem boots without them: a failed vote shows only when the radio starts */
 }
 #endif
