@@ -734,10 +734,8 @@ static int net(unsigned secs)
 /* everything `up` does, from a fresh boot */
 static int up(unsigned secs)
 {
-#ifndef BOARD_A9Y	/* radio.c's SMMU is the Pixel's (0x15000000); sdm660's WLAN streams are on anoc2 */
 	if (smmu_wlan_identity())
 		printf("up: no WLAN SMMU stream: the radio will not start\n");
-#endif
 	if (wlan_power() || smp2p_create() || boot_modem())
 		return 1;
 	return net(secs) ? 1 : 0;
@@ -857,13 +855,13 @@ int main(int argc, char **argv)
 		if (smp2p_create())
 			return 1;
 		return boot_modem() ? 1 : 0;
+	} else if (!strcmp(c, "smmu")) {
+		return smmu_wlan_identity() ? 1 : 0;
 #ifndef BOARD_A9Y
 	} else if (!strcmp(c, "levels") && argc > 2) {
 		levels(argv[2], 1);
 	} else if (!strcmp(c, "qmp") && argc > 2) {
 		return qmp_send(argv[2]) ? 1 : 0;
-	} else if (!strcmp(c, "smmu")) {
-		return smmu_wlan_identity() ? 1 : 0;
 	} else if (!strcmp(c, "cmddb")) {
 		cmddb_list();
 	} else if (!strcmp(c, "bcm") && argc > 3) {

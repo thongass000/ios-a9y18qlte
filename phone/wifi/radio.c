@@ -20,6 +20,7 @@
 #include <CommonCrypto/CommonHMAC.h>
 #include <CommonCrypto/CommonKeyDerivation.h>
 #include <CommonCrypto/CommonSymmetricKeywrap.h>
+#include "board.h"
 #include "pmem.h"
 #include "link.h"
 #include "radio.h"
@@ -67,6 +68,91 @@ static void mem_wr(uint64_t pa, const void *buf, uint32_t len)
 
 /* ---------------------------------------------------------------- apps SMMU */
 
+#ifdef BOARD_A9Y
+/*
+ * sdm660: the WLAN streams are on the anoc2 SMMU (arm,smmu-anoc2@16c0000, 6 SMRs, 11 banks, 4K pages x 32;
+ * its clock is a vote on aggre2_noc, which the kernel's RPM handoff runs). Set up as Android's arm-smmu
+ * leaves it for icnss (qcom,iommu-dma = "bypass"; ~/a9-ios/kmod/anoc2dump): one exact SMR per stream,
+ * 0x1a00 and 0x1a01, both to one bank with stage 1 on and translation off (CBAR 0x1f300, SCTLR 0xc01066,
+ * M = 0, ACTLR 0x70000000). No TLB sync: nothing is translated, and on this SoC's GPU SMMU (also behind
+ * the hypervisor) a TLB sync from outside Linux stalled the bus for good.
+ */
+#define SMMU_PA		0x016c0000ull
+#define SMMU_SIZE	0x00040000u
+static const uint32_t wlan_sids[] = { 0x1a00, 0x1a01 };
+#define CB_CBAR		0x0001f300u
+#define CB_CBA2R	0x00000001u	/* AArch64 */
+#define CB_SCTLR	0x00c01066u
+#define CB_ACTLR	0x70000000u
+
+static int smmu_done;
+
+int smmu_wlan_identity(void)
+{
+	uint64_t s = SMMU_PA;
+	uint32_t id0 = rd32(s + 0x20), id1 = rd32(s + 0x24);
+	uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
+	uint32_t psize = (id1 >> 31) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
+	const unsigned nsid = sizeof(wlan_sids) / sizeof(wlan_sids[0]);
+	int slot[2] = { -1, -1 }, cb = -1;
+	uint32_t used = 0;
+
+	printf("smmu: anoc2 sCR0 %08x ID0 %08x ID1 %08x: %u SMRs, %u context banks, page %#x x %u\n", rd32(s), id0,
+	       id1, nsmr, ncb, psize, npage);
+	if (nsmr > 32 || ncb > 32)
+		return -1;
+	for (uint32_t i = 0; i < nsmr; i++) {
+		uint32_t smr = rd32(s + 0x800 + 4 * i), s2cr = rd32(s + 0xc00 + 4 * i);
+		if (smr >> 31) {
+			printf("smmu: SMR%u %08x S2CR %08x\n", i, smr, s2cr);
+			if (((s2cr >> 16) & 3) == 0)
+				used |= 1u << (s2cr & 0x1f);
+			for (unsigned k = 0; k < nsid; k++)
+				if ((smr & 0x7fff) == wlan_sids[k])
+					slot[k] = (int)i;	/* reuse a matching SMR */
+		}
+	}
+	for (unsigned k = 0; k < nsid; k++)
+		for (uint32_t i = 0; slot[k] < 0 && i < nsmr; i++)
+			if (!(rd32(s + 0x800 + 4 * i) >> 31) && (k == 0 || slot[0] != (int)i))
+				slot[k] = (int)i;
+	for (uint32_t c = 0; c < ncb; c++) {
+		uint64_t cbp = s + (uint64_t)npage * psize + (uint64_t)c * psize;
+		if (!(used & (1u << c)) && !(rd32(cbp) & 1) && rd32(s + psize + 4 * c) == 0) {
+			cb = (int)c;
+			break;
+		}
+	}
+	if (slot[0] < 0 || slot[1] < 0 || cb < 0 || (uint64_t)(npage + cb + 1) * psize > SMMU_SIZE) {
+		printf("smmu: no free SMRs/bank (SMR %d %d, bank %d)\n", slot[0], slot[1], cb);
+		return -1;
+	}
+	uint64_t gr1 = s + psize, cbp = s + (uint64_t)npage * psize + (uint64_t)cb * psize;
+	wr32(cbp + 0x58, 0xffffffff);			/* FSR: clear */
+	wr32(cbp + 0x20, 0);				/* TTBR0 */
+	wr32(cbp + 0x24, 0);
+	wr32(cbp + 0x30, 0);				/* TCR */
+	wr32(cbp + 0x10, 0);				/* TCR2 */
+	wr32(cbp + 0x38, 0);				/* MAIR */
+	wr32(cbp + 0x3c, 0);
+	wr32(cbp + 0x4, CB_ACTLR);
+	wr32(gr1 + 0x800 + 4 * cb, CB_CBA2R);
+	wr32(gr1 + 4 * cb, CB_CBAR);
+	wr32(cbp, CB_SCTLR);				/* SCTLR before any stream points here */
+	smmu_done = 1;
+	for (unsigned k = 0; k < nsid; k++) {
+		wr32(s + 0xc00 + 4 * slot[k], (uint32_t)cb);	/* S2CR: translate (type 0) through this bank */
+		wr32(s + 0x800 + 4 * slot[k], (1u << 31) | wlan_sids[k]);	/* exact SMR, valid last */
+		uint32_t smr = rd32(s + 0x800 + 4 * slot[k]), s2cr = rd32(s + 0xc00 + 4 * slot[k]);
+		int ok = smr == ((1u << 31) | wlan_sids[k]) && ((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == (uint32_t)cb;
+		printf("smmu: WLAN %#x -> CB%d via SMR%d: SMR %08x S2CR %08x -> %s\n", wlan_sids[k], cb, slot[k], smr, s2cr,
+		       ok ? "ok" : "NOT as written");
+		smmu_done &= ok;
+	}
+	printf("smmu: CB%d SCTLR %08x CBAR %08x ACTLR %08x\n", cb, rd32(cbp), rd32(gr1 + 4 * cb), rd32(cbp + 0x4));
+	return smmu_done ? 0 : -1;
+}
+#else
 #define SMMU_PA		0x15000000ull
 #define SMMU_SIZE	0x00100000u
 #define WLAN_SID	0x640
@@ -147,6 +233,7 @@ int smmu_wlan_identity(void)
 	       WLAN_SID_MASK, cb, slot, smr, s2cr, rd32(cbp), rd32(gr1 + 4 * cb), smmu_done ? "ok" : "NOT as written");
 	return smmu_done ? 0 : -1;
 }
+#endif
 
 /* ---------------------------------------------------------------- copy engines */
 

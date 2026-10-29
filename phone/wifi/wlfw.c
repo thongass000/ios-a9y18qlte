@@ -33,8 +33,12 @@
 
 #define CLIENT_ID	0x4b4e454c	/* ath10k's */
 #define MSA_SIZE	0x100000u	/* qcom,wlan-msa-memory */
+#ifdef BOARD_A9Y
+#define BDF_PATH	FW_ROOT "/modem/bdwlan.bin"	/* stock /vendor/firmware/wlan/qca_cld/bdwlan.bin */
+#else
 #define BDF_PATH	"/var/local/fw/modem/bdwlan-flame.bin"
 #define BDF_PATH2	"/var/local/fw/modem/bdwlan-flame-PROTO1.1.bin"
+#endif
 
 static uint32_t srv_node, srv_port;
 static int srv_up, started;
