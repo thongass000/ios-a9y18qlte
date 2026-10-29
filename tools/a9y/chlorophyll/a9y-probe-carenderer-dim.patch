@@ -1,0 +1,147 @@
+diff --git a/test/bgmtl_carenderer_probe.m b/test/bgmtl_carenderer_probe.m
+index 8db9734..261d42d 100644
+--- a/test/bgmtl_carenderer_probe.m
++++ b/test/bgmtl_carenderer_probe.m
+@@ -9,6 +9,7 @@
+ #import <QuartzCore/QuartzCore.h>
+ #import <CoreGraphics/CoreGraphics.h>
+ #import <objc/runtime.h>
++#import <objc/message.h>
+ #import <IOSurface/IOSurfaceRef.h>
+ #include <dlfcn.h>
+ #include "../src/a9y_devices.h"
+@@ -208,10 +209,109 @@ make_scene(int n)
+       [root addSublayer:b];
+       break;
+    }
++   default: {  // a9y18qlte: dimming (purple on the phone). Grey on the left, red/green/blue/white bars on the right; the
++               // band DIM_Y0..DIM_Y1 is dimmed by what SpringBoard uses: a black view, or a backdrop with a recipe's filters
++      root.backgroundColor = CGColorCreateGenericRGB(0.5, 0.5, 0.5, 1);
++      for (int i = 0; i < 4; i++) {
++         CALayer *l = [CALayer layer];
++         l.frame = CGRectMake(128 + i * 32, 0, 32, H);
++         l.backgroundColor = CGColorCreateGenericRGB(i == 0 || i == 3, i == 1 || i == 3, i == 2 || i == 3, 1);
++         [root addSublayer:l];
++      }
++      Class bd = NSClassFromString(@"CABackdropLayer"), cf = NSClassFromString(@"CAFilter");
++      if (!bd || !cf) break;
++      CALayer *b = n == 13 ? [CALayer layer] : [bd layer];
++      b.frame = CGRectMake(0, 64, W, 128);
++      id (*mk)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
++      SEL fw = NSSelectorFromString(@"filterWithType:");
++      NSMutableArray *fs = [NSMutableArray array];
++      // CAColorMatrix: 4 rows of 5 floats (r g b a bias), as the recipes' m11..m45
++      static const float modules[20] = { 0.68123, -0.135338, -0.0258915, 0, -0.026, -0.068668, 0.615012, -0.0263445, 0, -0.026,
++                                         -0.069121, -0.134659, 0.72378, 0, -0.026, 0, 0, 0, 1, 0 };
++      static const float folder[20] = { 0.338712, -0.183333, -0.0353788, 0, 0.132, -0.0932292, 0.248869, -0.0356397, 0, 0.132,
++                                        -0.0934902, -0.182942, 0.396432, 0, 0.132, -0.2392, -0.4696, -0.0912, 1, 0 };
++      switch (n) {
++      case 13:   // UIDimmingView: black at 40 %
++         b.backgroundColor = CGColorCreateGenericRGB(0, 0, 0, 0.4);
++         break;
++      case 14: { // colorBrightness alone (plattersDark: -0.03)
++         id f = mk(cf, fw, @"colorBrightness");
++         [f setValue:@-0.2 forKey:@"inputAmount"];
++         [fs addObject:f];
++         break;
++      }
++      case 15: { // colorSaturate alone (the recipes: 1.4 .. 1.6)
++         id f = mk(cf, fw, @"colorSaturate");
++         [f setValue:@1.6 forKey:@"inputAmount"];
++         [fs addObject:f];
++         break;
++      }
++      case 16:   // colorMatrix: Control Center modules (alpha row identity)
++      case 18: { // ... and the dark folder (alpha row from colour)
++         id f = mk(cf, fw, @"colorMatrix");
++         [f setValue:[NSValue valueWithBytes:n == 16 ? modules : folder objCType:"{CAColorMatrix=ffffffffffffffffffff}"]
++              forKey:@"inputColorMatrix"];
++         [fs addObject:f];
++         break;
++      }
++      case 17: { // luminanceCurveMap alone: Control Center's background (modulesBackground)
++         id f = mk(cf, fw, @"luminanceCurveMap");
++         [f setValue:@[ @0.38, @0, @1, @0.76 ] forKey:@"inputValues"];
++         [f setValue:@0.4 forKey:@"inputAmount"];
++         [fs addObject:f];
++         break;
++      }
++      case 19: { // modulesBackground whole: blur 30, saturation 1.6, luminance curve
++         id f = mk(cf, fw, @"gaussianBlur");
++         [f setValue:@30 forKey:@"inputRadius"];
++         [fs addObject:f];
++         f = mk(cf, fw, @"colorSaturate");
++         [f setValue:@1.6 forKey:@"inputAmount"];
++         [fs addObject:f];
++         f = mk(cf, fw, @"luminanceCurveMap");
++         [f setValue:@[ @0.38, @0, @1, @0.76 ] forKey:@"inputValues"];
++         [f setValue:@0.4 forKey:@"inputAmount"];
++         [fs addObject:f];
++         break;
++      }
++      case 20: { // brightness + saturation together (CA may fold them into one matrix)
++         id f = mk(cf, fw, @"colorSaturate");
++         [f setValue:@1.4 forKey:@"inputAmount"];
++         [fs addObject:f];
++         f = mk(cf, fw, @"colorBrightness");
++         [f setValue:@-0.2 forKey:@"inputAmount"];
++         [fs addObject:f];
++         break;
++      }
++      }
++      for (id f in fs) if (!f) { printf("scene %d: a CAFilter type is missing\n", n); fs = nil; break; }
++      if (fs.count) b.filters = fs;
++      [root addSublayer:b];
++      break;
++   }
+    }
+    return root;
+ }
+ 
++/* a9y18qlte: the dimming scenes' colours: the grey half and each bar, inside the dimmed band and above it */
++static void
++dim_report(int n, const uint8_t *out, const uint8_t *ref)
++{
++   static const char *name[5] = { "grey", "red", "green", "blue", "white" };
++   static const int x0[5] = { 32, 136, 168, 200, 232 }, x1[5] = { 96, 152, 184, 216, 248 };
++   for (int k = 0; k < 5; k++) {
++      double in[3] = { 0, 0, 0 }, top[3] = { 0, 0, 0 };
++      int cnt = 0;
++      for (int y = 0; y < 32; y++) for (int x = x0[k]; x < x1[k]; x++, cnt++) for (int c = 0; c < 3; c++) {
++         in[c] += out[((112 + y) * W + x) * 4 + c];
++         top[c] += out[((16 + y) * W + x) * 4 + c];
++      }
++      const uint8_t *r = ref + (128 * W + (x0[k] + x1[k]) / 2) * 4;
++      printf("dim %d %-5s RGB dimmed %3.0f %3.0f %3.0f undimmed %3.0f %3.0f %3.0f (CPU %d %d %d)\n", n, name[k], in[2] / cnt,
++             in[1] / cnt, in[0] / cnt, top[2] / cnt, top[1] / cnt, top[0] / cnt, r[2], r[1], r[0]);
++   }
++}
++
+ static void
+ write_ppm(const char *path, const uint8_t *bgra)
+ {
+@@ -302,8 +402,9 @@ main(int argc, char **argv)
+          }
+          return 0;
+       }
+-      for (int n = 0; n < 13; n++) {
+-         if (only >= 0 && n != only) continue;
++      int dim_only = argc > 2 && !strcmp(argv[2], "dim");   // a9y18qlte: the dimming scenes 13..20 alone
++      for (int n = 0; n < 21; n++) {
++         if (dim_only ? n < 13 : only >= 0 && n != only) continue;
+          CALayer *scene = make_scene(n);
+          // the reference: CoreAnimation's CPU path into a bitmap
+          CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+@@ -351,6 +452,12 @@ main(int argc, char **argv)
+          double sum = 0; unsigned nonzero = 0;
+          for (int i = 0; i < W * H * 4; i++) { sum += abs((int)out[i] - (int)ref[i]); if (out[i]) nonzero++; }
+          printf("scene %d: mean abs diff %.2f over %d channels, %u non-zero bytes rendered\n", n, sum / (W * H * 4), W * H * 4, nonzero);
++         if (n >= 13) {   // a9y18qlte: dimming: colours by region; a backdrop's answer is not the CPU reference's
++            dim_report(n, out, ref);
++            done++;
++            free(out); free(ref);
++            continue;
++         }
+          if (n >= 11) {   // a blur's answer is not the CPU reference's (renderInContext draws no backdrop filter): its colour, by rows
+             for (int y = 40; y < H - 32; y += 48) {
+                double c[3] = { 0, 0, 0 };
