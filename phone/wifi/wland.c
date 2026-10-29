@@ -27,6 +27,7 @@
 #include <signal.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include "board.h"
 #include "pmem.h"
 #include "smem.h"
 #include "link.h"
@@ -37,7 +38,9 @@
 #include "radio.h"
 #include "ipnet.h"
 #include "bridge.h"
+#include "mss.h"
 
+#ifndef BOARD_A9Y	/* sm8150: RPMh (cmd-db, ARC/VRM/BCM votes) and the AOSS; sdm660 has the RPM instead */
 /* cmd-db aux levels (as in the GPU's arc votes) */
 /* Every cmd-db entry: name, RPMh slave (3 ARC, 4 VRM, 5 BCM), address. */
 static void cmddb_list(void)
@@ -146,6 +149,14 @@ static int wlan_power(void)
 	/* mainline sm8150 wifi: clocks "cxo_ref_clk_pin", "qdss" = <&aoss_qmp>: the QDSS clock is an AOSS message */
 	return qmp_send("{class: clock, res: qdss, val: 1}") ? -1 : 0;
 }
+#else
+/* sdm660: the WCN3990 rails (pm660 l5/l9/l6/l19) are RPM regulators: not wired up yet */
+static int wlan_power(void)
+{
+	printf("wlan power: no RPM votes on this board yet\n");
+	return 0;
+}
+#endif
 
 /* SMP2P item: magic "$SMP", version/features, local/remote pid, total/valid entries, flags, entries[16+4] */
 static void smp2p_show(const char *what, unsigned item)
@@ -172,9 +183,6 @@ static void smp2p_show(const char *what, unsigned item)
 
 /* ---- SMP2P outbound (Linux qcom_smp2p_alloc_outbound_item) and the APCS doorbell ---- */
 
-#define APCS_IPC	0x17c0000cull	/* apss_shared + 12: write BIT(n) */
-#define IPC_MODEM_SMP2P	14
-#define IPC_MODEM_GLINK	12
 #define SMP2P_OUT	428
 #define SMP2P_IN	435
 
@@ -291,6 +299,25 @@ static int smp2p_init(void)
 	return 0;
 }
 
+/* SMP2P in: "ready" (bit 1) from the modem after its boot */
+static int wait_ready(void)
+{
+	for (int t = 0; t < 300; t++) {
+		uint32_t v;
+		smp2p_service();
+		/* after a crash the old entry still says ready + fatal until the modem rewrites it */
+		if (smp2p_in_value("slave-kernel", &v) == 0 && (v & 2) && !(v & 1)) {
+			printf("boot: modem ready after %d00 ms\n", t);
+			return 0;
+		}
+		usleep(100000);
+	}
+	printf("boot: no ready from the modem in 30 s\n");
+	smp2p_show("in", SMP2P_IN);
+	return -1;
+}
+
+#ifndef BOARD_A9Y
 /* ---- AOSS QMP (Linux qcom_aoss.c): messages to the always-on processor ---- */
 
 #define QMP_RAM		0x0c300000ull
@@ -358,7 +385,7 @@ static int qmp_send(const char *msg)
 #define PAS_MODEM	4
 #define MPSS_PA		0x8dc00000ull	/* flame modem_region */
 #define MPSS_SIZE	0x0b400000ull
-#define FW_DIR		"/var/local/fw/modem"
+#define FW_DIR		FW_ROOT "/modem"
 #define SCM_PIL(cmd)	(0x42000000ull | (2u << 8) | (cmd))
 
 static int64_t scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1)
@@ -502,20 +529,21 @@ static int boot_modem(void)
 		return -1;
 
 	/* 5. wait for SMP2P in: "ready" (bit 1) from the modem */
-	for (int t = 0; t < 300; t++) {
-		uint32_t v;
-		smp2p_service();
-		/* after a crash the old entry still says ready + fatal until the modem rewrites it */
-		if (smp2p_in_value("slave-kernel", &v) == 0 && (v & 2) && !(v & 1)) {
-			printf("boot: modem ready after %d00 ms\n", t);
-			return 0;
-		}
-		usleep(100000);
-	}
-	printf("boot: no ready from the modem in 30 s\n");
-	smp2p_show("in", 435);
-	return -1;
+	return wait_ready();
 }
+#else
+/* sdm660: the self-authenticating boot through the MBA (mss_a9y.c), then the same wait for "ready" */
+static int boot_modem(void)
+{
+	uint64_t ve;
+	if (smp2p_in_entry("slave-kernel", &ve) == 0)
+		wr32(ve, 0);
+	modem_state = 0xffffffff;
+	if (mss_boot())
+		return -1;
+	return wait_ready();
+}
+#endif
 
 static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 {
@@ -667,7 +695,7 @@ static int net(unsigned secs)
 			radio_stats();
 			stats = link_ms() + 30000;
 		}
-		if (!wlfw_pending())
+		if (!wlfw_pending() || getenv("WLAND_NO_WLFW"))	/* WLAND_NO_WLFW: the modem and its services only */
 			continue;
 		if (wlfw_start()) {
 			printf("net: WLFW bring-up failed\n");
@@ -687,8 +715,10 @@ static int net(unsigned secs)
 /* everything `up` does, from a fresh boot */
 static int up(unsigned secs)
 {
+#ifndef BOARD_A9Y	/* radio.c's SMMU is the Pixel's (0x15000000); sdm660's WLAN streams are on anoc2 */
 	if (smmu_wlan_identity())
 		printf("up: no WLAN SMMU stream: the radio will not start\n");
+#endif
 	if (wlan_power() || smp2p_create() || boot_modem())
 		return 1;
 	return net(secs) ? 1 : 0;
@@ -759,17 +789,17 @@ int main(int argc, char **argv)
 	} else if (!strcmp(c, "smp2p")) {
 		smp2p_show("in", 435);	/* qcom,smem = <435>, <428>: inbound, outbound */
 		smp2p_show("out", 428);
-	} else if (!strcmp(c, "levels") && argc > 2) {
-		levels(argv[2], 1);
-	} else if (!strcmp(c, "qmp") && argc > 2) {
-		return qmp_send(argv[2]) ? 1 : 0;
 	} else if (!strcmp(c, "smp2p-init")) {
 		return smp2p_init() ? 1 : 0;
 	} else if (!strcmp(c, "shutdown")) {
+#ifdef BOARD_A9Y
+		mss_shutdown();
+#else
 		uint64_t r1 = 0;
 		int64_t rc = scm(6, 1, PAS_MODEM, 0, 0, &r1);	/* PAS_SHUTDOWN */
 		printf("shutdown -> %lld/%llx\n", (long long)rc, (unsigned long long)r1);
 		return rc ? 1 : 0;
+#endif
 	} else if (!strcmp(c, "items")) {
 		smem_list();
 	} else if (!strcmp(c, "item") && argc > 2) {
@@ -802,14 +832,21 @@ int main(int argc, char **argv)
 	} else if (!strcmp(c, "up")) {
 		/* everything from a fresh phone boot: SMP2P, the modem, GLINK + QRTR; the WLAN SMMU stream first */
 		return up(argc > 2 ? (unsigned)atoi(argv[2]) : 20);
+	} else if (!strcmp(c, "wlan-power")) {
+		return wlan_power() ? 1 : 0;
+	} else if (!strcmp(c, "boot")) {
+		if (smp2p_create())
+			return 1;
+		return boot_modem() ? 1 : 0;
+#ifndef BOARD_A9Y
+	} else if (!strcmp(c, "levels") && argc > 2) {
+		levels(argv[2], 1);
+	} else if (!strcmp(c, "qmp") && argc > 2) {
+		return qmp_send(argv[2]) ? 1 : 0;
 	} else if (!strcmp(c, "smmu")) {
 		return smmu_wlan_identity() ? 1 : 0;
 	} else if (!strcmp(c, "cmddb")) {
 		cmddb_list();
-	} else if (!strcmp(c, "wlan-power")) {
-		return wlan_power() ? 1 : 0;
-	} else if (!strcmp(c, "boot")) {
-		return boot_modem() ? 1 : 0;
 	} else if (!strcmp(c, "bcm") && argc > 3) {
 		/* a BCM (bus) vote: x = average, y = peak, in the BCM's own units (0x3fff = its top level); commit + valid */
 		uint32_t x = (uint32_t)strtoul(argv[2 + 1], NULL, 0) & 0x3fff, y = argc > 4 ? (uint32_t)strtoul(argv[4], NULL, 0) & 0x3fff : x;
@@ -819,6 +856,7 @@ int main(int argc, char **argv)
 		return rc ? 1 : 0;
 	} else if (!strcmp(c, "vote") && argc > 3) {
 		return vote(argv[2], (uint32_t)strtoul(argv[3], NULL, 0)) ? 1 : 0;
+#endif
 	} else {
 		fprintf(stderr, "wland: unknown command\n");
 		return 2;

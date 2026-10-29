@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "board.h"
 #include "link.h"
 #include "qmi.h"
 #include "scm.h"
@@ -31,7 +32,6 @@
 #define FW_INIT_DONE_IND 0x38
 
 #define CLIENT_ID	0x4b4e454c	/* ath10k's */
-#define MSA_PA		0x8bc00000ull	/* pil_wlan_fw_region */
 #define MSA_SIZE	0x100000u	/* qcom,wlan-msa-memory */
 #define BDF_PATH	"/var/local/fw/modem/bdwlan-flame.bin"
 #define BDF_PATH2	"/var/local/fw/modem/bdwlan-flame-PROTO1.1.bin"

@@ -12,13 +12,14 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "board.h"
 #include "link.h"
 #include "tftp.h"
 
 #define RO_PREFIX	"/readonly/firmware/image/"
 #define RW_PREFIX	"/readwrite/"
-#define FW_DIR		"/var/local/fw/modem"
-#define RW_DIR		"/var/local/fw/rw"
+#define FW_DIR		FW_ROOT "/modem"
+#define RW_DIR		FW_ROOT "/rw"
 
 enum { OP_RRQ = 1, OP_WRQ, OP_DATA, OP_ACK, OP_ERROR, OP_OACK };
 

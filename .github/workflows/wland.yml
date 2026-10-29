@@ -1,0 +1,35 @@
+name: wland
+
+# wland (phone/wifi) for iOS 16 arm64: the Pixel 4 build and the Galaxy A9 2018 one (WLAND_BOARD=a9y).
+# Only our own build outputs are uploaded, never SDK files.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "phone/wifi/**"
+      - ".github/workflows/wland.yml"
+
+concurrency:
+  group: wland-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          printf '#!/bin/sh\nexec "$(xcrun -f clang)" -arch arm64 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -miphoneos-version-min=16.0 "$@"\n' > "$RUNNER_TEMP/ios-cc"
+          chmod +x "$RUNNER_TEMP/ios-cc"
+          IOS_CC="$RUNNER_TEMP/ios-cc" phone/wifi/build.sh
+          IOS_CC="$RUNNER_TEMP/ios-cc" WLAND_BOARD=a9y phone/wifi/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wland-ios
+          path: |
+            phone/wifi/out/wland
+            phone/wifi/out/wland-a9y
+          retention-days: 7

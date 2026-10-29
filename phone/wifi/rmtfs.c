@@ -12,13 +12,14 @@
 #include <unistd.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include "board.h"
 #include "link.h"
 #include "pmem.h"
 #include "qmi.h"
 #include "rmtfs.h"
 #include "scm.h"
 
-#define RMTFS_DIR	"/var/local/fw/rmtfs"
+#define RMTFS_DIR	FW_ROOT "/rmtfs"
 #define BUF_SIZE	0x200000u
 #define SECTOR		512
 
@@ -64,10 +65,18 @@ int rmtfs_init(void)
 		buf_pa = fpa;
 		printf("rmtfs: buffer %llx from this boot's first run\n", (unsigned long long)buf_pa);
 	} else {
+#ifdef RMTFS_FIXED_PA
+		/* board.h: XNU's RAM is out of the modem's reach, this one is not (and not XNU's: zero it here) */
+		static const uint8_t zero[0x1000];
+		buf_pa = RMTFS_FIXED_PA;
+		for (uint64_t o = 0; o < BUF_SIZE; o += sizeof(zero))
+			pm_wr(buf_pa + o, zero, sizeof(zero));
+#else
 		uint64_t a = pm_alloc(BUF_SIZE + 0x2000, 0x1000);
 		if (!a)
 			return -1;
 		buf_pa = a + 0x1000;
+#endif
 		static const uint32_t src[] = { VMID_HLOS }, dst[] = { VMID_HLOS, VMID_MSS_MSA };
 		if (hyp_assign(buf_pa, BUF_SIZE, src, 1, dst, 2))
 			return -1;

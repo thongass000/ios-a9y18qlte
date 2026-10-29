@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include "board.h"
 #include "glink.h"
 #include "pmem.h"
 #include "smem.h"
@@ -7,8 +8,7 @@
 #define DESC_ITEM	478
 #define FIFO_TX_ITEM	479	/* ours: apps -> modem */
 #define FIFO_RX_ITEM	480	/* the modem's */
-#define APCS_IPC	0x17c0000cull
-#define IPC_GLINK	12
+#define IPC_GLINK	IPC_MODEM_GLINK
 
 static uint64_t desc, tx_fifo, rx_fifo;
 static uint32_t tx_len, rx_len;
