@@ -17,6 +17,7 @@
 #include "tftp.h"
 
 #define RO_PREFIX	"/readonly/firmware/image/"
+#define RO_PREFIX2	"/readonly/vendor/firmware/"	/* sdm660's modem asks here for wlanmdsp.mbn */
 #define RW_PREFIX	"/readwrite/"
 #define FW_DIR		FW_ROOT "/modem"
 #define RW_DIR		FW_ROOT "/rw"
@@ -99,8 +100,10 @@ static void send_window(int i, uint32_t acked)
 static int open_path(const char *path, int write)
 {
 	char p[256];
-	if (!strncmp(path, RO_PREFIX, strlen(RO_PREFIX))) {
-		const char *rest = path + strlen(RO_PREFIX);
+	const char *ro = !strncmp(path, RO_PREFIX, strlen(RO_PREFIX)) ? RO_PREFIX :
+			 !strncmp(path, RO_PREFIX2, strlen(RO_PREFIX2)) ? RO_PREFIX2 : NULL;
+	if (ro) {
+		const char *rest = path + strlen(ro);
 		const char *base = strrchr(rest, '/');
 		snprintf(p, sizeof(p), FW_DIR "/%s", base ? base + 1 : rest);
 		for (char *c = p + strlen(FW_DIR) + 1; *c; c++)
