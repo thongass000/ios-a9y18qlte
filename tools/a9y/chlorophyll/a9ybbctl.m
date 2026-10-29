@@ -498,6 +498,31 @@ main(int argc, char **argv)
          fclose(f);
          return 0;
       }
+      if (!strcmp(cmd, "hexname") && argc > 3) {   // hex of each file under ROOT whose name contains NAME (paths with spaces)
+         NSDirectoryEnumerator *e = [[NSFileManager defaultManager] enumeratorAtPath:@(argv[3])];
+         int max = argc > 4 ? atoi(argv[4]) : 4;
+         for (NSString *p in e) {
+            if (![[e fileAttributes][NSFileType] isEqual:NSFileTypeRegular] ||
+                [[p lastPathComponent] rangeOfString:@(argv[2]) options:NSCaseInsensitiveSearch].location == NSNotFound)
+               continue;
+            NSString *full = [@(argv[3]) stringByAppendingPathComponent:p];
+            FILE *f = fopen([full UTF8String], "rb");
+            if (!f) continue;
+            unsigned char b[64];
+            size_t n, off = 0;
+            printf("hexfile %s\n", [full UTF8String]);
+            while ((n = fread(b, 1, sizeof(b), f)) > 0 && off < 65536) {
+               char line[2 * sizeof(b) + 1];
+               for (size_t i = 0; i < n; i++) sprintf(line + 2 * i, "%02x", b[i]);
+               printf("hex %zx %s\n", off, line);
+               off += n;
+            }
+            printf("hexend %zu\n", off);
+            fclose(f);
+            if (--max <= 0) break;
+         }
+         return 0;
+      }
       printf("usage: a9ybbctl status|install|restore|trim|arm|disarm|respring|wait S|pids NAME|cat FILE [MAX]|hex FILE|threads NAME S|bench|top S|ls DIR [MAX]|snapclear|findname NAME ROOT [MAX]|findsize MIN MAX ROOT [MAX]|rm FILE...\n");
       return 2;
    }
