@@ -3987,6 +3987,30 @@ index 68612db..7a71453 100644
  	if (error) {
  		goto bad;
  	}
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index ff2c725..90581a4 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -362,6 +362,10 @@ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+  * apps die in CoreAnimation setup: work_interval_create(CA_CLIENT) needs
+  * PRIV_WORK_INTERVAL ("Failed to create work interval", SpringBoard).
+  * Grant that one; log the first denial of each other privilege per process.
++ * Also PRIV_NET_PRIVILEGED_SOCKET_DELEGATE (iOS: the socket-delegate
++ * entitlement): WebKit's Networking process opens Safari's sockets on its
++ * behalf; denied, Safari's loads never started while NSURLSession in a
++ * plain process got HTTP 200 over the same Wi-Fi.
+  */
+ #define SWEET_PRIV_LOG_MAX      64
+ static struct {
+@@ -373,7 +377,7 @@ static int sweet_priv_logged_count;
+ static int
+ sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+ {
+-	if (priv == PRIV_WORK_INTERVAL) {
++	if (priv == PRIV_WORK_INTERVAL || priv == PRIV_NET_PRIVILEGED_SOCKET_DELEGATE) {
+ 		return 0;
+ 	}
+ 	char name[20];
 diff --git a/config/MASTER.arm64.a9y18qlte b/config/MASTER.arm64.a9y18qlte
 new file mode 100644
 index 0000000..7c82491
