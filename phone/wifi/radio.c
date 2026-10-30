@@ -597,6 +597,7 @@ static void htc_rx(uint32_t c, const uint8_t *d, uint32_t len)
 #define WMI_EV_MGMT_RX		0x7001
 #define WMI_CMD_INIT		0x1
 #define CMD_START_SCAN		0x3001
+#define CMD_STOP_SCAN		0x3002
 #define CMD_SCAN_CHAN_LIST	0x3003
 #define CMD_VDEV_CREATE		0x5001
 #define TAG_ARRAY_UINT32	0x10
@@ -612,6 +613,7 @@ static void htc_rx(uint32_t c, const uint8_t *d, uint32_t len)
 #define TAG_RESOURCE_CONFIG	0x4b
 #define TAG_HOST_MEM_CHUNK	0x4c
 #define TAG_START_SCAN_CMD	0x4d
+#define TAG_STOP_SCAN_CMD	0x4e
 #define TAG_SCAN_CHAN_LIST_CMD	0x4f
 #define TAG_CHANNEL		0x50
 #define TAG_VDEV_CREATE_CMD	0x56
@@ -810,7 +812,8 @@ struct bss {
 static struct bss bss[NBSS];
 static uint32_t nbss, scans, scan_frames;
 static int scan_started, scanning;
-static uint64_t next_scan_ms;
+static uint64_t next_scan_ms, scan_t0;
+static uint32_t scan_id_cur;
 static int scan_asked;
 
 static int scan_send_start(void)
@@ -848,7 +851,24 @@ static int scan_send_start(void)
 	c = put_tlv(p, TAG_ARRAY_FIXED_STRUCT, 8);	/* bssid: broadcast */
 	memset(c, 0xff, 6);
 	p = put_tlv(c + 8, TAG_ARRAY_BYTE, 0);
-	return wmi_send(CMD_START_SCAN, m, (uint32_t)(p - m));
+	int r = wmi_send(CMD_START_SCAN, m, (uint32_t)(p - m));
+	if (!r) {
+		scan_t0 = link_ms();
+		scan_id_cur = 0xa000 | (scans + 1);
+	}
+	return r;
+}
+
+/* ath10k wmi_tlv_op_gen_stop_scan: the scan under way, one (req_type 0) */
+static int scan_send_stop(void)
+{
+	uint8_t m[4 + 16] = { 0 };
+	uint8_t *c = put_tlv(m, TAG_STOP_SCAN_CMD, 16);
+	c = put32(c, 0xa000 | 1);			/* scan_req_id, as started */
+	c = put32(c, scan_id_cur);
+	c = put32(c, 0);				/* WMI_SCAN_STOP_ONE */
+	put32(c, 0);					/* vdev */
+	return wmi_send(CMD_STOP_SCAN, m, sizeof(m));
 }
 
 static void scan_start(void)
@@ -900,6 +920,8 @@ static void scan_event(const uint8_t *t, uint32_t len)
 		return;					/* foreign channel / exit / bss channel */
 	if (e[0] == 0x001)
 		LOG("scan: STARTED");
+	else if (e[0] != 0x002)
+		LOG("scan: event %#x reason %u (scan id %#x)", e[0], e[1], e[4]);	/* dequeued, preempted, failed... */
 	if (e[0] == 0x002 || e[0] == 0x040 || e[0] == 0x010) {
 		scanning = 0;
 		scans++;
@@ -2092,6 +2114,15 @@ void radio_poll(void)
 		LOG("ce: no HTC READY in 5 s; rri ce1 %08x ce2 %08x, ce2 DRRI %u DR_WR %u, rx %u/%u",
 		    rri[1], rri[2], ce_rd(2, CUR_DRRI), ce_rd(2, DR_WR_IDX), ce[1].rx, ce[2].rx);
 	}
+	/*
+	 * A scan whose end never came (A9: a wifid scan right after the last one ended said STARTED, then
+	 * nothing) would block every later one: past its 20 s max scan time + 10 s, stop it and go on.
+	 */
+	if (scanning && now - scan_t0 > 30000) {
+		LOG("scan: id %#x no end after 30 s: stop -> %d; ce rx %u/%u/%u/%u", scan_id_cur, scan_send_stop(),
+		    ce[1].rx, ce[2].rx, ce[5].rx, ce[9].rx);
+		scanning = 0;
+	}
 	if (scan_started && !scanning && next_scan_ms && now >= next_scan_ms) {
 		next_scan_ms = 0;
 		if (s_state == S_IDLE && !s_join_asked)	/* scans leave the channel: never while joining or joined */
@@ -2128,8 +2159,10 @@ unsigned radio_scans(void)
 
 void radio_stats(void)
 {
-	LOG("stats: state %u, tx %u sent %u done %u failed, rx %u to the IP side, htt msdus %u, ce tx full %u/%u/%u",
-	    s_state, tx_sent, tx_done, tx_fail, rx_up, htt_msdus, ce[0].tx_full, ce[3].tx_full, ce[4].tx_full);
+	LOG("stats: state %u, tx %u sent %u done %u failed, rx %u to the IP side, htt msdus %u, ce tx full %u/%u/%u, "
+	    "ce rx %u/%u/%u/%u, %u scans %u frames%s",
+	    s_state, tx_sent, tx_done, tx_fail, rx_up, htt_msdus, ce[0].tx_full, ce[3].tx_full, ce[4].tx_full,
+	    ce[1].rx, ce[2].rx, ce[5].rx, ce[9].rx, scans, scan_frames, scanning ? ", scanning" : "");
 }
 
 /* the i-th network heard (any scan): 0, or -1 past the last */
