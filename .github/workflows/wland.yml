@@ -30,6 +30,9 @@ jobs:
           cd phone/tools && mkdir -p out
           "$RUNNER_TEMP/ios-cc" -O2 -fobjc-arc -framework Foundation -o out/openapp openapp.m
           codesign -f -s - --entitlements openapp-ents.plist out/openapp
+          # nettest (DNS, TCP, HTTPS layer by layer; wland runs it once after the first join when present)
+          "$RUNNER_TEMP/ios-cc" -O2 -fobjc-arc -framework Foundation -o out/nettest nettest.m
+          codesign -f -s - out/nettest
       - uses: actions/upload-artifact@v4
         with:
           name: wland-ios
@@ -37,4 +40,5 @@ jobs:
             phone/wifi/out/wland
             phone/wifi/out/wland-a9y
             phone/tools/out/openapp
+            phone/tools/out/nettest
           retention-days: 7

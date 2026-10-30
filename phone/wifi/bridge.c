@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -47,6 +48,11 @@ static void bridge_rx(const uint8_t *frame, uint32_t len)
 		bridge_send(FW_RX, frame, len);
 }
 
+/* nettest (phone/tools) once, 15 s after the first link up when it is there: DNS, TCP, HTTPS into this log */
+#define NETTEST		"/usr/local/bin/nettest"
+static uint64_t nettest_at;
+static int nettest_done;
+
 static void bridge_link(int up)
 {
 	struct fw_link l;
@@ -55,6 +61,19 @@ static void bridge_link(int up)
 	l.ssid_len = (uint8_t)radio_ssid(l.ssid, l.bssid);
 	printf("[%6llu] bridge: link %s '%.*s'\n", (unsigned long long)link_ms(), up ? "up" : "down", l.ssid_len, l.ssid);
 	bridge_send(FW_LINK, &l, sizeof(l));
+	if (up && !nettest_done && !nettest_at && access(NETTEST, X_OK) == 0)
+		nettest_at = link_ms() + 15000;
+}
+
+static void nettest_run(void)
+{
+	char *argv[] = { NETTEST, NULL };
+	pid_t pid;
+	nettest_done = 1;
+	extern char **environ;
+	int e = posix_spawn(&pid, NETTEST, NULL, NULL, argv, environ);	/* stdout: this log; SIGCHLD ignored: no zombie */
+	printf("[%6llu] bridge: nettest -> %s (pid %d)\n", (unsigned long long)link_ms(), e ? strerror(e) : "started",
+	       e ? 0 : pid);
 }
 
 /* what the scans heard (in the last minute), then SCAN_DONE */
@@ -181,6 +200,10 @@ void bridge_poll(void)
 	if (sc_at && link_ms() > sc_at) {	/* once, 3 s after en0 is made */
 		sc_at = 0;
 		sc_check();
+	}
+	if (nettest_at && link_ms() > nettest_at) {
+		nettest_at = 0;
+		nettest_run();
 	}
 	if (!hello_sent && radio_scans() > 0) {
 		struct fw_hello h;
