@@ -33,6 +33,9 @@ jobs:
           # nettest (DNS, TCP, HTTPS layer by layer; wland runs it once after the first join when present)
           "$RUNNER_TEMP/ios-cc" -O2 -fobjc-arc -framework Foundation -o out/nettest nettest.m
           codesign -f -s - out/nettest
+          # oslog (the unified log; wland streams Safari's processes into its log after the first join)
+          "$RUNNER_TEMP/ios-cc" -O2 -fobjc-arc -framework Foundation -o out/oslog oslog.m
+          codesign -f -s - --entitlements oslog-ents.plist out/oslog
       - uses: actions/upload-artifact@v4
         with:
           name: wland-ios
@@ -41,4 +44,5 @@ jobs:
             phone/wifi/out/wland-a9y
             phone/tools/out/openapp
             phone/tools/out/nettest
+            phone/tools/out/oslog
           retention-days: 7

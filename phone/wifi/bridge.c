@@ -65,15 +65,26 @@ static void bridge_link(int up)
 		nettest_at = link_ms() + 15000;
 }
 
+/* and oslog (phone/tools), when there, for 4 minutes: Safari's own words about its loads */
+#define OSLOG		"/usr/local/bin/oslog"
+
+static void spawn_tool(char *const argv[])
+{
+	extern char **environ;
+	pid_t pid;
+	int e = posix_spawn(&pid, argv[0], NULL, NULL, argv, environ);	/* stdout: this log; SIGCHLD ignored */
+	printf("[%6llu] bridge: %s -> %s (pid %d)\n", (unsigned long long)link_ms(), argv[0], e ? strerror(e) : "started",
+	       e ? 0 : pid);
+}
+
 static void nettest_run(void)
 {
-	char *argv[] = { NETTEST, NULL };
-	pid_t pid;
+	char *nt[] = { NETTEST, NULL };
+	char *ol[] = { OSLOG, "-t", "240", "MobileSafari", "com.apple.WebKit", "nsurlsessiond", NULL };
 	nettest_done = 1;
-	extern char **environ;
-	int e = posix_spawn(&pid, NETTEST, NULL, NULL, argv, environ);	/* stdout: this log; SIGCHLD ignored: no zombie */
-	printf("[%6llu] bridge: nettest -> %s (pid %d)\n", (unsigned long long)link_ms(), e ? strerror(e) : "started",
-	       e ? 0 : pid);
+	if (access(OSLOG, X_OK) == 0)
+		spawn_tool(ol);
+	spawn_tool(nt);
 }
 
 /* what the scans heard (in the last minute), then SCAN_DONE */
