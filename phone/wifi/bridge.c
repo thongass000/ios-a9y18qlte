@@ -65,8 +65,12 @@ static void bridge_link(int up)
 		nettest_at = link_ms() + 15000;
 }
 
-/* and oslog (phone/tools), when there, for 4 minutes: Safari's own words about its loads */
+/*
+ * and oslog (phone/tools) for 4 minutes, only with /usr/local/etc/wland-oslog: its burst filled the pipe to
+ * a9yrun and wland, the radio's only driver, blocked in printf (A9: no frames moved until the reboot)
+ */
 #define OSLOG		"/usr/local/bin/oslog"
+#define OSLOG_FLAG	"/usr/local/etc/wland-oslog"
 
 static void spawn_tool(char *const argv[])
 {
@@ -82,7 +86,7 @@ static void nettest_run(void)
 	char *nt[] = { NETTEST, NULL };
 	char *ol[] = { OSLOG, "-t", "240", "MobileSafari", "com.apple.WebKit", "nsurlsessiond", NULL };
 	nettest_done = 1;
-	if (access(OSLOG, X_OK) == 0)
+	if (access(OSLOG, X_OK) == 0 && access(OSLOG_FLAG, F_OK) == 0)
 		spawn_tool(ol);
 	spawn_tool(nt);
 }
