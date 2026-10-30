@@ -68,6 +68,8 @@ static void mem_wr(uint64_t pa, const void *buf, uint32_t len)
 
 /* ---------------------------------------------------------------- apps SMMU */
 
+static uint64_t smmu_cbp;	/* the WLAN context bank's registers (A9: for the fault dump) */
+
 #ifdef BOARD_A9Y
 /*
  * sdm660: the WLAN streams are on the anoc2 SMMU (arm,smmu-anoc2@16c0000, 6 SMRs, 11 banks, 4K pages x 32;
@@ -139,6 +141,7 @@ int smmu_wlan_identity(void)
 	wr32(gr1 + 0x800 + 4 * cb, CB_CBA2R);
 	wr32(gr1 + 4 * cb, CB_CBAR);
 	wr32(cbp, CB_SCTLR);				/* SCTLR before any stream points here */
+	smmu_cbp = cbp;
 	smmu_done = 1;
 	for (unsigned k = 0; k < nsid; k++) {
 		wr32(s + 0xc00 + 4 * slot[k], (uint32_t)cb);	/* S2CR: translate (type 0) through this bank */
@@ -402,6 +405,29 @@ static void ce_poll(void)
 		if (posted)
 			ce_wr(c, DR_WR_IDX, s->dst_wr);
 	}
+}
+
+/*
+ * The receive side went quiet (A9: all CE rx counts froze during a scan): who stopped? For the host rx rings
+ * the CE's read index (its own and the copy in rri), its write index, ours, and the length in the descriptor
+ * we wait on (0: the CE has not written it); then the SMMU's global and WLAN bank fault status.
+ */
+static void freeze_dump(void)
+{
+	uint32_t rri[CE_COUNT];
+	mem_rd(rri_pa, rri, sizeof(rri));
+	for (uint32_t c = 1; c <= 2; c++) {
+		struct ce_state *s = &ce[c];
+		LOG("freeze: ce%u drri %u (rri %u) dr_wr %u, ours sw %u wr %u, desc[sw] len %u, rx %u", c,
+		    ce_rd(c, CUR_DRRI) & (s->dst_n - 1), (rri[c] >> 16) & (s->dst_n - 1), ce_rd(c, DR_WR_IDX),
+		    s->dst_sw, s->dst_wr, rd32(s->dst_pa + (uint64_t)s->dst_sw * DESC + 8) & 0xffff, s->rx);
+	}
+	LOG("freeze: ce3 srri %u sr_wr %u ours %u, ce0 srri %u sr_wr %u ours %u", rri[3] & 0xffff, ce_rd(3, SR_WR_IDX),
+	    ce[3].src_wr, rri[0] & 0xffff, ce_rd(0, SR_WR_IDX), ce[0].src_wr);
+	if (smmu_cbp)
+		LOG("freeze: smmu sGFSR %08x sGFSYNR0 %08x; CB FSR %08x FSYNR0 %08x FAR %08x%08x", rd32(SMMU_PA + 0x48),
+		    rd32(SMMU_PA + 0x50), rd32(smmu_cbp + 0x58), rd32(smmu_cbp + 0x68), rd32(smmu_cbp + 0x64),
+		    rd32(smmu_cbp + 0x60));
 }
 
 static int ce_send(uint32_t c, const void *data, uint32_t len, uint32_t transfer_id)
@@ -2121,6 +2147,7 @@ void radio_poll(void)
 	if (scanning && now - scan_t0 > 30000) {
 		LOG("scan: id %#x no end after 30 s: stop -> %d; ce rx %u/%u/%u/%u", scan_id_cur, scan_send_stop(),
 		    ce[1].rx, ce[2].rx, ce[5].rx, ce[9].rx);
+		freeze_dump();
 		scanning = 0;
 	}
 	if (scan_started && !scanning && next_scan_ms && now >= next_scan_ms) {
