@@ -6,9 +6,11 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/sysctl.h>
 #include "flamewlan.h"
 #include "link.h"
 #include "radio.h"
@@ -131,17 +133,61 @@ static void on_join(const struct fw_join *j)
 	join_deadline = link_ms() + 35000;
 }
 
+/*
+ * configd needs a network service for en0, or it never starts DHCP there: joined, en0 sent nothing. A root
+ * whose SystemConfiguration preferences name no en0 (the Pixel's held host names only) gets flame's fix once:
+ * the file moves to .pre-wifi and configd (KeepAlive) restarts and writes its default set, Wi-Fi included.
+ */
+#define SC_PREFS	"/var/preferences/SystemConfiguration/preferences.plist"
+static void sc_check(void)
+{
+	static char b[1 << 18];
+	size_t n = 0;
+	FILE *f = fopen(SC_PREFS, "rb");
+	if (!f) {
+		printf("bridge: %s: %s (configd makes its default)\n", SC_PREFS, strerror(errno));
+		return;
+	}
+	n = fread(b, 1, sizeof(b), f);
+	fclose(f);
+	if (memmem(b, n, "en0", 3)) {
+		printf("bridge: %s: %zu bytes, names en0\n", SC_PREFS, n);
+		return;
+	}
+	int r = rename(SC_PREFS, SC_PREFS ".pre-wifi");
+	printf("bridge: %s: %zu bytes, no en0: moved to .pre-wifi -> %d\n", SC_PREFS, n, r ? errno : 0);
+	if (r)
+		return;
+	int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+	static struct kinfo_proc kp[1024];
+	size_t len = sizeof(kp);
+	if (sysctl(mib, 3, kp, &len, NULL, 0) != 0)
+		return;
+	for (size_t i = 0; i < len / sizeof(kp[0]); i++)
+		if (!strcmp(kp[i].kp_proc.p_comm, "configd")) {
+			printf("bridge: configd (pid %d) restarted -> %d\n", kp[i].kp_proc.p_pid,
+			       kill(kp[i].kp_proc.p_pid, SIGTERM) ? errno : 0);
+			break;
+		}
+}
+
 /* from wland's idle loop */
 void bridge_poll(void)
 {
 	static uint8_t m[FW_MSG_MAX];
+	static uint64_t sc_at;
 	if (bfd < 0)
 		return;
+	if (sc_at && link_ms() > sc_at) {	/* once, 3 s after en0 is made */
+		sc_at = 0;
+		sc_check();
+	}
 	if (!hello_sent && radio_scans() > 0) {
 		struct fw_hello h;
 		memcpy(h.address, radio_mac, 6);
 		bridge_send(FW_HELLO, &h, sizeof(h));
 		hello_sent = 1;
+		sc_at = link_ms() + 3000;
 		printf("[%6llu] bridge: hello: the kernel makes en0\n", (unsigned long long)link_ms());
 	}
 	for (int n = 0; n < 32; n++) {
