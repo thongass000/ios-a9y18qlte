@@ -26,10 +26,15 @@ jobs:
           chmod +x "$RUNNER_TEMP/ios-cc"
           IOS_CC="$RUNNER_TEMP/ios-cc" phone/wifi/build.sh
           IOS_CC="$RUNNER_TEMP/ios-cc" WLAND_BOARD=a9y phone/wifi/build.sh
+          # openapp (Settings > Wi-Fi with no tap: openapp com.apple.Preferences prefs:root=WIFI)
+          cd phone/tools && mkdir -p out
+          "$RUNNER_TEMP/ios-cc" -O2 -fobjc-arc -framework Foundation -o out/openapp openapp.m
+          codesign -f -s - --entitlements openapp-ents.plist out/openapp
       - uses: actions/upload-artifact@v4
         with:
           name: wland-ios
           path: |
             phone/wifi/out/wland
             phone/wifi/out/wland-a9y
+            phone/tools/out/openapp
           retention-days: 7
